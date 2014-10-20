@@ -32,11 +32,13 @@ asm (
 // ASM
 void co_switch_arm(cothread_t handle, cothread_t current);
 
-static void crash(void) {
+static void crash(void)
+{
    assert(0); // Called only if cothread_t entrypoint returns.
 }
 
-cothread_t co_create(unsigned int size, void (*entrypoint)(void)) {
+cothread_t co_create(unsigned int size, void (*entrypoint)(void))
+{
    size = (size + 1023) & ~1023;
    cothread_t handle = 0;
 #if HAVE_POSIX_MEMALIGN >= 1
@@ -64,17 +66,20 @@ cothread_t co_create(unsigned int size, void (*entrypoint)(void)) {
    return handle;
 }
 
-cothread_t co_active(void) {
+cothread_t co_active(void)
+{
    if (!co_active_handle)
       co_active_handle = co_active_buffer;
    return co_active_handle;
 }
 
-void co_delete(cothread_t handle) {
+void co_delete(cothread_t handle)
+{
    free(handle);
 }
 
-void co_switch(cothread_t handle) {
+void co_switch(cothread_t handle)
+{
    cothread_t co_previous_handle = co_active();
    co_switch_arm(co_active_handle = handle, co_previous_handle);
 }
