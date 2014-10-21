@@ -1,7 +1,7 @@
-/* Copyright  (C) 2010-2014 The RetroArch team
+/* Copyright (C) 2010-2014 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (xenon_sdl_threads.c).
+ * The following license statement only applies to this libretro SDK code part (glsym).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,40 +20,30 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-// libSDLxenon doesn't implement this yet :[. Implement it very stupidly for now. ;)
+#ifndef RGLGEN_H__
+#define RGLGEN_H__
 
-#include "SDL_thread.h"
-#include "SDL_mutex.h"
-#include <stdlib.h>
-#include <boolean.h>
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 
-SDL_cond *SDL_CreateCond(void)
-{
-   bool *sleeping = calloc(1, sizeof(*sleeping));
-   return (SDL_cond*)sleeping;
+#include "rglgen_headers.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct rglgen_sym_map;
+
+typedef void (*rglgen_func_t)(void);
+typedef rglgen_func_t (*rglgen_proc_address_t)(const char*);
+void rglgen_resolve_symbols(rglgen_proc_address_t proc);
+void rglgen_resolve_symbols_custom(rglgen_proc_address_t proc,
+      const struct rglgen_sym_map *map);
+
+#ifdef __cplusplus
 }
+#endif
 
-void SDL_DestroyCond(SDL_cond *sleeping)
-{
-   free(sleeping);
-}
-
-int SDL_CondWait(SDL_cond *cond, SDL_mutex *lock)
-{
-   (void)lock;
-   volatile bool *sleeping = (volatile bool*)cond;
-
-   SDL_mutexV(lock);
-   *sleeping = true;
-   while (*sleeping); /* Yeah, we all love busyloops don't we? ._. */
-   SDL_mutexP(lock);
-
-   return 0;
-}
-
-int SDL_CondSignal(SDL_cond *cond)
-{
-   *(volatile bool*)cond = false;
-   return 0;
-}
+#endif
 
