@@ -573,7 +573,7 @@ static bool path_mkdir_norecurse(const char *dir)
    if (ret < 0 && errno == EEXIST && path_is_directory(dir))
       ret = 0;
    if (ret < 0)
-      RARCH_ERR("mkdir(%s) error: %s.\n", dir, strerror(errno));
+      printf("mkdir(%s) error: %s.\n", dir, strerror(errno));
    return ret == 0;
 }
 
@@ -620,7 +620,7 @@ bool path_mkdir(const char *dir)
 
 end:
    if (target && !ret)
-      RARCH_ERR("Failed to create directory: \"%s\".\n", target);
+      printf("Failed to create directory: \"%s\".\n", target);
    free(basedir);
    return ret;
 }
@@ -874,7 +874,7 @@ void fill_pathname_application_path(char *buf, size_t size)
       }
    }
    
-   RARCH_ERR("Cannot resolve application path! This should not happen.\n");
+   /* Cannot resolve application path! This should not happen. */
 #endif
 }
 #endif
