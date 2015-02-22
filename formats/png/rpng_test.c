@@ -21,15 +21,71 @@
  */
 
 #include <formats/rpng.h>
+#include <file/nbio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef HAVE_IMLIB2
 #include <Imlib2.h>
+#endif
 
-int main(int argc, char *argv[])
+static bool rpng_nbio_load_image_argb(const char *path, uint32_t **data,
+      unsigned *width, unsigned *height)
 {
+   bool ret      = true;
+
+   struct rpng_t *rpng = rpng_nbio_load_image_argb_init(path);
+
+   if (!rpng)
+   {
+      ret = false;
+      goto end;
+   }
+
+   while (!nbio_iterate((struct nbio_t*)rpng->userdata));
+
+   if (!rpng_nbio_load_image_argb_start(rpng))
+   {
+      ret = false;
+      goto end;
+   }
+
+   while (rpng_nbio_load_image_argb_iterate(
+            rpng->buff_data, rpng))
+   {
+      rpng->buff_data += 4 + 4 + rpng->chunk.size + 4;
+   }
+
+#if 0
+   fprintf(stderr, "has_ihdr: %d\n", rpng->has_ihdr);
+   fprintf(stderr, "has_idat: %d\n", rpng->has_idat);
+   fprintf(stderr, "has_iend: %d\n", rpng->has_iend);
+#endif
+
+   if (!rpng->has_ihdr || !rpng->has_idat || !rpng->has_iend)
+   {
+      ret = false;
+      goto end;
+   }
+   
+   rpng_nbio_load_image_argb_process(rpng, data, width, height);
+
+end:
+   rpng_nbio_load_image_free(rpng);
+   rpng = NULL;
+   if (!ret)
+      free(*data);
+
+   return ret;
+}
+
+static int test_nonblocking_rpng(const char *in_path)
+{
+#ifdef HAVE_IMLIB2
    Imlib_Image img;
+   const uint32_t *imlib_data = NULL;
+#endif
    const uint32_t test_data[] = {
       0xff000000 | 0x50, 0xff000000 | 0x80,
       0xff000000 | 0x40, 0xff000000 | 0x88,
@@ -43,23 +99,11 @@ int main(int argc, char *argv[])
    uint32_t *data = NULL;
    unsigned width = 0;
    unsigned height = 0;
-   const uint32_t *imlib_data = NULL;
-   const char *in_path = "/tmp/test.png";
-
-   if (argc > 2)
-   {
-      fprintf(stderr, "Usage: %s <png file>\n", argv[0]);
-      return 1;
-   }
-
-   if (argc == 2)
-      in_path = argv[1];
 
    if (!rpng_save_image_argb("/tmp/test.png", test_data, 4, 4, 16))
       return 1;
 
-
-   if (!rpng_load_image_argb(in_path, &data, &width, &height))
+   if (!rpng_nbio_load_image_argb(in_path, &data, &width, &height))
       return 2;
 
    fprintf(stderr, "Path: %s.\n", in_path);
@@ -76,6 +120,7 @@ int main(int argc, char *argv[])
    }
 #endif
 
+#ifdef HAVE_IMLIB2
    /* Validate with imlib2 as well. */
    img = imlib_load_image(in_path);
    if (!img)
@@ -106,6 +151,112 @@ int main(int argc, char *argv[])
       fprintf(stderr, "Imlib and RPNG are equivalent!\n");
 
    imlib_free_image();
+#endif
    free(data);
+
+   return 0;
 }
 
+static int test_blocking_rpng(const char *in_path)
+{
+#ifdef HAVE_IMLIB2
+   Imlib_Image img;
+   const uint32_t *imlib_data = NULL;
+#endif
+   const uint32_t test_data[] = {
+      0xff000000 | 0x50, 0xff000000 | 0x80,
+      0xff000000 | 0x40, 0xff000000 | 0x88,
+      0xff000000 | 0x50, 0xff000000 | 0x80,
+      0xff000000 | 0x40, 0xff000000 | 0x88,
+      0xff000000 | 0xc3, 0xff000000 | 0xd3,
+      0xff000000 | 0xc3, 0xff000000 | 0xd3,
+      0xff000000 | 0xc3, 0xff000000 | 0xd3,
+      0xff000000 | 0xc3, 0xff000000 | 0xd3,
+   };
+   uint32_t *data = NULL;
+   unsigned width = 0;
+   unsigned height = 0;
+
+   if (!rpng_save_image_argb("/tmp/test.png", test_data, 4, 4, 16))
+      return 1;
+
+
+   if (!rpng_load_image_argb(in_path, &data, &width, &height))
+      return 2;
+
+   fprintf(stderr, "Path: %s.\n", in_path);
+   fprintf(stderr, "Got image: %u x %u.\n", width, height);
+
+#if 0
+   fprintf(stderr, "\nRPNG:\n");
+   for (unsigned h = 0; h < height; h++)
+   {
+      unsigned w;
+      for (w = 0; w < width; w++)
+         fprintf(stderr, "[%08x] ", data[h * width + w]);
+      fprintf(stderr, "\n");
+   }
+#endif
+
+#ifdef HAVE_IMLIB2
+   /* Validate with imlib2 as well. */
+   img = imlib_load_image(in_path);
+   if (!img)
+      return 4;
+
+   imlib_context_set_image(img);
+
+   width      = imlib_image_get_width();
+   height     = imlib_image_get_width();
+   imlib_data = imlib_image_get_data_for_reading_only();
+
+#if 0
+   fprintf(stderr, "\nImlib:\n");
+   for (unsigned h = 0; h < height; h++)
+   {
+      for (unsigned w = 0; w < width; w++)
+         fprintf(stderr, "[%08x] ", imlib_data[h * width + w]);
+      fprintf(stderr, "\n");
+   }
+#endif
+
+   if (memcmp(imlib_data, data, width * height * sizeof(uint32_t)) != 0)
+   {
+      fprintf(stderr, "Imlib and RPNG differs!\n");
+      return 5;
+   }
+   else
+      fprintf(stderr, "Imlib and RPNG are equivalent!\n");
+
+   imlib_free_image();
+#endif
+   free(data);
+
+   return 0;
+}
+
+int main(int argc, char *argv[])
+{
+   const char *in_path = "/tmp/test.png";
+
+   if (argc > 2)
+   {
+      fprintf(stderr, "Usage: %s <png file>\n", argv[0]);
+      return 1;
+   }
+
+   if (argc == 2)
+      in_path = argv[1];
+
+   fprintf(stderr, "Doing nonblocking tests...\n");
+
+   if (test_nonblocking_rpng(in_path) != 0)
+   {
+      fprintf(stderr, "Nonblocking test failed.\n");
+      return -1;
+   }
+
+   fprintf(stderr, "Doing blocking tests...\n");
+
+   return test_blocking_rpng(in_path);
+}

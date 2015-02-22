@@ -1,20 +1,41 @@
+/* Copyright  (C) 2010-2015 The RetroArch team
+ *
+ * ---------------------------------------------------------------------------------------
+ * The following license statement only applies to this file (dir_list.h).
+ * ---------------------------------------------------------------------------------------
+ *
+ * Permission is hereby granted, free of charge,
+ * to any person obtaining a copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+ * and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#ifndef __LIBRETRO_SDK_NBIO_H
+#define __LIBRETRO_SDK_NBIO_H
+
 #include <stddef.h>
 #include <boolean.h>
 
-enum nbio_mode_t
-{
-   /* The comments tell which mode in fopen() it corresponds to. */
-   NBIO_READ = 0,/* rb */
-   NBIO_WRITE,   /* wb */
-   NBIO_UPDATE,  /* r+b */
-};
+#define NBIO_READ   0
+#define NBIO_WRITE  1
+#define NBIO_UPDATE 2
 
 struct nbio_t;
 
 /*
  * Creates an nbio structure for performing the given operation on the given file.
  */
-struct nbio_t* nbio_open(const char * filename, enum nbio_mode_t mode);
+struct nbio_t* nbio_open(const char * filename, unsigned mode);
 
 /*
  * Starts reading the given file. When done, it will be available in nbio_get_ptr.
@@ -55,3 +76,5 @@ void nbio_cancel(struct nbio_t* handle);
  * Deletes the nbio structure and its associated pointer.
  */
 void nbio_free(struct nbio_t* handle);
+
+#endif
