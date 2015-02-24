@@ -28,8 +28,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <file/nbio.h>
-
 #ifdef GEKKO
 #include <malloc.h>
 #endif
@@ -151,10 +149,15 @@ static bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *
    return true;
 }
 
-static bool png_read_plte_into_buf(uint32_t *buffer, unsigned entries)
+static bool png_read_plte_into_buf(uint8_t *buf, 
+      uint32_t *buffer, unsigned entries)
 {
    unsigned i;
-   uint8_t buf[256 * 3];
+
+   if (entries > 256)
+      return false;
+
+   buf += 8;
 
    for (i = 0; i < entries; i++)
    {
@@ -216,15 +219,7 @@ bool rpng_nbio_load_image_argb_iterate(uint8_t *buf, struct rpng_t *rpng)
             if (rpng->chunk.size % 3)
                return false;
 
-            if (entries > 256)
-               return false;
-
-            buf += 8;
-
-            for (i = 0; i < entries; i++)
-               rpng->palette[i] = buf[i];
-
-            if (!png_read_plte_into_buf(rpng->palette, entries))
+            if (!png_read_plte_into_buf(buf, rpng->palette, entries))
                return false;
 
             rpng->has_plte = true;
@@ -319,7 +314,6 @@ void rpng_nbio_load_image_free(struct rpng_t *rpng)
    if (!rpng)
       return;
 
-   nbio_free((struct nbio_t*)rpng->userdata);
    if (rpng->idat_buf.data)
       free(rpng->idat_buf.data);
    if (rpng->inflate_buf)
@@ -329,61 +323,14 @@ void rpng_nbio_load_image_free(struct rpng_t *rpng)
       free(rpng);
 }
 
-struct rpng_t *rpng_nbio_load_image_argb_init(const char *path)
-{
-   size_t file_len;
-   struct nbio_t* nbread = NULL;
-   struct rpng_t *rpng = (struct rpng_t*)calloc(1, sizeof(struct rpng_t));
-
-   if (!rpng)
-      goto error;
-
-   rpng->userdata = (void*)nbio_open(path, NBIO_READ);
-
-   nbread = (struct nbio_t*)rpng->userdata;
-
-   if (!nbread)
-      goto error;
-
-   rpng->ptr  = nbio_get_ptr(nbread, &file_len);
-
-   nbio_begin_read(nbread);
-
-   return rpng;
-
-error:
-   if (rpng->userdata)
-      nbio_free((struct nbio_t*)rpng->userdata);
-   if (rpng)
-      free(rpng);
-   return NULL;
-}
-
 bool rpng_nbio_load_image_argb_start(struct rpng_t *rpng)
 {
    unsigned i;
-   size_t file_len;
    char header[8];
-   struct nbio_t *nbread = NULL;
 
    if (!rpng)
       return false;
    
-   nbread    = (struct nbio_t*)rpng->userdata;
-
-   if (!nbread)
-      return false;
-
-   rpng->ptr = nbio_get_ptr(nbread, &file_len);
-
-   if (!rpng->ptr)
-      return false;
-
-   rpng->buff_data = (uint8_t*)rpng->ptr;
-
-   if (!rpng->buff_data)
-      return false;
-
    for (i = 0; i < 8; i++)
       header[i] = rpng->buff_data[i];
 
