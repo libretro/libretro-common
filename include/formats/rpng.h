@@ -27,6 +27,7 @@
 #include <stddef.h>
 
 #include <boolean.h>
+#include <zlib.h>
 
 #ifdef HAVE_CONFIG_H
 #include "../../config.h"
@@ -60,16 +61,38 @@ struct png_ihdr
    uint8_t interlace;
 };
 
+struct rpng_process_t
+{
+   bool adam7_pass_initialized;
+   bool pass_initialized;
+   uint32_t *data;
+   struct png_ihdr ihdr;
+   uint8_t *prev_scanline;
+   uint8_t *decoded_scanline;
+   uint8_t *inflate_buf;
+   size_t inflate_buf_size;
+   unsigned bpp;
+   unsigned pitch;
+   unsigned h;
+   struct
+   {
+      unsigned width;
+      unsigned height;
+      size_t   size;
+      unsigned pos;
+   } pass;
+   z_stream stream;
+};
+
 struct rpng_t
 {
+   struct rpng_process_t process;
    bool has_ihdr;
    bool has_idat;
    bool has_iend;
    bool has_plte;
    struct idat_buffer idat_buf;
    struct png_ihdr ihdr;
-   uint8_t *inflate_buf;
-   size_t inflate_buf_size;
    uint8_t *buff_data;
    uint32_t palette[256];
    struct png_chunk chunk;

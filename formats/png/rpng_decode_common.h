@@ -23,6 +23,144 @@
 #ifndef _RPNG_DECODE_COMMON_H
 #define _RPNG_DECODE_COMMON_H
 
+static enum png_chunk_type png_chunk_type(const struct png_chunk *chunk)
+{
+   unsigned i;
+   struct
+   {
+      const char *id;
+      enum png_chunk_type type;
+   } static const chunk_map[] = {
+      { "IHDR", PNG_CHUNK_IHDR },
+      { "IDAT", PNG_CHUNK_IDAT },
+      { "IEND", PNG_CHUNK_IEND },
+      { "PLTE", PNG_CHUNK_PLTE },
+   };
+
+   for (i = 0; i < ARRAY_SIZE(chunk_map); i++)
+   {
+      if (memcmp(chunk->type, chunk_map[i].id, 4) == 0)
+         return chunk_map[i].type;
+   }
+
+   return PNG_CHUNK_NOOP;
+}
+
+static void copy_line_rgb(uint32_t *data,
+      const uint8_t *decoded, unsigned width, unsigned bpp)
+{
+   unsigned i;
+
+   bpp /= 8;
+
+   for (i = 0; i < width; i++)
+   {
+      uint32_t r, g, b;
+
+      r        = *decoded;
+      decoded += bpp;
+      g        = *decoded;
+      decoded += bpp;
+      b        = *decoded;
+      decoded += bpp;
+      data[i]  = (0xffu << 24) | (r << 16) | (g << 8) | (b << 0);
+   }
+}
+
+static void copy_line_rgba(uint32_t *data,
+      const uint8_t *decoded, unsigned width, unsigned bpp)
+{
+   unsigned i;
+
+   bpp /= 8;
+
+   for (i = 0; i < width; i++)
+   {
+      uint32_t r, g, b, a;
+      r        = *decoded;
+      decoded += bpp;
+      g        = *decoded;
+      decoded += bpp;
+      b        = *decoded;
+      decoded += bpp;
+      a        = *decoded;
+      decoded += bpp;
+      data[i]  = (a << 24) | (r << 16) | (g << 8) | (b << 0);
+   }
+}
+
+static void copy_line_bw(uint32_t *data,
+      const uint8_t *decoded, unsigned width, unsigned depth)
+{
+   unsigned i, bit;
+   static const unsigned mul_table[] = { 0, 0xff, 0x55, 0, 0x11, 0, 0, 0, 0x01 };
+   unsigned mul, mask;
+   
+   if (depth == 16)
+   {
+      for (i = 0; i < width; i++)
+      {
+         uint32_t val = decoded[i << 1];
+         data[i]      = (val * 0x010101) | (0xffu << 24);
+      }
+      return;
+   }
+
+   mul  = mul_table[depth];
+   mask = (1 << depth) - 1;
+   bit  = 0;
+
+   for (i = 0; i < width; i++, bit += depth)
+   {
+      unsigned byte = bit >> 3;
+      unsigned val  = decoded[byte] >> (8 - depth - (bit & 7));
+
+      val          &= mask;
+      val          *= mul;
+      data[i]       = (val * 0x010101) | (0xffu << 24);
+   }
+}
+
+static void copy_line_gray_alpha(uint32_t *data,
+      const uint8_t *decoded, unsigned width,
+      unsigned bpp)
+{
+   unsigned i;
+
+   bpp /= 8;
+
+   for (i = 0; i < width; i++)
+   {
+      uint32_t gray, alpha;
+
+      gray     = *decoded;
+      decoded += bpp;
+      alpha    = *decoded;
+      decoded += bpp;
+
+      data[i]  = (gray * 0x010101) | (alpha << 24);
+   }
+}
+
+static void copy_line_plt(uint32_t *data,
+      const uint8_t *decoded, unsigned width,
+      unsigned depth, const uint32_t *palette)
+{
+   unsigned i, bit;
+   unsigned mask = (1 << depth) - 1;
+
+   bit = 0;
+
+   for (i = 0; i < width; i++, bit += depth)
+   {
+      unsigned byte = bit >> 3;
+      unsigned val  = decoded[byte] >> (8 - depth - (bit & 7));
+
+      val          &= mask;
+      data[i]       = palette[val];
+   }
+}
+
 static void png_pass_geom(const struct png_ihdr *ihdr,
       unsigned width, unsigned height,
       unsigned *bpp_out, unsigned *pitch_out, size_t *pass_size)
@@ -89,164 +227,255 @@ static void deinterlace_pass(uint32_t *data, const struct png_ihdr *ihdr,
    }
 }
 
-static bool png_reverse_filter(uint32_t *data, const struct png_ihdr *ihdr,
-      const uint8_t *inflate_buf, size_t inflate_buf_size,
+static void png_reverse_filter_deinit(struct rpng_process_t *pngp)
+{
+   if (pngp->decoded_scanline)
+      free(pngp->decoded_scanline);
+   pngp->decoded_scanline = NULL;
+   if (pngp->prev_scanline)
+      free(pngp->prev_scanline);
+   pngp->prev_scanline    = NULL;
+
+   pngp->pass_initialized = false;
+   pngp->h                = 0;
+}
+
+static const struct adam7_pass passes[] = {
+   { 0, 0, 8, 8 },
+   { 4, 0, 8, 8 },
+   { 0, 4, 4, 8 },
+   { 2, 0, 4, 4 },
+   { 0, 2, 2, 4 },
+   { 1, 0, 2, 2 },
+   { 0, 1, 1, 2 },
+};
+
+static int png_reverse_filter_init(const struct png_ihdr *ihdr,
+      const uint8_t *inflate_buf, struct rpng_process_t *pngp,
       const uint32_t *palette)
 {
-   unsigned i, h;
-   unsigned bpp;
-   unsigned pitch;
    size_t pass_size;
-   uint8_t *prev_scanline = NULL;
-   uint8_t *decoded_scanline = NULL;
-   bool ret = true;
 
-   png_pass_geom(ihdr, ihdr->width, ihdr->height, &bpp, &pitch, &pass_size);
-
-   if (inflate_buf_size < pass_size)
-      return false;
-
-   prev_scanline    = (uint8_t*)calloc(1, pitch);
-   decoded_scanline = (uint8_t*)calloc(1, pitch);
-
-   if (!prev_scanline || !decoded_scanline)
-      GOTO_END_ERROR();
-
-   for (h = 0; h < ihdr->height;
-         h++, inflate_buf += pitch, data += ihdr->width)
+   if (!pngp->adam7_pass_initialized && ihdr->interlace)
    {
-      unsigned filter = *inflate_buf++;
+      if (ihdr->width <= passes[pngp->pass.pos].x ||
+            ihdr->height <= passes[pngp->pass.pos].y) /* Empty pass */
+         return 1;
 
-      switch (filter)
+      pngp->pass.width  = (ihdr->width - 
+            passes[pngp->pass.pos].x + passes[pngp->pass.pos].stride_x - 1) / passes[pngp->pass.pos].stride_x;
+      pngp->pass.height = (ihdr->height - passes[pngp->pass.pos].y + 
+            passes[pngp->pass.pos].stride_y - 1) / passes[pngp->pass.pos].stride_y;
+
+      pngp->data = (uint32_t*)malloc(
+            pngp->pass.width * pngp->pass.height * sizeof(uint32_t));
+
+      if (!pngp->data)
+         return -1;
+
+      pngp->ihdr        = *ihdr;
+      pngp->ihdr.width  = pngp->pass.width;
+      pngp->ihdr.height = pngp->pass.height;
+
+      png_pass_geom(&pngp->ihdr, pngp->pass.width,
+            pngp->pass.height, NULL, NULL, &pngp->pass.size);
+
+      if (pngp->pass.size > pngp->stream.total_out)
       {
-         case 0: /* None */
-            memcpy(decoded_scanline, inflate_buf, pitch);
-            break;
-
-         case 1: /* Sub */
-            for (i = 0; i < bpp; i++)
-               decoded_scanline[i] = inflate_buf[i];
-            for (i = bpp; i < pitch; i++)
-               decoded_scanline[i] = decoded_scanline[i - bpp] + inflate_buf[i];
-            break;
-
-         case 2: /* Up */
-            for (i = 0; i < pitch; i++)
-               decoded_scanline[i] = prev_scanline[i] + inflate_buf[i];
-            break;
-
-         case 3: /* Average */
-            for (i = 0; i < bpp; i++)
-            {
-               uint8_t avg = prev_scanline[i] >> 1;
-               decoded_scanline[i] = avg + inflate_buf[i];
-            }
-            for (i = bpp; i < pitch; i++)
-            {
-               uint8_t avg = (decoded_scanline[i - bpp] + prev_scanline[i]) >> 1;
-               decoded_scanline[i] = avg + inflate_buf[i];
-            }
-            break;
-
-         case 4: /* Paeth */
-            for (i = 0; i < bpp; i++)
-               decoded_scanline[i] = paeth(0, prev_scanline[i], 0) + inflate_buf[i];
-            for (i = bpp; i < pitch; i++)
-               decoded_scanline[i] = paeth(decoded_scanline[i - bpp],
-                     prev_scanline[i], prev_scanline[i - bpp]) + inflate_buf[i];
-            break;
-
-         default:
-            GOTO_END_ERROR();
+         free(pngp->data);
+         return -1;
       }
 
-      if (ihdr->color_type == 0)
-         copy_line_bw(data, decoded_scanline, ihdr->width, ihdr->depth);
-      else if (ihdr->color_type == 2)
-         copy_line_rgb(data, decoded_scanline, ihdr->width, ihdr->depth);
-      else if (ihdr->color_type == 3)
-         copy_line_plt(data, decoded_scanline, ihdr->width,
-               ihdr->depth, palette);
-      else if (ihdr->color_type == 4)
-         copy_line_gray_alpha(data, decoded_scanline, ihdr->width,
-               ihdr->depth);
-      else if (ihdr->color_type == 6)
-         copy_line_rgba(data, decoded_scanline, ihdr->width, ihdr->depth);
+      pngp->adam7_pass_initialized = true;
 
-      memcpy(prev_scanline, decoded_scanline, pitch);
+      return 0;
+   }
+   
+   if (pngp->pass_initialized)
+      return 0;
+
+   png_pass_geom(ihdr, ihdr->width, ihdr->height, &pngp->bpp, &pngp->pitch, &pass_size);
+
+   if (pngp->stream.total_out < pass_size)
+      return -1;
+
+   pngp->prev_scanline    = (uint8_t*)calloc(1, pngp->pitch);
+   pngp->decoded_scanline = (uint8_t*)calloc(1, pngp->pitch);
+
+   if (!pngp->prev_scanline || !pngp->decoded_scanline)
+      goto error;
+
+   pngp->h = 0;
+   pngp->pass_initialized = true;
+
+   return 0;
+
+error:
+   png_reverse_filter_deinit(pngp);
+   return -1;
+}
+
+static int png_reverse_filter_wrapper(uint32_t *data, const struct png_ihdr *ihdr,
+      const uint8_t *inflate_buf, struct rpng_process_t *pngp,
+      const uint32_t *palette, unsigned filter)
+{
+   unsigned i;
+
+   switch (filter)
+   {
+      case 0: /* None */
+         memcpy(pngp->decoded_scanline, inflate_buf, pngp->pitch);
+         break;
+
+      case 1: /* Sub */
+         for (i = 0; i < pngp->bpp; i++)
+            pngp->decoded_scanline[i] = inflate_buf[i];
+         for (i = pngp->bpp; i < pngp->pitch; i++)
+            pngp->decoded_scanline[i] = pngp->decoded_scanline[i - pngp->bpp] + inflate_buf[i];
+         break;
+
+      case 2: /* Up */
+         for (i = 0; i < pngp->pitch; i++)
+            pngp->decoded_scanline[i] = pngp->prev_scanline[i] + inflate_buf[i];
+         break;
+
+      case 3: /* Average */
+         for (i = 0; i < pngp->bpp; i++)
+         {
+            uint8_t avg = pngp->prev_scanline[i] >> 1;
+            pngp->decoded_scanline[i] = avg + inflate_buf[i];
+         }
+         for (i = pngp->bpp; i < pngp->pitch; i++)
+         {
+            uint8_t avg = (pngp->decoded_scanline[i - pngp->bpp] + pngp->prev_scanline[i]) >> 1;
+            pngp->decoded_scanline[i] = avg + inflate_buf[i];
+         }
+         break;
+
+      case 4: /* Paeth */
+         for (i = 0; i < pngp->bpp; i++)
+            pngp->decoded_scanline[i] = paeth(0, pngp->prev_scanline[i], 0) + inflate_buf[i];
+         for (i = pngp->bpp; i < pngp->pitch; i++)
+            pngp->decoded_scanline[i] = paeth(pngp->decoded_scanline[i - pngp->bpp],
+                  pngp->prev_scanline[i], pngp->prev_scanline[i - pngp->bpp]) + inflate_buf[i];
+         break;
+
+      default:
+         return -1;
    }
 
-end:
-   free(decoded_scanline);
-   free(prev_scanline);
-   return ret;
+   switch (ihdr->color_type)
+   {
+      case 0:
+         copy_line_bw(data, pngp->decoded_scanline, ihdr->width, ihdr->depth);
+         break;
+      case 2:
+         copy_line_rgb(data, pngp->decoded_scanline, ihdr->width, ihdr->depth);
+         break;
+      case 3:
+         copy_line_plt(data, pngp->decoded_scanline, ihdr->width,
+               ihdr->depth, palette);
+         break;
+      case 4:
+         copy_line_gray_alpha(data, pngp->decoded_scanline, ihdr->width,
+               ihdr->depth);
+         break;
+      case 6:
+         copy_line_rgba(data, pngp->decoded_scanline, ihdr->width, ihdr->depth);
+         break;
+   }
+
+   memcpy(pngp->prev_scanline, pngp->decoded_scanline, pngp->pitch);
+
+   return 0;
+}
+
+static bool png_reverse_filter(uint32_t *data, const struct png_ihdr *ihdr,
+      const uint8_t *inflate_buf, struct rpng_process_t *pngp,
+      const uint32_t *palette)
+{
+   int ret;
+
+   if (png_reverse_filter_init(ihdr, inflate_buf, pngp, palette) == -1)
+      return -1;
+
+   do{
+      ret = 1;
+
+      if (pngp->h < ihdr->height)
+      {
+         unsigned filter = *inflate_buf++;
+         ret = png_reverse_filter_wrapper(data,
+               ihdr, inflate_buf, pngp, palette, filter);
+      }
+
+      if (ret == 1 || ret == -1)
+      {
+         png_reverse_filter_deinit(pngp);
+         break;
+      }
+
+      pngp->h++;
+      inflate_buf += pngp->pitch;
+      data += ihdr->width;
+   }while(1);
+
+   if (ret == 1)
+      return true;
+   return false;
 }
 
 static bool png_reverse_filter_adam7(uint32_t *data,
       const struct png_ihdr *ihdr,
-      const uint8_t *inflate_buf, size_t inflate_buf_size,
+      const uint8_t *inflate_buf, struct rpng_process_t *pngp,
       const uint32_t *palette)
 {
-   unsigned pass;
-   static const struct adam7_pass passes[] = {
-      { 0, 0, 8, 8 },
-      { 4, 0, 8, 8 },
-      { 0, 4, 4, 8 },
-      { 2, 0, 4, 4 },
-      { 0, 2, 2, 4 },
-      { 1, 0, 2, 2 },
-      { 0, 1, 1, 2 },
-   };
 
-   for (pass = 0; pass < ARRAY_SIZE(passes); pass++)
+   for (; pngp->pass.pos < ARRAY_SIZE(passes); pngp->pass.pos++)
    {
-      unsigned pass_width, pass_height;
-      size_t pass_size;
-      struct png_ihdr tmp_ihdr;
-      uint32_t *tmp_data = NULL;
+      int ret = png_reverse_filter_init(ihdr, inflate_buf, pngp, palette);
 
-      if (ihdr->width <= passes[pass].x ||
-            ihdr->height <= passes[pass].y) /* Empty pass */
+      if (ret == 1)
          continue;
-
-      pass_width  = (ihdr->width - 
-            passes[pass].x + passes[pass].stride_x - 1) / passes[pass].stride_x;
-      pass_height = (ihdr->height - passes[pass].y + 
-            passes[pass].stride_y - 1) / passes[pass].stride_y;
-
-      tmp_data = (uint32_t*)malloc(
-            pass_width * pass_height * sizeof(uint32_t));
-
-      if (!tmp_data)
+      if (ret == -1)
          return false;
 
-      tmp_ihdr = *ihdr;
-      tmp_ihdr.width = pass_width;
-      tmp_ihdr.height = pass_height;
-
-      png_pass_geom(&tmp_ihdr, pass_width,
-            pass_height, NULL, NULL, &pass_size);
-
-      if (pass_size > inflate_buf_size)
+      if (!png_reverse_filter(pngp->data,
+               &pngp->ihdr, inflate_buf, pngp, palette))
       {
-         free(tmp_data);
+         free(pngp->data);
          return false;
       }
 
-      if (!png_reverse_filter(tmp_data,
-               &tmp_ihdr, inflate_buf, pass_size, palette))
-      {
-         free(tmp_data);
-         return false;
-      }
-
-      inflate_buf += pass_size;
-      inflate_buf_size -= pass_size;
+      inflate_buf            += pngp->pass.size;
+      pngp->stream.total_out -= pngp->pass.size;
 
       deinterlace_pass(data,
-            ihdr, tmp_data, pass_width, pass_height, &passes[pass]);
-      free(tmp_data);
+            ihdr, pngp->data, pngp->pass.width, pngp->pass.height, &passes[pngp->pass.pos]);
+
+      free(pngp->data);
+
+      pngp->pass.width  = 0;
+      pngp->pass.height = 0;
+      pngp->pass.size   = 0;
+      pngp->adam7_pass_initialized = false;
    }
+
+   return true;
+}
+
+static bool png_reverse_filter_loop(struct rpng_t *rpng,
+      uint32_t **data)
+{
+   if (rpng->ihdr.interlace == 1)
+   {
+      if (!png_reverse_filter_adam7(*data,
+               &rpng->ihdr, rpng->process.inflate_buf, &rpng->process, rpng->palette))
+         return false;
+   }
+   else if (!png_reverse_filter(*data,
+            &rpng->ihdr, rpng->process.inflate_buf, &rpng->process, rpng->palette))
+      return false;
 
    return true;
 }
