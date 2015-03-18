@@ -83,7 +83,7 @@ static bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *
    return true;
 }
 
-static bool png_read_plte_into_buf(uint8_t *buf, 
+static bool png_read_plte_into_buf(uint8_t *buf,
       uint32_t *buffer, unsigned entries)
 {
    unsigned i;
@@ -225,7 +225,7 @@ bool rpng_nbio_load_image_argb_start(struct rpng_t *rpng)
 
    if (!rpng)
       return false;
-   
+
    for (i = 0; i < 8; i++)
       header[i] = rpng->buff_data[i];
 
