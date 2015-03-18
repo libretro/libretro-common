@@ -57,7 +57,7 @@ static bool png_read_chunk(FILE **fd, struct png_chunk *chunk)
    if (!chunk->data)
       return false;
 
-   if (fread(chunk->data, 1, chunk->size + 
+   if (fread(chunk->data, 1, chunk->size +
             sizeof(uint32_t), file) != (chunk->size + sizeof(uint32_t)))
    {
       free(chunk->data);
@@ -248,7 +248,7 @@ bool rpng_load_image_argb(const char *path, uint32_t **data,
       GOTO_END_ERROR();
 
    /* feof() apparently isn't triggered after a seek (IEND). */
-   for (pos = ftell(file); 
+   for (pos = ftell(file);
          pos < file_len && pos >= 0; pos = ftell(file))
    {
       if (!rpng_load_image_argb_iterate(&file, &rpng))
