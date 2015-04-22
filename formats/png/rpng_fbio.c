@@ -20,15 +20,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <formats/rpng.h>
-
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef GEKKO
-#include <malloc.h>
-#endif
+#include <boolean.h>
 
 #include "rpng_common.h"
 #include "rpng_decode.h"
@@ -260,6 +256,14 @@ bool rpng_load_image_argb(const char *path, uint32_t **data,
 
    if (!rpng_load_image_argb_process_init(&rpng, data, width,
             height))
+      GOTO_END_ERROR();
+
+   do{
+      retval = rpng_load_image_argb_process_inflate_init(&rpng, data,
+               width, height);
+   }while(retval == 0);
+
+   if (retval == -1)
       GOTO_END_ERROR();
 
    do{

@@ -16,47 +16,54 @@ struct nbio_t
     * -2 - the pointer was reallocated since the last operation
     */
    signed char op;
+   signed char mode;
 };
 
-static const char * modes[]={ "rb", "wb", "r+b" };
+static const char * modes[]={ "rb", "wb", "r+b", "rb", "wb", "r+b" };
 
 struct nbio_t* nbio_open(const char * filename, unsigned mode)
 {
    struct nbio_t* handle = NULL;
-   FILE* f=fopen(filename, modes[mode]);
+   FILE* f               = fopen(filename, modes[mode]);
    if (!f)
       return NULL;
 
-   handle=(struct nbio_t*)malloc(sizeof(struct nbio_t));
+   handle                = (struct nbio_t*)malloc(sizeof(struct nbio_t));
 
    if (!handle)
+      goto error;
+
+   handle->f             = f;
+   handle->len           = 0;
+
+   switch (mode)
    {
-      fclose(f);
-      return NULL;
+      case NBIO_WRITE:
+      case BIO_WRITE:
+         break;
+      default:
+         fseek(handle->f, 0, SEEK_END);
+         handle->len = ftell(handle->f);
+         break;
    }
 
-   handle->f   = f;
-   handle->len = 0;
-
-   if (mode != NBIO_WRITE)
-   {
-      fseek(handle->f, 0, SEEK_END);
-      handle->len = ftell(handle->f);
-   }
-
-   handle->data = malloc(handle->len);
+   handle->mode          = mode;
+   handle->data          = malloc(handle->len);
 
    if (handle->len && !handle->data)
-   {
-      free(handle);
-      fclose(f);
-      return NULL;
-   }
+      goto error;
 
-   handle->progress = handle->len;
-   handle->op       = -2;
+   handle->progress      = handle->len;
+   handle->op            = -2;
 
    return handle;
+
+error:
+   if (handle)
+      free(handle);
+   handle = NULL;
+   fclose(f);
+   return NULL;
 }
 
 void nbio_begin_read(struct nbio_t* handle)
@@ -78,6 +85,9 @@ void nbio_begin_read(struct nbio_t* handle)
 
 void nbio_begin_write(struct nbio_t* handle)
 {
+   if (!handle)
+      return;
+
    if (handle->op >= 0)
    {
       puts("ERROR - attempted file write operation while busy");
@@ -99,10 +109,30 @@ bool nbio_iterate(struct nbio_t* handle)
    if (amount > handle->len - handle->progress)
       amount = handle->len - handle->progress;
 
-   if (handle->op == NBIO_READ)
-      fread((char*)handle->data + handle->progress, 1,amount, handle->f);
-   if (handle->op == NBIO_WRITE)
-      fwrite((char*)handle->data + handle->progress, 1,amount, handle->f);
+   switch (handle->op)
+   {
+      case NBIO_READ:
+         if (handle->mode == BIO_READ)
+         {
+            amount = handle->len;
+            fread((char*)handle->data, 1, amount, handle->f);
+         }
+         else
+            fread((char*)handle->data + handle->progress, 1, amount, handle->f);
+         break;
+      case NBIO_WRITE:
+         if (handle->mode == BIO_WRITE)
+         {
+            size_t written = 0;
+            amount = handle->len;
+            written = fwrite((char*)handle->data, 1, amount, handle->f);
+            if (written != amount)
+               return false;
+         }
+         else
+            fwrite((char*)handle->data + handle->progress, 1, amount, handle->f);
+         break;
+   }
 
    handle->progress += amount;
 
@@ -113,6 +143,9 @@ bool nbio_iterate(struct nbio_t* handle)
 
 void nbio_resize(struct nbio_t* handle, size_t len)
 {
+   if (!handle)
+      return;
+
    if (handle->op >= 0)
    {
       puts("ERROR - attempted file resize operation while busy");
@@ -143,6 +176,9 @@ void* nbio_get_ptr(struct nbio_t* handle, size_t* len)
 
 void nbio_cancel(struct nbio_t* handle)
 {
+   if (!handle)
+      return;
+
    handle->op = -1;
    handle->progress = handle->len;
 }

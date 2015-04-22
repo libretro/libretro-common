@@ -20,18 +20,29 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifdef IOS
-#import <Availability.h>
+#ifdef __APPLE__
+#include <AvailabilityMacros.h>
+#endif
 
+#ifdef __OBJC__
+
+#if (MAC_OS_X_VERSION_MAX_ALLOWED <= MAC_OS_X_VERSION_10_4)
+typedef int NSInteger;
+typedef unsigned NSUInteger;
+#endif
+
+#endif
+
+#ifdef IOS
 #ifndef __IPHONE_5_0
 #warning "This project uses features only available in iOS SDK 5.0 and later."
 #endif
 
 #ifdef __OBJC__
-    #import <UIKit/UIKit.h>
-    #import <GLKit/GLKit.h>
-    #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <GLKit/GLKit.h>
+#import <Foundation/Foundation.h>
 
-    #import <objc/runtime.h>
+#include <objc/objc-runtime.h>
 #endif
 #endif

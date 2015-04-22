@@ -27,11 +27,7 @@
 #include <stddef.h>
 
 #include <boolean.h>
-#include <zlib.h>
-
-#ifdef HAVE_CONFIG_H
-#include "../../config.h"
-#endif
+#include <file/file_extract.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +60,7 @@ struct png_ihdr
 struct rpng_process_t
 {
    bool initialized;
+   bool inflate_initialized;
    bool adam7_pass_initialized;
    bool pass_initialized;
    uint32_t *data;
@@ -86,7 +83,8 @@ struct rpng_process_t
       size_t   size;
       unsigned pos;
    } pass;
-   z_stream stream;
+   void *stream;
+   zlib_file_handle_t handle;
 };
 
 struct rpng_t
@@ -100,7 +98,6 @@ struct rpng_t
    struct png_ihdr ihdr;
    uint8_t *buff_data;
    uint32_t palette[256];
-   struct png_chunk chunk;
 };
 
 bool rpng_load_image_argb(const char *path, uint32_t **data,
@@ -111,9 +108,12 @@ struct rpng_t *rpng_nbio_load_image_argb_init(const char *path);
 void rpng_nbio_load_image_free(struct rpng_t *rpng);
 
 bool rpng_nbio_load_image_argb_iterate(uint8_t *buf,
-      struct rpng_t *rpng);
+      struct rpng_t *rpng, unsigned *ret);
 
 int rpng_nbio_load_image_argb_process(struct rpng_t *rpng,
+      uint32_t **data, unsigned *width, unsigned *height);
+
+int rpng_load_image_argb_process_inflate_init(struct rpng_t *rpng,
       uint32_t **data, unsigned *width, unsigned *height);
 
 bool rpng_nbio_load_image_argb_start(struct rpng_t *rpng);

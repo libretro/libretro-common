@@ -20,15 +20,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <formats/rpng.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef GEKKO
-#include <malloc.h>
-#endif
 
 #include "rpng_common.h"
 #include "rpng_decode.h"
@@ -104,14 +98,13 @@ static bool png_read_plte_into_buf(uint8_t *buf,
    return true;
 }
 
-bool rpng_nbio_load_image_argb_iterate(uint8_t *buf, struct rpng_t *rpng)
+bool rpng_nbio_load_image_argb_iterate(uint8_t *buf, struct rpng_t *rpng, unsigned *ret)
 {
    unsigned i;
 
-   rpng->chunk.size = 0;
-   rpng->chunk.type[0] = '\0';
+   struct png_chunk chunk = {0};
 
-   if (!read_chunk_header(buf, &rpng->chunk))
+   if (!read_chunk_header(buf, &chunk))
       return false;
 
 #if 0
@@ -121,43 +114,43 @@ bool rpng_nbio_load_image_argb_iterate(uint8_t *buf, struct rpng_t *rpng)
    }
 #endif
 
-   switch (png_chunk_type(&rpng->chunk))
+   switch (png_chunk_type(&chunk))
    {
       case PNG_CHUNK_NOOP:
       default:
          break;
 
       case PNG_CHUNK_ERROR:
-         return false;
+         goto error;
 
       case PNG_CHUNK_IHDR:
          if (rpng->has_ihdr || rpng->has_idat || rpng->has_iend)
-            return false;
+            goto error;
 
-         if (rpng->chunk.size != 13)
-            return false;
+         if (chunk.size != 13)
+            goto error;
 
          if (!png_parse_ihdr(buf, &rpng->ihdr))
-            return false;
+            goto error;
 
          if (!png_process_ihdr(&rpng->ihdr))
-            return false;
+            goto error;
 
          rpng->has_ihdr = true;
          break;
 
       case PNG_CHUNK_PLTE:
          {
-            unsigned entries = rpng->chunk.size / 3;
+            unsigned entries = chunk.size / 3;
 
             if (!rpng->has_ihdr || rpng->has_plte || rpng->has_iend || rpng->has_idat)
-               return false;
+               goto error;
 
-            if (rpng->chunk.size % 3)
-               return false;
+            if (chunk.size % 3)
+               goto error;
 
             if (!png_read_plte_into_buf(buf, rpng->palette, entries))
-               return false;
+               goto error;
 
             rpng->has_plte = true;
          }
@@ -165,30 +158,35 @@ bool rpng_nbio_load_image_argb_iterate(uint8_t *buf, struct rpng_t *rpng)
 
       case PNG_CHUNK_IDAT:
          if (!(rpng->has_ihdr) || rpng->has_iend || (rpng->ihdr.color_type == PNG_IHDR_COLOR_PLT && !(rpng->has_plte)))
-            return false;
+            goto error;
 
-         if (!png_realloc_idat(&rpng->chunk, &rpng->idat_buf))
-            return false;
+         if (!png_realloc_idat(&chunk, &rpng->idat_buf))
+            goto error;
 
          buf += 8;
 
-         for (i = 0; i < rpng->chunk.size; i++)
+         for (i = 0; i < chunk.size; i++)
             rpng->idat_buf.data[i + rpng->idat_buf.size] = buf[i];
 
-         rpng->idat_buf.size += rpng->chunk.size;
+         rpng->idat_buf.size += chunk.size;
 
          rpng->has_idat = true;
          break;
 
       case PNG_CHUNK_IEND:
          if (!(rpng->has_ihdr) || !(rpng->has_idat))
-            return false;
+            goto error;
 
          rpng->has_iend = true;
-         return false;
+         goto error;
    }
 
+   *ret = 4 + 4 + chunk.size + 4;
+
    return true;
+
+error:
+   return false;
 }
 
 int rpng_nbio_load_image_argb_process(struct rpng_t *rpng,
@@ -199,6 +197,16 @@ int rpng_nbio_load_image_argb_process(struct rpng_t *rpng,
       if (!rpng_load_image_argb_process_init(rpng, data, width,
                height))
          return PNG_PROCESS_ERROR;
+      return 0;
+   }
+
+   if (!rpng->process.inflate_initialized)
+   {
+      int ret = rpng_load_image_argb_process_inflate_init(rpng, data,
+               width, height);
+      if (ret == -1)
+         return PNG_PROCESS_ERROR;
+      return 0;
    }
 
    return png_reverse_filter_iterate(rpng, data);

@@ -20,10 +20,6 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <formats/rpng.h>
-
-#include <zlib.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,8 +45,9 @@ static void dword_write_be(uint8_t *buf, uint32_t val)
 
 static bool png_write_crc(FILE *file, const uint8_t *data, size_t size)
 {
-   uint32_t crc = crc32(0, data, size);
    uint8_t crc_raw[4] = {0};
+   uint32_t crc = zlib_crc32_calculate(data, size);
+
    dword_write_be(crc_raw, crc);
    return fwrite(crc_raw, 1, sizeof(crc_raw), file) == sizeof(crc_raw);
 }
@@ -213,8 +210,7 @@ static bool rpng_save_image(const char *path,
    uint8_t *paeth_filtered = NULL;
    uint8_t *prev_encoded   = NULL;
    uint8_t *encode_target  = NULL;
-
-   z_stream stream = {0};
+   void *stream            = NULL;
 
    FILE *file = fopen(path, "wb");
    if (!file)
@@ -268,8 +264,8 @@ static bool rpng_save_image(const char *path,
       unsigned avg_score   = filter_avg(avg_filtered, rgba_line, prev_encoded, width, bpp);
       unsigned paeth_score = filter_paeth(paeth_filtered, rgba_line, prev_encoded, width, bpp);
 
-      uint8_t filter = 0;
-      unsigned min_sad = none_score;
+      uint8_t filter       = 0;
+      unsigned min_sad     = none_score;
       const uint8_t *chosen_filtered = rgba_line;
 
       if (sub_score < min_sad)
@@ -310,22 +306,31 @@ static bool rpng_save_image(const char *path,
    if (!deflate_buf)
       GOTO_END_ERROR();
 
-   stream.next_in   = encode_buf;
-   stream.avail_in  = encode_buf_size;
-   stream.next_out  = deflate_buf + 8;
-   stream.avail_out = encode_buf_size * 2;
+   stream = zlib_stream_new();
 
-   deflateInit(&stream, 9);
-   if (deflate(&stream, Z_FINISH) != Z_STREAM_END)
+   if (!stream)
+      GOTO_END_ERROR();
+
+   zlib_set_stream(
+         stream,
+         encode_buf_size,
+         encode_buf_size * 2,
+         encode_buf,
+         deflate_buf + 8);
+
+   zlib_deflate_init(stream, 9);
+
+   if (zlib_deflate_data_to_file(stream) != 1)
    {
-      deflateEnd(&stream);
+      zlib_stream_deflate_free(stream);
       GOTO_END_ERROR();
    }
-   deflateEnd(&stream);
+
+   zlib_stream_deflate_free(stream);
 
    memcpy(deflate_buf + 4, "IDAT", 4);
-   dword_write_be(deflate_buf + 0, stream.total_out);
-   if (!png_write_idat(file, deflate_buf, stream.total_out + 8))
+   dword_write_be(deflate_buf + 0, zlib_stream_get_total_out(stream));
+   if (!png_write_idat(file, deflate_buf, zlib_stream_get_total_out(stream) + 8))
       GOTO_END_ERROR();
 
    if (!png_write_iend(file))
@@ -342,6 +347,8 @@ end:
    free(sub_filtered);
    free(avg_filtered);
    free(paeth_filtered);
+
+   zlib_stream_free(stream);
    return ret;
 }
 

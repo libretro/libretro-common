@@ -20,9 +20,6 @@
 #include <stdint.h>
 #include <boolean.h>
 
-#include <formats/rpng.h>
-#include <formats/tga.h>
-
 enum image_process_code
 {
    IMAGE_PROCESS_ERROR     = -2,
@@ -38,11 +35,10 @@ struct texture_image
 #ifdef _XBOX1
    unsigned x;
    unsigned y;
-   LPDIRECT3DTEXTURE pixels;
-   LPDIRECT3DVERTEXBUFFER vertex_buf;
-#else
-   uint32_t *pixels;
+   void *texture_buf;
+   void *vertex_buf;
 #endif
+   uint32_t *pixels;
 };
 
 bool texture_image_load(struct texture_image *img, const char *path);
