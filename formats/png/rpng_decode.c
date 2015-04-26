@@ -174,7 +174,7 @@ static void png_reverse_filter_copy_line_bw(uint32_t *data,
    unsigned i, bit;
    static const unsigned mul_table[] = { 0, 0xff, 0x55, 0, 0x11, 0, 0, 0, 0x01 };
    unsigned mul, mask;
-
+   
    if (depth == 16)
    {
       for (i = 0; i < width; i++)
@@ -296,7 +296,7 @@ static void png_reverse_filter_adam7_deinterlace_pass(uint32_t *data,
          y++, data += ihdr->width * pass->stride_y, input += pass_width)
    {
       uint32_t *out = data;
-
+     
       for (x = 0; x < pass_width; x++, out += pass->stride_x)
          *out = input[x];
    }
@@ -336,9 +336,9 @@ static int png_reverse_filter_init(const struct png_ihdr *ihdr,
             ihdr->height <= passes[pngp->pass.pos].y) /* Empty pass */
          return 1;
 
-      pngp->pass.width  = (ihdr->width -
+      pngp->pass.width  = (ihdr->width - 
             passes[pngp->pass.pos].x + passes[pngp->pass.pos].stride_x - 1) / passes[pngp->pass.pos].stride_x;
-      pngp->pass.height = (ihdr->height - passes[pngp->pass.pos].y +
+      pngp->pass.height = (ihdr->height - passes[pngp->pass.pos].y + 
             passes[pngp->pass.pos].stride_y - 1) / passes[pngp->pass.pos].stride_y;
 
       pngp->data = (uint32_t*)malloc(
@@ -613,10 +613,10 @@ end:
    *height = rpng->ihdr.height;
 #ifdef GEKKO
    /* we often use these in textures, make sure they're 32-byte aligned */
-   *data = (uint32_t*)memalign(32, rpng->ihdr.width *
+   *data = (uint32_t*)memalign(32, rpng->ihdr.width * 
          rpng->ihdr.height * sizeof(uint32_t));
 #else
-   *data = (uint32_t*)malloc(rpng->ihdr.width *
+   *data = (uint32_t*)malloc(rpng->ihdr.width * 
          rpng->ihdr.height * sizeof(uint32_t));
 #endif
    if (!*data)

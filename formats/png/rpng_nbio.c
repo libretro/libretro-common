@@ -77,7 +77,7 @@ static bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *
    return true;
 }
 
-static bool png_read_plte_into_buf(uint8_t *buf,
+static bool png_read_plte_into_buf(uint8_t *buf, 
       uint32_t *buffer, unsigned entries)
 {
    unsigned i;
@@ -221,6 +221,11 @@ void rpng_nbio_load_image_free(struct rpng_t *rpng)
       free(rpng->idat_buf.data);
    if (rpng->process.inflate_buf)
       free(rpng->process.inflate_buf);
+   if (rpng->process.stream)
+   {
+      zlib_stream_free(rpng->process.stream);
+      free(rpng->process.stream);
+   }
 
    if (rpng)
       free(rpng);
@@ -233,7 +238,7 @@ bool rpng_nbio_load_image_argb_start(struct rpng_t *rpng)
 
    if (!rpng)
       return false;
-
+   
    for (i = 0; i < 8; i++)
       header[i] = rpng->buff_data[i];
 
