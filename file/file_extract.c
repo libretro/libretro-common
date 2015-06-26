@@ -53,14 +53,14 @@ struct zlib_file_backend
 
 static bool zlib_write_file(const char *path, const void *data, ssize_t size)
 {
-   bool ret   = false;
+   ssize_t ret   = 0;
    FILE *file = fopen(path, "wb");
    if (!file)
       return false;
 
-   ret = fwrite(data, 1, size, file) == size;
+   ret = fwrite(data, 1, size, file);
    fclose(file);
-   return ret;
+   return (ret == size);
 }
 
 
@@ -448,7 +448,10 @@ int zlib_inflate_data_to_file(zlib_file_handle_t *handle,
       const uint8_t *cdata, uint32_t csize, uint32_t size, uint32_t checksum)
 {
    if (handle)
+   {
       zlib_stream_free(handle->stream);
+      free(handle->stream);
+   }
 
    if (!handle || ret == -1)
    {
@@ -476,6 +479,155 @@ end:
    return ret;
 }
 
+
+int zlib_parse_file_iterate_step_internal(
+      zlib_transfer_t *state, char *filename,
+      const uint8_t **cdata,
+      unsigned *cmode, uint32_t *size, uint32_t *csize,
+      uint32_t *checksum, unsigned *payback)
+{
+   uint32_t offset;
+   uint32_t namelength, extralength, commentlength,
+            offsetNL, offsetEL;
+   uint32_t signature = read_le(state->directory + 0, 4);
+
+   if (signature != CENTRAL_FILE_HEADER_SIGNATURE)
+      return 0;
+
+   *cmode         = read_le(state->directory + 10, 2);
+   *checksum      = read_le(state->directory + 16, 4);
+   *csize         = read_le(state->directory + 20, 4);
+   *size          = read_le(state->directory + 24, 4);
+
+   namelength    = read_le(state->directory + 28, 2);
+   extralength   = read_le(state->directory + 30, 2);
+   commentlength = read_le(state->directory + 32, 2);
+
+   if (namelength >= PATH_MAX_LENGTH)
+      return -1;
+
+   memcpy(filename, state->directory + 46, namelength);
+
+   offset        = read_le(state->directory + 42, 4);
+   offsetNL      = read_le(state->data + offset + 26, 2);
+   offsetEL      = read_le(state->data + offset + 28, 2);
+
+   *cdata = state->data + offset + 30 + offsetNL + offsetEL;
+
+   *payback = 46 + namelength + extralength + commentlength;
+
+   return 1;
+}
+
+int zlib_parse_file_iterate_step(zlib_transfer_t *state,
+      const char *valid_exts, void *userdata, zlib_file_cb file_cb)
+{
+   const uint8_t *cdata = NULL;
+   uint32_t checksum    = 0;
+   uint32_t size        = 0;
+   uint32_t csize       = 0;
+   unsigned cmode       = 0;
+   unsigned payload     = 0;
+   char filename[PATH_MAX_LENGTH] = {0};
+   int ret = zlib_parse_file_iterate_step_internal(state, filename, &cdata, &cmode, &size, &csize,
+         &checksum, &payload);
+
+   if (ret != 1)
+      return ret;
+
+#if 0
+   RARCH_LOG("OFFSET: %u, CSIZE: %u, SIZE: %u.\n", offset + 30 + 
+         offsetNL + offsetEL, csize, size);
+#endif
+
+   if (!file_cb(filename, valid_exts, cdata, cmode,
+            csize, size, checksum, userdata))
+      return 0;
+
+   state->directory += payload;
+
+   return 1;
+}
+
+int zlib_parse_file_init(zlib_transfer_t *state,
+      const char *file)
+{
+   state->backend = zlib_get_default_file_backend();
+
+   if (!state->backend)
+      return -1;
+
+   state->handle = state->backend->open(file);
+   if (!state->handle)
+      return -1;
+
+   state->zip_size = state->backend->size(state->handle);
+   if (state->zip_size < 22)
+      return -1;
+
+   state->data   = state->backend->data(state->handle);
+   state->footer = state->data + state->zip_size - 22;
+
+   for (;; state->footer--)
+   {
+      if (state->footer <= state->data + 22)
+         return -1;
+      if (read_le(state->footer, 4) == END_OF_CENTRAL_DIR_SIGNATURE)
+      {
+         unsigned comment_len = read_le(state->footer + 20, 2);
+         if (state->footer + 22 + comment_len == state->data + state->zip_size)
+            break;
+      }
+   }
+
+   state->directory = state->data + read_le(state->footer + 16, 4);
+
+   return 0;
+}
+
+int zlib_parse_file_iterate(void *data, bool *returnerr, const char *file,
+      const char *valid_exts, zlib_file_cb file_cb, void *userdata)
+{
+   zlib_transfer_t *state = (zlib_transfer_t*)data;
+
+   if (!state)
+      return -1;
+
+   switch (state->type)
+   {
+      case ZLIB_TRANSFER_NONE:
+         break;
+      case ZLIB_TRANSFER_INIT:
+         if (zlib_parse_file_init(state, file) == 0)
+            state->type = ZLIB_TRANSFER_ITERATE;
+         else
+            state->type = ZLIB_TRANSFER_DEINIT_ERROR;
+         break;
+      case ZLIB_TRANSFER_ITERATE:
+         {
+            int ret2 = zlib_parse_file_iterate_step(state,
+                  valid_exts, userdata, file_cb);
+            if (ret2 != 1)
+               state->type = ZLIB_TRANSFER_DEINIT;
+            if (ret2 == -1)
+               state->type = ZLIB_TRANSFER_DEINIT_ERROR;
+         }
+         break;
+      case ZLIB_TRANSFER_DEINIT_ERROR:
+         *returnerr = false;
+      case ZLIB_TRANSFER_DEINIT:
+         if (state->handle)
+            state->backend->free(state->handle);
+         break;
+   }
+
+   if (state->type == ZLIB_TRANSFER_DEINIT ||
+         state->type == ZLIB_TRANSFER_DEINIT_ERROR)
+      return -1;
+
+   return 0;
+}
+
 /**
  * zlib_parse_file:
  * @file                        : filename path of archive
@@ -492,92 +644,21 @@ end:
 bool zlib_parse_file(const char *file, const char *valid_exts,
       zlib_file_cb file_cb, void *userdata)
 {
-   void *handle;
-   const uint8_t *footer    = NULL;
-   const uint8_t *directory = NULL;
-   const uint8_t *data      = NULL;
-   ssize_t zip_size = 0;
-   bool ret = true;
-   const struct zlib_file_backend *backend = zlib_get_default_file_backend();
+   zlib_transfer_t state = {0};
+   bool returnerr = true;
 
-   if (!backend)
-      return false;
-
-   (void)valid_exts;
-
-   handle = backend->open(file);
-   if (!handle)
-      GOTO_END_ERROR();
-
-   zip_size = backend->size(handle);
-   if (zip_size < 22)
-      GOTO_END_ERROR();
-
-   data = backend->data(handle);
-
-   footer = data + zip_size - 22;
-   for (;; footer--)
-   {
-      if (footer <= data + 22)
-         GOTO_END_ERROR();
-      if (read_le(footer, 4) == END_OF_CENTRAL_DIR_SIGNATURE)
-      {
-         unsigned comment_len = read_le(footer + 20, 2);
-         if (footer + 22 + comment_len == data + zip_size)
-            break;
-      }
-   }
-
-   directory = data + read_le(footer + 16, 4);
+   state.type = ZLIB_TRANSFER_INIT;
 
    for (;;)
    {
-      uint32_t checksum, csize, size, offset;
-      unsigned cmode, namelength, extralength, commentlength,
-               offsetNL, offsetEL;
-      char filename[PATH_MAX_LENGTH] = {0};
-      const uint8_t *cdata = NULL;
-      uint32_t signature = read_le(directory + 0, 4);
+      int ret = zlib_parse_file_iterate(&state, &returnerr, file,
+            valid_exts, file_cb, userdata);
 
-      if (signature != CENTRAL_FILE_HEADER_SIGNATURE)
+      if (ret != 0)
          break;
-
-      cmode         = read_le(directory + 10, 2);
-      checksum      = read_le(directory + 16, 4);
-      csize         = read_le(directory + 20, 4);
-      size          = read_le(directory + 24, 4);
-
-      namelength    = read_le(directory + 28, 2);
-      extralength   = read_le(directory + 30, 2);
-      commentlength = read_le(directory + 32, 2);
-
-      if (namelength >= PATH_MAX_LENGTH)
-         GOTO_END_ERROR();
-
-      memcpy(filename, directory + 46, namelength);
-
-      offset        = read_le(directory + 42, 4);
-      offsetNL      = read_le(data + offset + 26, 2);
-      offsetEL      = read_le(data + offset + 28, 2);
-
-      cdata = data + offset + 30 + offsetNL + offsetEL;
-
-#if 0
-      RARCH_LOG("OFFSET: %u, CSIZE: %u, SIZE: %u.\n", offset + 30 + 
-      offsetNL + offsetEL, csize, size);
-#endif
-
-      if (!file_cb(filename, valid_exts, cdata, cmode,
-               csize, size, checksum, userdata))
-         break;
-
-      directory += 46 + namelength + extralength + commentlength;
    }
 
-end:
-   if (handle)
-      backend->free(handle);
-   return ret;
+   return returnerr;
 }
 
 struct zip_extract_userdata
@@ -607,7 +688,7 @@ static int zip_extract_cb(const char *name, const char *valid_exts,
 
    if (ext && string_list_find_elem(data->ext, ext))
    {
-      char new_path[PATH_MAX_LENGTH];
+      char new_path[PATH_MAX_LENGTH] = {0};
 
       if (data->extraction_directory)
          fill_pathname_join(new_path, data->extraction_directory,

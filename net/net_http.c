@@ -58,21 +58,19 @@ struct http_connection_t
    char *domain;
    char *location;
    char *urlcopy;
-   char* scan;
+   char *scan;
    int port;
 };
 
 
-static int net_http_new_socket(const char * domain, int port)
+static int net_http_new_socket(const char *domain, int port)
 {
-   char portstr[16];
-   int fd, i = 1;
-#ifdef _WIN32
-   u_long mode = 1;
-#else
+   int fd;
+#ifndef _WIN32
    struct timeval timeout;
 #endif
    struct addrinfo hints, *addr = NULL;
+   char portstr[16] = {0};
 
    snprintf(portstr, sizeof(portstr), "%i", port);
 
@@ -83,8 +81,8 @@ static int net_http_new_socket(const char * domain, int port)
 
    if (getaddrinfo_rarch(domain, portstr, &hints, &addr) < 0)
       return -1;
-
-   (void)i;
+   if (!addr)
+      return -1;
 
    fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
 
@@ -249,6 +247,8 @@ void net_http_connection_free(struct http_connection_t *conn)
 
    if (conn->urlcopy)
       free(conn->urlcopy);
+
+   free(conn);
 }
 
 struct http_t *net_http_new(struct http_connection_t *conn)
@@ -276,7 +276,7 @@ struct http_t *net_http_new(struct http_connection_t *conn)
 
    if (conn->port != 80)
    {
-      char portstr[16];
+      char portstr[16] = {0};
 
       snprintf(portstr, sizeof(portstr), ":%i", conn->port);
       net_http_send_str(fd, &error, portstr);
@@ -507,11 +507,14 @@ parse_again:
    return (state->part == P_DONE);
 
 fail:
-   state->error  = true;
-   state->part   = P_ERROR;
-   state->status = -1;
+   if (state)
+   {
+      state->error  = true;
+      state->part   = P_ERROR;
+      state->status = -1;
+   }
 
-   return true;
+   return false;
 }
 
 int net_http_status(struct http_t *state)

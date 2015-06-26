@@ -34,6 +34,26 @@ typedef struct zlib_handle
    uint32_t real_checksum;
 } zlib_file_handle_t;
 
+enum zlib_transfer_type
+{
+   ZLIB_TRANSFER_NONE = 0,
+   ZLIB_TRANSFER_INIT,
+   ZLIB_TRANSFER_ITERATE,
+   ZLIB_TRANSFER_DEINIT,
+   ZLIB_TRANSFER_DEINIT_ERROR,
+};
+
+typedef struct zlib_transfer
+{
+   void *handle;
+   const uint8_t *footer;
+   const uint8_t *directory;
+   const uint8_t *data;
+   int32_t zip_size;
+   enum zlib_transfer_type type;
+   const struct zlib_file_backend *backend;
+} zlib_transfer_t;
+
 /* Returns true when parsing should continue. False to stop. */
 typedef int (*zlib_file_cb)(const char *name, const char *valid_exts,
       const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size,
@@ -58,6 +78,10 @@ uint32_t zlib_crc32_adjust(uint32_t crc, uint8_t data);
  **/
 bool zlib_parse_file(const char *file, const char *valid_exts,
       zlib_file_cb file_cb, void *userdata);
+
+int zlib_parse_file_iterate(void *data, bool *returnerr,
+      const char *file,
+      const char *valid_exts, zlib_file_cb file_cb, void *userdata);
 
 /**
  * zlib_extract_first_content_file:
