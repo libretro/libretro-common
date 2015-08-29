@@ -28,7 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <zlib.h>
+#include <compat/zlib.h>
 
 /* File backends. Can be fleshed out later, but keep it simple for now.
  * The file is mapped to memory directly (via mmap() or just 
@@ -617,7 +617,10 @@ int zlib_parse_file_iterate(void *data, bool *returnerr, const char *file,
          *returnerr = false;
       case ZLIB_TRANSFER_DEINIT:
          if (state->handle)
+         {
             state->backend->free(state->handle);
+            state->handle = NULL;
+         }
          break;
    }
 
@@ -626,6 +629,16 @@ int zlib_parse_file_iterate(void *data, bool *returnerr, const char *file,
       return -1;
 
    return 0;
+}
+
+void zlib_parse_file_iterate_stop(void *data)
+{
+   zlib_transfer_t *state = (zlib_transfer_t*)data;
+   if (!state || !state->handle)
+      return;
+
+   state->type = ZLIB_TRANSFER_DEINIT;
+   zlib_parse_file_iterate(data, NULL, NULL, NULL, NULL, NULL);
 }
 
 /**
@@ -673,7 +686,7 @@ struct zip_extract_userdata
 enum
 {
    ZLIB_MODE_UNCOMPRESSED = 0,
-   ZLIB_MODE_DEFLATE      = 8,
+   ZLIB_MODE_DEFLATE      = 8
 } zlib_compression_mode;
 
 static int zip_extract_cb(const char *name, const char *valid_exts,

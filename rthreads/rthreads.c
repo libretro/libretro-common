@@ -104,10 +104,11 @@ static void *thread_wrap(void *data_)
 sthread_t *sthread_create(void (*thread_func)(void*), void *userdata)
 {
    sthread_t *thread = (sthread_t*)calloc(1, sizeof(*thread));
+   struct thread_data *data;
    if (!thread)
       return NULL;
 
-   struct thread_data *data = (struct thread_data*)calloc(1, sizeof(*data));
+   data = (struct thread_data*)calloc(1, sizeof(*data));
    if (!data)
    {
       free(thread);
@@ -382,6 +383,7 @@ bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
    return ret == WAIT_OBJECT_0;
 #else
    int ret;
+   int64_t seconds, remainder;
    struct timespec now = {0};
 
 #ifdef __MACH__
@@ -412,11 +414,11 @@ bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
    clock_gettime(CLOCK_REALTIME, &now);
 #endif
 
-   now.tv_sec += timeout_us / 1000000LL;
-   now.tv_nsec += timeout_us * 1000LL;
+   seconds      = timeout_us / INT64_C(1000000);
+   remainder    = timeout_us % INT64_C(1000000);
 
-   now.tv_sec += now.tv_nsec / 1000000000LL;
-   now.tv_nsec = now.tv_nsec % 1000000000LL;
+   now.tv_sec  += seconds;
+   now.tv_nsec += remainder * INT64_C(1000);
 
    ret = pthread_cond_timedwait(&cond->cond, &lock->lock, &now);
    return (ret == 0);

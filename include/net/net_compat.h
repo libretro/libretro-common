@@ -47,6 +47,10 @@
 #include <xtl.h>
 #include <io.h>
 
+#elif defined(GEKKO)
+
+#include <network.h>
+
 #else
 #include <sys/select.h>
 #include <sys/types.h>
@@ -60,11 +64,12 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
-#include <errno.h>
 
 #if defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)
 #include <cell/sysmodule.h>
 #include <netex/net.h>
+#include <netex/libnetctl.h>
+#include <sys/timer.h>
 
 #ifndef EWOULDBLOCK
 #define EWOULDBLOCK SYS_NET_EWOULDBLOCK
@@ -74,6 +79,21 @@
 #include <signal.h>
 #endif
 
+#endif
+
+#include <errno.h>
+
+#ifdef GEKKO
+#define sendto(s, msg, len, flags, addr, tolen) net_sendto(s, msg, len, 0, addr, 8)
+#define socket(domain, type, protocol) net_socket(domain, type, protocol)
+
+static INLINE int inet_pton(int af, const char *src, void *dst)
+{
+   if (af != AF_INET)
+      return -1;
+
+   return inet_aton (src, dst);
+}
 #endif
 
 static INLINE bool isagain(int bytes)
@@ -171,6 +191,11 @@ bool network_init(void);
  * Deinitialize platform specific socket libraries.
  **/
 void network_deinit(void);
+
+int network_interface_up(struct sockaddr_in *target, int index,
+      const char *ip_address, unsigned udp_port, int *s);
+
+int network_interface_down(struct sockaddr_in *target, int *s);
 
 #endif
 

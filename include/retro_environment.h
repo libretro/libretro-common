@@ -1,7 +1,7 @@
-/* Copyright (C) 2010-2015 The RetroArch team
+/* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this libretro SDK code part (glsym).
+ * The following license statement only applies to this file (retro_environment.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,61 +20,49 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef RGLGEN_HEADERS_H__
-#define RGLGEN_HEADERS_H__
+#ifndef __LIBRETRO_SDK_ENVIRONMENT_H
+#define __LIBRETRO_SDK_ENVIRONMENT_H
 
-#ifdef HAVE_EGL
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
+#if defined (__cplusplus)
+#if 0
+printf("This is C++, version %d.\n", __cplusplus);
 #endif
+/* The expected values would be
+ *   199711L, for ISO/IEC 14882:1998 or 14882:2003
+ */
 
-#if defined(IOS)
+#elif defined(__STDC__)
+/* This is standard C. */
 
-#if defined(HAVE_OPENGLES3)
-#include <OpenGLES/ES3/gl.h>
-#include <OpenGLES/ES3/glext.h>
+#if (__STDC__ == 1)
+/* The implementation is ISO-conforming. */
+#define __STDC_ISO__
 #else
-#include <OpenGLES/ES2/gl.h>
-#include <OpenGLES/ES2/glext.h>
+/* The implementation is not ISO-conforming. */
 #endif
 
-#elif defined(__APPLE__)
-#include <OpenGL/gl.h>
-#include <OpenGL/glext.h>
-#elif defined(HAVE_PSGL)
-#include <PSGL/psgl.h>
-#include <GLES/glext.h>
-#elif defined(HAVE_OPENGL_MODERN)
-#include <GL3/gl3.h>
-#include <GL3/gl3ext.h>
-#elif defined(HAVE_OPENGLES3)
-#include <GLES3/gl3.h>
-#include <GLES2/gl2ext.h> /* There are no GLES3 extensions yet. */
-#elif defined(HAVE_OPENGLES2)
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
-#elif defined(HAVE_OPENGLES1)
-#include <GLES/gl.h>
-#include <GLES/glext.h>
+#if defined(__STDC_VERSION__)
+#if (__STDC_VERSION__ >= 201112L)
+/* This is C11. */
+#define __STDC_C11__
+#elif (__STDC_VERSION__ >= 199901L)
+/* This is C99. */
+#define __STDC_C99__
+#elif (__STDC_VERSION__ >= 199409L)
+/* This is C89 with amendment 1. */
+#define __STDC_C89__
+#define __STDC_C89_AMENDMENT_1__
 #else
-#if defined(_WIN32) && !defined(_XBOX)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+/* This is C89 without amendment 1. */
+#define __STDC_C89__
 #endif
-#include <GL/gl.h>
-#include <GL/glext.h>
-#endif
-
-#ifndef GL_MAP_WRITE_BIT
-#define GL_MAP_WRITE_BIT 0x0002
+#else /* !defined(__STDC_VERSION__) */
+/* This is C89. __STDC_VERSION__ is not defined. */
+#define __STDC_C89__
 #endif
 
-#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
-#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
-#endif
-
-#ifndef GL_RED_INTEGER
-#define GL_RED_INTEGER 0x8D94
+#else   /* !defined(__STDC__) */
+/* This is not standard C. __STDC__ is not defined. */
 #endif
 
 #endif
