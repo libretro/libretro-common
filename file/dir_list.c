@@ -38,7 +38,13 @@
 #include <direct.h>
 #include <windows.h>
 #endif
+#elif defined(VITA)
+#include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h>
 #else
+#if defined(PSP)
+#include <pspiofilemgr.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -96,7 +102,6 @@ void dir_list_free(struct string_list *list)
    string_list_free(list);
 }
 
-#ifndef _WIN32
 /**
  *
  * dirent_is_directory:
@@ -109,12 +114,22 @@ void dir_list_free(struct string_list *list)
  * a directory, false if not.
  */
 
-static bool dirent_is_directory(const char *path,
-      const struct dirent *entry)
+static bool dirent_is_directory(const char *path, const void *data)
 {
+#if defined(_WIN32)
+   const WIN32_FIND_DATA *entry = (const WIN32_FIND_DATA*)data;
+   return entry->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+#elif defined(PSP) || defined(VITA)
+
+   const SceIoDirent *entry = (const SceIoDirent*)data;
 #if defined(PSP)
    return (entry->d_stat.st_attr & FIO_SO_IFDIR) == FIO_SO_IFDIR;
+#elif defined(VITA)
+   return PSP2_S_ISDIR(entry->d_stat.st_mode);
+#endif
+
 #elif defined(DT_DIR)
+   const struct dirent *entry = (const struct dirent*)data;
    if (entry->d_type == DT_DIR)
       return true;
    else if (entry->d_type == DT_UNKNOWN /* This can happen on certain file systems. */
@@ -122,20 +137,21 @@ static bool dirent_is_directory(const char *path,
       return path_is_directory(path);
    return false;
 #else /* dirent struct doesn't have d_type, do it the slow way ... */
+   const struct dirent *entry = (const struct dirent*)data;
    return path_is_directory(path);
 #endif
 }
-#endif
 
 /**
  * parse_dir_entry:
- * @name         : name of the directory listing entry.
- * @file_path    : file path of the directory listing entry.
- * @is_dir       : is the directory listing a directory?
- * @include_dirs : include directories as part of the finished directory listing?
- * @list         : pointer to directory listing.
- * @ext_list     : pointer to allowed file extensions listing.
- * @file_ext     : file extension of the directory listing entry.
+ * @name               : name of the directory listing entry.
+ * @file_path          : file path of the directory listing entry.
+ * @is_dir             : is the directory listing a directory?
+ * @include_dirs       : include directories as part of the finished directory listing?
+ * @include_compressed : Include compressed files, even if not part of ext_list.
+ * @list               : pointer to directory listing.
+ * @ext_list           : pointer to allowed file extensions listing.
+ * @file_ext           : file extension of the directory listing entry.
  *
  * Parses a directory listing.
  *
@@ -143,7 +159,7 @@ static bool dirent_is_directory(const char *path,
  * continue to the next entry in the directory listing.
  **/
 static int parse_dir_entry(const char *name, char *file_path,
-      bool is_dir, bool include_dirs,
+      bool is_dir, bool include_dirs, bool include_compressed,
       struct string_list *list, struct string_list *ext_list,
       const char *file_ext)
 {
@@ -166,7 +182,9 @@ static int parse_dir_entry(const char *name, char *file_path,
    if (!strcmp(name, ".") || !strcmp(name, ".."))
       return 1;
 
-   if (!is_compressed_file && !is_dir && ext_list && !supported_by_core)
+   if (!is_dir && ext_list &&
+           ((!is_compressed_file && !supported_by_core) ||
+            (!supported_by_core && !include_compressed)))
       return 1;
 
    if (is_dir)
@@ -190,11 +208,50 @@ static int parse_dir_entry(const char *name, char *file_path,
    return 0;
 }
 
+#if defined(_WIN32)
+#define dirent_opendir(directory, dir) \
+{ \
+   char path_buf[PATH_MAX_LENGTH]; \
+   snprintf(path_buf, sizeof(path_buf), "%s\\*", dir); \
+   directory = FindFirstFile(path_buf, &entry); \
+}
+#elif defined(VITA) || defined(PSP)
+#define dirent_opendir(directory, dir) directory = sceIoDopen(dir)
+#else
+#define dirent_opendir(directory, dir) directory = opendir(dir)
+#endif
+
+#if defined(_WIN32)
+#define dirent_error(directory) ((directory) == INVALID_HANDLE_VALUE)
+#elif defined(VITA) || defined(PSP)
+#define dirent_error(directory) ((directory) < 0)
+#else
+#define dirent_error(directory) (!(directory))
+#endif
+
+#if defined(_WIN32)
+#define dirent_readdir(directory, entry) (FindNextFile((directory), &(entry)) != 0)
+#elif defined(VITA) || defined(PSP)
+#define dirent_readdir(directory, entry) (sceIoDread((directory), &(entry)) > 0)
+#else
+#define dirent_readdir(directory, entry) (entry = readdir(directory))
+#endif
+
+#if defined(_WIN32)
+#define dirent_closedir(directory) if (directory != INVALID_HANDLE_VALUE) FindClose(directory)
+#elif defined(VITA) || defined(PSP)
+#define dirent_closedir(directory) sceIoDclose(directory)
+#else
+#define dirent_closedir(directory) if (directory) closedir(directory)
+#endif
+
+
 /**
  * dir_list_new:
- * @dir          : directory path.
- * @ext          : allowed extensions of file directory entries to include.
- * @include_dirs : include directories as part of the finished directory listing?
+ * @dir                : directory path.
+ * @ext                : allowed extensions of file directory entries to include.
+ * @include_dirs       : include directories as part of the finished directory listing?
+ * @include_compressed : Only include files which match ext. Do not try to match compressed files, etc.
  *
  * Create a directory listing.
  *
@@ -202,20 +259,20 @@ static int parse_dir_entry(const char *name, char *file_path,
  * NULL in case of error. Has to be freed manually.
  **/
 struct string_list *dir_list_new(const char *dir,
-      const char *ext, bool include_dirs)
+      const char *ext, bool include_dirs, bool include_compressed)
 {
-#ifdef _WIN32
-   WIN32_FIND_DATA ffd;
-   HANDLE hFind = INVALID_HANDLE_VALUE;
+#if defined(_WIN32)
+   WIN32_FIND_DATA entry;
+   HANDLE directory = INVALID_HANDLE_VALUE;
+#elif defined(VITA) || defined(PSP)
+   SceUID directory;
+   SceIoDirent entry;
 #else
-   DIR *directory = NULL;
-   const struct dirent *entry = NULL;
+   DIR *directory                 = NULL;
+   const struct dirent *entry     = NULL;
 #endif
-   char path_buf[PATH_MAX_LENGTH] = {0};
    struct string_list *ext_list   = NULL;
    struct string_list *list       = NULL;
-
-   (void)path_buf;
 
    if (!(list = string_list_new()))
       return NULL;
@@ -223,59 +280,31 @@ struct string_list *dir_list_new(const char *dir,
    if (ext)
       ext_list = string_split(ext, "|");
 
+   dirent_opendir(directory, dir);
+
+   if (dirent_error(directory))
+      goto error;
+
+   while (dirent_readdir(directory, entry))
+   {
+      char file_path[PATH_MAX_LENGTH];
+      int ret                         = 0;
 #ifdef _WIN32
-   snprintf(path_buf, sizeof(path_buf), "%s\\*", dir);
-
-   hFind = FindFirstFile(path_buf, &ffd);
-   if (hFind == INVALID_HANDLE_VALUE)
-      goto error;
-
-   do
-   {
-      char file_path[PATH_MAX_LENGTH];
-      int ret                         = 0;
-      const char *name                = ffd.cFileName;
-      const char *file_ext            = path_get_extension(name);
-      bool is_dir                     = ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
-
-      fill_pathname_join(file_path, dir, name, sizeof(file_path));
-
-      ret = parse_dir_entry(name, file_path, is_dir,
-            include_dirs, list, ext_list, file_ext);
-
-      if (ret == -1)
-         goto error;
-
-      if (ret == 1)
-         continue;
-   }while (FindNextFile(hFind, &ffd) != 0);
-
-   FindClose(hFind);
-   string_list_free(ext_list);
-   return list;
-
-error:
-   if (hFind != INVALID_HANDLE_VALUE)
-      FindClose(hFind);
+      const char *name                = entry.cFileName;
+      bool is_dir = dirent_is_directory(file_path, &entry);
+#elif defined(VITA) || defined(PSP)
+      const char *name                = entry.d_name;
+      bool is_dir = dirent_is_directory(file_path, &entry);
 #else
-   directory = opendir(dir);
-   if (!directory)
-      goto error;
-
-   while ((entry = readdir(directory)))
-   {
-      char file_path[PATH_MAX_LENGTH];
-      int ret                         = 0;
       const char *name                = entry->d_name;
+      bool is_dir = dirent_is_directory(file_path, entry);
+#endif
       const char *file_ext            = path_get_extension(name);
-      bool is_dir                     = false;
 
       fill_pathname_join(file_path, dir, name, sizeof(file_path));
 
-      is_dir = dirent_is_directory(file_path, entry);
-
-      ret = parse_dir_entry(name, file_path, is_dir,
-            include_dirs, list, ext_list, file_ext);
+      ret    = parse_dir_entry(name, file_path, is_dir,
+            include_dirs, include_compressed, list, ext_list, file_ext);
 
       if (ret == -1)
          goto error;
@@ -284,17 +313,14 @@ error:
          continue;
    }
 
-   closedir(directory);
+   dirent_closedir(directory);
 
    string_list_free(ext_list);
    return list;
 
 error:
+   dirent_closedir(directory);
 
-   if (directory)
-      closedir(directory);
-
-#endif
    string_list_free(list);
    string_list_free(ext_list);
    return NULL;
