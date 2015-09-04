@@ -26,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "rpng_common.h"
+#include "rpng_internal.h"
 #include "rpng_decode.h"
 
 #ifdef GEKKO
@@ -639,6 +639,33 @@ error:
 false_end:
    rpng->process.inflate_initialized = false;
    return -1;
+}
+
+bool png_read_plte(uint8_t *buf, 
+      uint32_t *buffer, unsigned entries)
+{
+   unsigned i;
+
+   for (i = 0; i < entries; i++)
+   {
+      uint32_t r = buf[3 * i + 0];
+      uint32_t g = buf[3 * i + 1];
+      uint32_t b = buf[3 * i + 2];
+      buffer[i] = (r << 16) | (g << 8) | (b << 0) | (0xffu << 24);
+   }
+
+   return true;
+}
+
+bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *buf)
+{
+   uint8_t *new_buffer = (uint8_t*)realloc(buf->data, buf->size + chunk->size);
+
+   if (!new_buffer)
+      return false;
+
+   buf->data  = new_buffer;
+   return true;
 }
 
 bool rpng_load_image_argb_process_init(struct rpng_t *rpng,
