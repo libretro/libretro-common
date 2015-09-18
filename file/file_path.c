@@ -43,7 +43,7 @@
 #elif defined(VITA)
 #include <psp2/io/fcntl.h>
 #include <psp2/io/dirent.h>
-#include <sys/stat.h>
+#include <psp2/io/stat.h>
 #else
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -174,6 +174,10 @@ bool path_is_directory(const char *path)
 #ifdef _WIN32
    DWORD ret = GetFileAttributes(path);
    return (ret & FILE_ATTRIBUTE_DIRECTORY) && (ret != INVALID_FILE_ATTRIBUTES);
+#elif defined(VITA)
+   SceIoStat stat;
+	 if(sceIoGetstat(path,&stat) < 0)return -1;
+	 return PSP2_S_ISDIR(stat.st_mode);
 #else
    struct stat buf;
    if (stat(path, &buf) < 0)
@@ -557,7 +561,7 @@ static bool path_mkdir_norecurse(const char *dir)
 #elif defined(IOS)
    ret = mkdir(dir, 0755);
 #elif defined(VITA) || defined(PSP)
-   ret = sceIoMkdir(dir, 0755);
+   ret = sceIoMkdir(dir, 0777);
 #else
    ret = mkdir(dir, 0750);
 #endif

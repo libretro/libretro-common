@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (config_file_userdata.h).
+ * The following license statement only applies to this file (retro_dirent.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,36 +20,42 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _LIBRETRO_SDK_CONFIG_FILE_USERDATA_H
-#define _LIBRETRO_SDK_CONFIG_FILE_USERDATA_H
+#ifndef __RETRO_DIRENT_H
+#define __RETRO_DIRENT_H
 
-#include <string.h>
+#include <boolean.h>
 
-#include "config_file.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-struct config_file_userdata
-{
-   config_file_t *conf;
-   const char *prefix[2];
-};
+struct RDIR;
 
-int config_userdata_get_float(void *userdata, const char *key_str,
-      float *value, float default_value);
+struct RDIR *retro_opendir(const char *name);
 
-int config_userdata_get_int(void *userdata, const char *key_str,
-      int *value, int default_value);
+int retro_readdir(struct RDIR *rdir);
 
-int config_userdata_get_float_array(void *userdata, const char *key_str,
-      float **values, unsigned *out_num_values,
-      const float *default_values, unsigned num_default_values);
+bool retro_dirent_error(struct RDIR *rdir);
 
-int config_userdata_get_int_array(void *userdata, const char *key_str,
-      int **values, unsigned *out_num_values,
-      const int *default_values, unsigned num_default_values);
+const char *retro_dirent_get_name(struct RDIR *rdir);
 
-int config_userdata_get_string(void *userdata, const char *key_str,
-      char **output, const char *default_output);
+/**
+ *
+ * retro_dirent_is_dir:
+ * @rdir         : pointer to the directory entry.
+ * @path         : path to the directory entry.
+ *
+ * Is the directory listing entry a directory?
+ *
+ * Returns: true if directory listing entry is
+ * a directory, false if not.
+ */
+bool retro_dirent_is_dir(struct RDIR *rdir, const char *path);
 
-void config_userdata_free(void *ptr);
+void retro_closedir(struct RDIR *rdir);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

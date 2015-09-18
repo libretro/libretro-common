@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (config_file_userdata.h).
+ * The following license statement only applies to this file (filters.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,36 +20,54 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _LIBRETRO_SDK_CONFIG_FILE_USERDATA_H
-#define _LIBRETRO_SDK_CONFIG_FILE_USERDATA_H
+#ifndef _LIBRETRO_SDK_FILTERS_H
+#define _LIBRETRO_SDK_FILTERS_H
 
-#include <string.h>
+#include <math.h>
+#include <retro_inline.h>
 
-#include "config_file.h"
-
-struct config_file_userdata
+static INLINE double sinc(double val)
 {
-   config_file_t *conf;
-   const char *prefix[2];
-};
+   if (fabs(val) < 0.00001)
+      return 1.0;
+   return sin(val) / val;
+}
 
-int config_userdata_get_float(void *userdata, const char *key_str,
-      float *value, float default_value);
+/* Modified Bessel function of first order.
+ * Check Wiki for mathematical definition ... */
+static INLINE double besseli0(double x)
+{
+   unsigned i;
+   double sum            = 0.0;
+   double factorial      = 1.0;
+   double factorial_mult = 0.0;
+   double x_pow          = 1.0;
+   double two_div_pow    = 1.0;
+   double x_sqr          = x * x;
 
-int config_userdata_get_int(void *userdata, const char *key_str,
-      int *value, int default_value);
+   /* Approximate. This is an infinite sum.
+    * Luckily, it converges rather fast. */
+   for (i = 0; i < 18; i++)
+   {
+      sum += x_pow * two_div_pow / (factorial * factorial);
 
-int config_userdata_get_float_array(void *userdata, const char *key_str,
-      float **values, unsigned *out_num_values,
-      const float *default_values, unsigned num_default_values);
+      factorial_mult += 1.0;
+      x_pow *= x_sqr;
+      two_div_pow *= 0.25;
+      factorial *= factorial_mult;
+   }
 
-int config_userdata_get_int_array(void *userdata, const char *key_str,
-      int **values, unsigned *out_num_values,
-      const int *default_values, unsigned num_default_values);
+   return sum;
+}
 
-int config_userdata_get_string(void *userdata, const char *key_str,
-      char **output, const char *default_output);
+static INLINE double kaiser_window_function(double index, double beta)
+{
+   return besseli0(beta * sqrtf(1 - index * index));
+}
 
-void config_userdata_free(void *ptr);
+static INLINE double lanzcos_window_function(double index)
+{
+   return sinc(M_PI * index);
+}
 
 #endif

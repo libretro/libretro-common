@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (config_file_userdata.h).
+ * The following license statement only applies to this file (retro_file.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,36 +20,49 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _LIBRETRO_SDK_CONFIG_FILE_USERDATA_H
-#define _LIBRETRO_SDK_CONFIG_FILE_USERDATA_H
+#ifndef __RETRO_FILE_H
+#define __RETRO_FILE_H
 
-#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
 
-#include "config_file.h"
+#include <sys/types.h>
 
-struct config_file_userdata
+#include <boolean.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct RFILE RFILE;
+
+enum
 {
-   config_file_t *conf;
-   const char *prefix[2];
+   RFILE_MODE_READ = 0,
+   RFILE_MODE_WRITE,
+   RFILE_MODE_READ_WRITE
 };
 
-int config_userdata_get_float(void *userdata, const char *key_str,
-      float *value, float default_value);
+RFILE *retro_fopen(const char *path, unsigned mode, ssize_t len);
 
-int config_userdata_get_int(void *userdata, const char *key_str,
-      int *value, int default_value);
+ssize_t retro_fseek(RFILE *stream, ssize_t offset, int whence);
 
-int config_userdata_get_float_array(void *userdata, const char *key_str,
-      float **values, unsigned *out_num_values,
-      const float *default_values, unsigned num_default_values);
+ssize_t retro_fread(RFILE *stream, void *s, size_t len);
 
-int config_userdata_get_int_array(void *userdata, const char *key_str,
-      int **values, unsigned *out_num_values,
-      const int *default_values, unsigned num_default_values);
+ssize_t retro_fwrite(RFILE *stream, const void *s, size_t len);
 
-int config_userdata_get_string(void *userdata, const char *key_str,
-      char **output, const char *default_output);
+ssize_t retro_ftell(RFILE *stream);
 
-void config_userdata_free(void *ptr);
+void retro_frewind(RFILE *stream);
+
+void retro_fclose(RFILE *stream);
+
+bool retro_fmemcpy(const char *path, char *s, size_t len, ssize_t *bytes_written);
+
+int retro_get_fd(RFILE *stream);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
