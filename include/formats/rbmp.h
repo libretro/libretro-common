@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (rpng.c).
+ * The following license statement only applies to this file (rbmp.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,29 +20,21 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _RPNG_DECODE_H
-#define _RPNG_DECODE_H
+#ifndef __LIBRETRO_SDK_FORMAT_RBMP_H__
+#define __LIBRETRO_SDK_FORMAT_RBMP_H__
 
-enum png_process_code
-{
-   PNG_PROCESS_ERROR     = -2,
-   PNG_PROCESS_ERROR_END = -1,
-   PNG_PROCESS_NEXT      =  0,
-   PNG_PROCESS_END       =  1
-};
+#include <boolean.h>
 
-enum png_chunk_type png_chunk_type(const struct png_chunk *chunk);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-bool png_process_ihdr(struct png_ihdr *ihdr);
+bool rbmp_save_image(const char *filename, const void *frame,
+      unsigned width, unsigned height,
+      unsigned pitch, bool bgr24, bool xrgb8888);
 
-bool png_read_plte(uint8_t *buf, 
-      uint32_t *buffer, unsigned entries);
-
-bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *buf);
-
-int png_reverse_filter_iterate(rpng_t *rpng, uint32_t **data);
-
-bool rpng_load_image_argb_process_init(rpng_t *rpng,
-      uint32_t **data, unsigned *width, unsigned *height);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

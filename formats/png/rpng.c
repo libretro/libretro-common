@@ -21,6 +21,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,13 +29,119 @@
 #include <malloc.h>
 #endif
 
+#include <boolean.h>
+#include <file/nbio.h>
+#include <formats/rpng.h>
 #include <file/file_extract.h>
 
 #include "rpng_internal.h"
-#include "rpng_decode.h"
 
+enum png_ihdr_color_type
+{
+   PNG_IHDR_COLOR_GRAY       = 0,
+   PNG_IHDR_COLOR_RGB        = 2,
+   PNG_IHDR_COLOR_PLT        = 3,
+   PNG_IHDR_COLOR_GRAY_ALPHA = 4,
+   PNG_IHDR_COLOR_RGBA       = 6
+};
 
-enum png_chunk_type png_chunk_type(const struct png_chunk *chunk)
+enum png_line_filter
+{
+   PNG_FILTER_NONE = 0,
+   PNG_FILTER_SUB,
+   PNG_FILTER_UP,
+   PNG_FILTER_AVERAGE,
+   PNG_FILTER_PAETH
+};
+
+enum png_chunk_type
+{
+   PNG_CHUNK_NOOP = 0,
+   PNG_CHUNK_ERROR,
+   PNG_CHUNK_IHDR,
+   PNG_CHUNK_IDAT,
+   PNG_CHUNK_PLTE,
+   PNG_CHUNK_IEND
+};
+
+struct adam7_pass
+{
+   unsigned x;
+   unsigned y;
+   unsigned stride_x;
+   unsigned stride_y;
+};
+
+struct idat_buffer
+{
+   uint8_t *data;
+   size_t size;
+};
+
+struct png_chunk
+{
+   uint32_t size;
+   char type[4];
+   uint8_t *data;
+};
+
+struct rpng_process_t
+{
+   bool initialized;
+   bool inflate_initialized;
+   bool adam7_pass_initialized;
+   bool pass_initialized;
+   uint32_t *data;
+   uint32_t *palette;
+   struct png_ihdr ihdr;
+   uint8_t *prev_scanline;
+   uint8_t *decoded_scanline;
+   uint8_t *inflate_buf;
+   size_t restore_buf_size;
+   size_t adam7_restore_buf_size;
+   size_t data_restore_buf_size;
+   size_t inflate_buf_size;
+   unsigned bpp;
+   unsigned pitch;
+   unsigned h;
+   struct
+   {
+      unsigned width;
+      unsigned height;
+      size_t   size;
+      unsigned pos;
+   } pass;
+   void *stream;
+   zlib_file_handle_t handle;
+};
+
+struct rpng
+{
+   struct rpng_process_t process;
+   bool has_ihdr;
+   bool has_idat;
+   bool has_iend;
+   bool has_plte;
+   struct idat_buffer idat_buf;
+   struct png_ihdr ihdr;
+   uint8_t *buff_data;
+   uint32_t palette[256];
+};
+
+enum png_process_code
+{
+   PNG_PROCESS_ERROR     = -2,
+   PNG_PROCESS_ERROR_END = -1,
+   PNG_PROCESS_NEXT      =  0,
+   PNG_PROCESS_END       =  1
+};
+
+static INLINE uint32_t dword_be(const uint8_t *buf)
+{
+   return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | (buf[3] << 0);
+}
+
+static enum png_chunk_type png_chunk_type(const struct png_chunk *chunk)
 {
    unsigned i;
    struct
@@ -57,7 +164,7 @@ enum png_chunk_type png_chunk_type(const struct png_chunk *chunk)
    return PNG_CHUNK_NOOP;
 }
 
-bool png_process_ihdr(struct png_ihdr *ihdr)
+static bool png_process_ihdr(struct png_ihdr *ihdr)
 {
    unsigned i;
    bool ret = true;
@@ -571,7 +678,7 @@ static int png_reverse_filter_adam7(uint32_t **data_,
    return ret;
 }
 
-int png_reverse_filter_iterate(rpng_t *rpng, uint32_t **data)
+static int png_reverse_filter_iterate(rpng_t *rpng, uint32_t **data)
 {
    if (!rpng)
       return false;
@@ -582,7 +689,7 @@ int png_reverse_filter_iterate(rpng_t *rpng, uint32_t **data)
    return png_reverse_filter_regular_iterate(data, &rpng->ihdr, &rpng->process);
 }
 
-int rpng_load_image_argb_process_inflate_init(rpng_t *rpng,
+static int rpng_load_image_argb_process_inflate_init(rpng_t *rpng,
       uint32_t **data, unsigned *width, unsigned *height)
 {
    int zstatus;
@@ -641,7 +748,7 @@ false_end:
    return -1;
 }
 
-bool png_read_plte(uint8_t *buf, 
+static bool png_read_plte(uint8_t *buf, 
       uint32_t *buffer, unsigned entries)
 {
    unsigned i;
@@ -668,7 +775,7 @@ bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *buf)
    return true;
 }
 
-bool rpng_load_image_argb_process_init(rpng_t *rpng,
+static bool rpng_load_image_argb_process_init(rpng_t *rpng,
       uint32_t **data, unsigned *width, unsigned *height)
 {
    rpng->process.inflate_buf_size = 0;
@@ -701,4 +808,308 @@ bool rpng_load_image_argb_process_init(rpng_t *rpng,
    rpng->process.initialized = true;
 
    return true;
+}
+
+static bool read_chunk_header(uint8_t *buf, struct png_chunk *chunk)
+{
+   unsigned i;
+   uint8_t dword[4] = {0};
+
+   for (i = 0; i < 4; i++)
+      dword[i] = buf[i];
+
+   buf += 4;
+
+   chunk->size = dword_be(dword);
+
+   for (i = 0; i < 4; i++)
+      chunk->type[i] = buf[i];
+
+   buf += 4;
+
+   return true;
+}
+
+static bool png_parse_ihdr(uint8_t *buf,
+      struct png_ihdr *ihdr)
+{
+   buf += 4 + 4;
+
+   ihdr->width       = dword_be(buf + 0);
+   ihdr->height      = dword_be(buf + 4);
+   ihdr->depth       = buf[8];
+   ihdr->color_type  = buf[9];
+   ihdr->compression = buf[10];
+   ihdr->filter      = buf[11];
+   ihdr->interlace   = buf[12];
+
+   if (ihdr->width == 0 || ihdr->height == 0)
+      return false;
+
+   return true;
+}
+
+bool rpng_nbio_load_image_argb_iterate(rpng_t *rpng)
+{
+   unsigned i;
+   unsigned ret;
+   uint8_t *buf = (uint8_t*)rpng->buff_data;
+
+   struct png_chunk chunk = {0};
+
+   if (!read_chunk_header(buf, &chunk))
+      return false;
+
+#if 0
+   for (i = 0; i < 4; i++)
+   {
+      fprintf(stderr, "chunktype: %c\n", chunk.type[i]);
+   }
+#endif
+
+   switch (png_chunk_type(&chunk))
+   {
+      case PNG_CHUNK_NOOP:
+      default:
+         break;
+
+      case PNG_CHUNK_ERROR:
+         goto error;
+
+      case PNG_CHUNK_IHDR:
+         if (rpng->has_ihdr || rpng->has_idat || rpng->has_iend)
+            goto error;
+
+         if (chunk.size != 13)
+            goto error;
+
+         if (!png_parse_ihdr(buf, &rpng->ihdr))
+            goto error;
+
+         if (!png_process_ihdr(&rpng->ihdr))
+            goto error;
+
+         rpng->has_ihdr = true;
+         break;
+
+      case PNG_CHUNK_PLTE:
+         {
+            unsigned entries = chunk.size / 3;
+
+            if (!rpng->has_ihdr || rpng->has_plte || rpng->has_iend || rpng->has_idat)
+               goto error;
+
+            if (chunk.size % 3)
+               goto error;
+
+            if (entries > 256)
+               goto error;
+
+            buf += 8;
+
+            if (!png_read_plte(buf, rpng->palette, entries))
+               goto error;
+
+            rpng->has_plte = true;
+         }
+         break;
+
+      case PNG_CHUNK_IDAT:
+         if (!(rpng->has_ihdr) || rpng->has_iend || (rpng->ihdr.color_type == PNG_IHDR_COLOR_PLT && !(rpng->has_plte)))
+            goto error;
+
+         if (!png_realloc_idat(&chunk, &rpng->idat_buf))
+            goto error;
+
+         buf += 8;
+
+         for (i = 0; i < chunk.size; i++)
+            rpng->idat_buf.data[i + rpng->idat_buf.size] = buf[i];
+
+         rpng->idat_buf.size += chunk.size;
+
+         rpng->has_idat = true;
+         break;
+
+      case PNG_CHUNK_IEND:
+         if (!(rpng->has_ihdr) || !(rpng->has_idat))
+            goto error;
+
+         rpng->has_iend = true;
+         goto error;
+   }
+
+   ret = 4 + 4 + chunk.size + 4;
+   rpng->buff_data += ret; 
+
+   return true;
+
+error:
+   return false;
+}
+
+int rpng_nbio_load_image_argb_process(rpng_t *rpng,
+      uint32_t **data, unsigned *width, unsigned *height)
+{
+   if (!rpng->process.initialized)
+   {
+      if (!rpng_load_image_argb_process_init(rpng, data, width,
+               height))
+         return PNG_PROCESS_ERROR;
+      return 0;
+   }
+
+   if (!rpng->process.inflate_initialized)
+   {
+      int ret = rpng_load_image_argb_process_inflate_init(rpng, data,
+               width, height);
+      if (ret == -1)
+         return PNG_PROCESS_ERROR;
+      return 0;
+   }
+
+   return png_reverse_filter_iterate(rpng, data);
+}
+
+void rpng_nbio_load_image_free(rpng_t *rpng)
+{
+   if (!rpng)
+      return;
+
+   if (rpng->idat_buf.data)
+      free(rpng->idat_buf.data);
+   if (rpng->process.inflate_buf)
+      free(rpng->process.inflate_buf);
+   if (rpng->process.stream)
+   {
+      zlib_stream_free(rpng->process.stream);
+      free(rpng->process.stream);
+   }
+
+   free(rpng);
+}
+
+bool rpng_nbio_load_image_argb_start(rpng_t *rpng)
+{
+   unsigned i;
+   char header[8] = {0};
+
+   if (!rpng)
+      return false;
+   
+   for (i = 0; i < 8; i++)
+      header[i] = rpng->buff_data[i];
+
+   if (memcmp(header, png_magic, sizeof(png_magic)) != 0)
+      return false;
+
+   rpng->buff_data += 8;
+
+   return true;
+}
+
+bool rpng_is_valid(rpng_t *rpng)
+{
+   if (!rpng)
+      return false;
+
+   if (rpng->has_ihdr)
+      return true;
+   if (rpng->has_idat)
+      return true;
+   if (rpng->has_iend)
+      return true;
+   return false;
+}
+
+bool rpng_set_buf_ptr(rpng_t *rpng, uint8_t *data)
+{
+   if (!rpng)
+      return false;
+
+   rpng->buff_data = data;
+
+   return true;
+}
+
+rpng_t *rpng_alloc(void)
+{
+   rpng_t *rpng = (rpng_t*)calloc(1, sizeof(rpng_t));
+   if (!rpng)
+      return NULL;
+   return rpng;
+}
+
+bool rpng_load_image_argb(const char *path, uint32_t **data,
+      unsigned *width, unsigned *height)
+{
+   int retval;
+   size_t file_len;
+   bool ret = true;
+   rpng_t *rpng = NULL;
+   void *ptr = NULL;
+   struct nbio_t* handle = (void*)nbio_open(path, NBIO_READ);
+
+   if (!handle)
+      goto end;
+
+   ptr  = nbio_get_ptr(handle, &file_len);
+
+   nbio_begin_read(handle);
+
+   while (!nbio_iterate(handle));
+
+   ptr = nbio_get_ptr(handle, &file_len);
+
+   if (!ptr)
+   {
+      ret = false;
+      goto end;
+   }
+
+   rpng = rpng_alloc();
+
+   if (!rpng)
+   {
+      ret = false;
+      goto end;
+   }
+
+   if (!rpng_set_buf_ptr(rpng, (uint8_t*)ptr))
+   {
+      ret = false;
+      goto end;
+   }
+
+   if (!rpng_nbio_load_image_argb_start(rpng))
+   {
+      ret = false;
+      goto end;
+   }
+
+   while (rpng_nbio_load_image_argb_iterate(rpng));
+
+   if (!rpng_is_valid(rpng))
+   {
+      ret = false;
+      goto end;
+   }
+   
+   do
+   {
+      retval = rpng_nbio_load_image_argb_process(rpng, data, width, height);
+   }while(retval == PNG_PROCESS_NEXT);
+
+   if (retval == PNG_PROCESS_ERROR || retval == PNG_PROCESS_ERROR_END)
+      ret = false;
+
+end:
+   if (handle)
+      nbio_free(handle);
+   if (rpng)
+      rpng_nbio_load_image_free(rpng);
+   rpng = NULL;
+   if (!ret)
+      free(*data);
+   return ret;
 }

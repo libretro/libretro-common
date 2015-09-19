@@ -38,6 +38,10 @@
 #include <fcntl.h>
 #endif
 
+#ifdef RARCH_INTERNAL
+#include <retro_log.h>
+#endif
+
 #if 1
 #define HAVE_BUFFERED_IO 1
 #endif
@@ -207,10 +211,10 @@ ssize_t retro_fwrite(RFILE *stream, const void *s, size_t len)
 #endif
 }
 
-void retro_fclose(RFILE *stream)
+int retro_fclose(RFILE *stream)
 {
    if (!stream)
-      return;
+      return -1;
 
 #if defined(VITA) || defined(PSP)
    if (stream->fd > 0)
@@ -223,32 +227,99 @@ void retro_fclose(RFILE *stream)
       close(stream->fd);
 #endif
    free(stream);
+
+   return 0;
 }
 
-static bool retro_fread_iterate(RFILE *stream, char *s, size_t len, ssize_t *bytes_written)
+/**
+ * retro_read_file:
+ * @path             : path to file.
+ * @buf              : buffer to allocate and read the contents of the
+ *                     file into. Needs to be freed manually.
+ *
+ * Read the contents of a file into @buf.
+ *
+ * Returns: number of items read, -1 on error.
+ */
+int retro_read_file(const char *path, void **buf, ssize_t *len)
 {
-   *bytes_written = retro_fread(stream, s, len);
-#if defined(HAVE_BUFFERED_IO)
-   return (*bytes_written < 0);
+   ssize_t ret              = 0;
+   ssize_t content_buf_size = 0;
+   void *content_buf        = NULL;
+   RFILE *file              = retro_fopen(path, RFILE_MODE_READ, -1);
+
+   if (!file)
+      goto error;
+
+   if (retro_fseek(file, 0, SEEK_END) != 0)
+      goto error;
+
+   content_buf_size = retro_ftell(file);
+   if (content_buf_size < 0)
+      goto error;
+
+   retro_frewind(file);
+
+   content_buf = malloc(content_buf_size + 1);
+
+   if (!content_buf)
+      goto error;
+
+   if ((ret = retro_fread(file, content_buf, content_buf_size)) < content_buf_size)
+   {
+#ifdef RARCH_INTERNAL
+      RARCH_WARN("Didn't read whole file: %s.\n", path);
 #else
-   return (*bytes_written < 0 && errno == EINTR);
+      printf("Didn't read whole file: %s.\n", path);
 #endif
+   }
+
+   if (!content_buf)
+      goto error;
+
+   *buf    = content_buf;
+
+   /* Allow for easy reading of strings to be safe.
+    * Will only work with sane character formatting (Unix). */
+   ((char*)content_buf)[content_buf_size] = '\0';
+
+   if (retro_fclose(file) != 0)
+      printf("Failed to close file stream.\n");
+
+   if (len)
+      *len = ret;
+
+   return 1;
+
+error:
+   retro_fclose(file);
+   if (content_buf)
+      free(content_buf);
+   if (len)
+      *len = -1;
+   *buf = NULL;
+   return 0;
 }
 
-bool retro_fmemcpy(const char *path, char *s, size_t len, ssize_t *bytes_written)
+/**
+ * retro_write_file:
+ * @path             : path to file.
+ * @data             : contents to write to the file.
+ * @size             : size of the contents.
+ *
+ * Writes data to a file.
+ *
+ * Returns: true (1) on success, false (0) otherwise.
+ */
+bool retro_write_file(const char *path, const void *data, ssize_t size)
 {
-   RFILE *stream = retro_fopen(path, RFILE_MODE_READ, -1);
-   if (!stream)
+   ssize_t ret   = 0;
+   RFILE *file   = retro_fopen(path, RFILE_MODE_WRITE, -1);
+   if (!file)
       return false;
 
-   while(retro_fread_iterate(stream, s, len, bytes_written));
+   ret = retro_fwrite(file, data, size);
+   retro_fclose(file);
 
-   retro_fclose(stream);
-   if (*bytes_written < 0)
-      return false;
-
-   /* NULL-terminate the string. */
-   s[*bytes_written] = '\0';
-
-   return true;
+   return (ret == size);
 }
