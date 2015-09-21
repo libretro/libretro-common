@@ -78,6 +78,9 @@
 
 #endif
 
+#if defined(VITA)
+#define FIO_SO_ISDIR PSP2_S_ISDIR
+#endif
 
 /**
  * path_get_extension:
@@ -172,19 +175,48 @@ bool path_is_compressed_file(const char* path)
  */
 bool path_is_directory(const char *path)
 {
-#ifdef _WIN32
+#if defined(VITA) || defined(PSP)
+   SceIoStat buf;
+   if (sceIoGetstat(path, &buf) < 0)
+      return false;
+   return FIO_SO_ISDIR(buf.st_mode);
+#elif defined(__CELLOS_LV2__)
+    CellFsStat buf;
+    if (cellFsStat(path, &buf) < 0)
+       return false;
+    return ((buf.st_mode & S_IFMT) == S_IFDIR);
+#elif defined(_WIN32)
    DWORD ret = GetFileAttributes(path);
    return (ret & FILE_ATTRIBUTE_DIRECTORY) && (ret != INVALID_FILE_ATTRIBUTES);
-#elif defined(VITA)
-   SceIoStat stat;
-	 if(sceIoGetstat(path,&stat) < 0)return -1;
-	 return PSP2_S_ISDIR(stat.st_mode);
 #else
    struct stat buf;
    if (stat(path, &buf) < 0)
       return false;
 
    return S_ISDIR(buf.st_mode);
+#endif
+}
+
+bool path_is_valid(const char *path)
+{
+#if defined(VITA) || defined(PSP)
+   SceIoStat buf;
+   if (sceIoGetstat(path, &buf) < 0)
+      return false;
+   return true;
+#elif defined(__CELLOS_LV2__)
+    CellFsStat buf;
+    if (cellFsStat(path, &buf) < 0)
+       return false;
+    return true;
+#elif defined(_WIN32)
+   DWORD ret = GetFileAttributes(path);
+   return (ret != INVALID_FILE_ATTRIBUTES);
+#else
+   struct stat buf;
+   if (stat(path, &buf) < 0)
+      return false;
+   return true;
 #endif
 }
 
