@@ -22,6 +22,12 @@
 #elif defined(VITA)
 #  include <psp2/io/fcntl.h>
 #  include <psp2/io/dirent.h>
+
+#define PSP_O_RDONLY PSP2_O_RDONLY
+#define PSP_O_RDWR   PSP2_O_RDWR
+#define PSP_O_CREAT  PSP2_O_CREAT
+#define PSP_O_WRONLY PSP2_O_WRONLY
+#define PSP_O_TRUNC  PSP2_O_TRUNC
 #else
 #  if defined(PSP)
 #    include <pspiofilemgr.h>
@@ -89,7 +95,7 @@ RFILE *retro_fopen(const char *path, unsigned mode, ssize_t len)
       case RFILE_MODE_READ:
 #if defined(VITA) || defined(PSP)
          mode_int = 0777;
-         flags = O_RDONLY;
+         flags    = PSP_O_RDONLY;
 #elif defined(HAVE_BUFFERED_IO)
          mode_str = "rb";
 #else
@@ -99,7 +105,7 @@ RFILE *retro_fopen(const char *path, unsigned mode, ssize_t len)
       case RFILE_MODE_WRITE:
 #if defined(VITA) || defined(PSP)
          mode_int = 0777;
-         flags    = O_WRONLY | O_CREAT;
+         flags    = PSP_O_CREAT | PSP_O_WRONLY | PSP_O_TRUNC;
 #elif defined(HAVE_BUFFERED_IO)
          mode_str = "wb";
 #else
@@ -109,7 +115,7 @@ RFILE *retro_fopen(const char *path, unsigned mode, ssize_t len)
       case RFILE_MODE_READ_WRITE:
 #if defined(VITA) || defined(PSP)
          mode_int = 0777;
-         flags    = O_RDWR;
+         flags    = PSP_O_RDWR;
 #elif defined(HAVE_BUFFERED_IO)
          mode_str = "w+";
 #else
