@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (retro_stat.h).
+ * The following license statement only applies to this file (compat_strcasestr.c).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,46 +20,40 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __RETRO_STAT_H
-#define __RETRO_STAT_H
+#include <ctype.h>
 
-#include <stdint.h>
-#include <stddef.h>
+#include <compat/strcasestr.h>
+#include <retro_assert.h>
 
-#include <boolean.h>
+/* Pretty much strncasecmp. */
+static int casencmp(const char *a, const char *b, size_t n)
+{
+   size_t i;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+   for (i = 0; i < n; i++)
+   {
+      int a_lower = tolower(a[i]);
+      int b_lower = tolower(b[i]);
+      if (a_lower != b_lower)
+         return a_lower - b_lower;
+   }
 
-/**
- * path_is_directory:
- * @path               : path
- *
- * Checks if path is a directory.
- *
- * Returns: true (1) if path is a directory, otherwise false (0).
- */
-bool path_is_directory(const char *path);
-
-bool path_is_character_special(const char *path);
-
-bool path_is_valid(const char *path);
-
-int32_t path_get_size(const char *path);
-
-/**
- * path_mkdir_norecurse:
- * @dir                : directory
- *
- * Create directory on filesystem.
- *
- * Returns: true (1) if directory could be created, otherwise false (0).
- **/
-bool mkdir_norecurse(const char *dir);
-
-#ifdef __cplusplus
+   return 0;
 }
-#endif
 
-#endif
+char *strcasestr_rarch__(const char *haystack, const char *needle)
+{
+   size_t i, hay_len, needle_len, search_off;
+
+   hay_len = strlen(haystack);
+   needle_len = strlen(needle);
+   if (needle_len > hay_len)
+      return NULL;
+
+   search_off = hay_len - needle_len;
+   for (i = 0; i <= search_off; i++)
+      if (!casencmp(haystack + i, needle, needle_len))
+         return (char*)haystack + i;
+
+   return NULL;
+}

@@ -34,6 +34,10 @@
 extern "C" {
 #endif
 
+#ifdef __MACH__
+#define HAVE_STRL
+#endif
+
 #ifndef HAVE_STRL
 /* Avoid possible naming collisions during link since 
  * we prefer to use the actual name. */
