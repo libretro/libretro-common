@@ -34,6 +34,24 @@ extern "C" {
 
 #include <boolean.h>
 
+#define CONFIG_GET_BOOL_BASE(conf, base, var, key) do { \
+   bool tmp = false; \
+   if (config_get_bool(conf, key, &tmp)) \
+      base->var = tmp; \
+} while(0)
+
+#define CONFIG_GET_INT_BASE(conf, base, var, key) do { \
+   int tmp = 0; \
+   if (config_get_int(conf, key, &tmp)) \
+      base->var = tmp; \
+} while(0)
+
+#define CONFIG_GET_FLOAT_BASE(conf, base, var, key) do { \
+   float tmp = 0.0f; \
+   if (config_get_float(conf, key, &tmp)) \
+      base->var = tmp; \
+} while(0)
+
 typedef struct config_file config_file_t;
 
 /* Config file format
@@ -89,8 +107,10 @@ bool config_get_int(config_file_t *conf, const char *entry, int *in);
 /* Extracts an uint from config file. */
 bool config_get_uint(config_file_t *conf, const char *entry, unsigned *in);
 
+#ifndef C89_BUILD
 /* Extracts an uint64 from config file. */
 bool config_get_uint64(config_file_t *conf, const char *entry, uint64_t *in);
+#endif
 
 /* Extracts an unsigned int from config file treating input as hex. */
 bool config_get_hex(config_file_t *conf, const char *entry, unsigned *in);

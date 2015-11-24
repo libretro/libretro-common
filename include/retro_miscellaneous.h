@@ -24,6 +24,7 @@
 #define __RARCH_MISCELLANEOUS_H
 
 #include <stdint.h>
+#include <math.h>
 
 #if defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)
 #include <sys/timer.h>
@@ -56,7 +57,15 @@
 #include <retro_inline.h>
 
 #ifndef PATH_MAX_LENGTH
+#if defined(_XBOX1) || defined(_3DS) || defined(PSP) || defined(GEKKO)
+#define PATH_MAX_LENGTH 512
+#else
 #define PATH_MAX_LENGTH 4096
+#endif
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327
 #endif
 
 #ifndef max
@@ -134,6 +143,19 @@ static INLINE uint32_t prev_pow2(uint32_t v)
    v |= v >> 8;
    v |= v >> 16;
    return v - (v >> 1);
+}
+
+/**
+ * db_to_gain:
+ * @db          : Decibels.
+ *
+ * Converts decibels to voltage gain.
+ *
+ * Returns: voltage gain value.
+ **/
+static INLINE float db_to_gain(float db)
+{
+   return powf(10.0f, db / 20.0f);
 }
 
 /* Helper macros and struct to keep track of many booleans.
