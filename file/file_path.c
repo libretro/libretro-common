@@ -462,12 +462,10 @@ void path_parent_dir(char *path)
  **/
 const char *path_basename(const char *path)
 {
-   const char *last_hash = NULL;
    const char *last = find_last_slash(path);
-
-   (void)last_hash;
-
 #ifdef HAVE_COMPRESSION
+   const char *last_hash = NULL;
+
    /* We cut either at the last hash or the last slash; whichever comes last */
    last_hash = strchr(path,'#');
 
@@ -579,6 +577,15 @@ void fill_pathname_join(char *out_path,
       fill_pathname_slash(out_path, size);
 
    retro_assert(strlcat(out_path, path, size) < size);
+}
+
+void fill_string_join(char *out_path,
+      const char *append, size_t size)
+{
+   if (*out_path)
+      fill_pathname_slash(out_path, size);
+
+   retro_assert(strlcat(out_path, append, size) < size);
 }
 
 /**
