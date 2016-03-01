@@ -524,7 +524,7 @@ config_file_t *config_file_new(const char *path)
 void config_file_free(config_file_t *conf)
 {
    struct config_include_list *inc_tmp = NULL;
-   struct config_entry_list *tmp = NULL;
+   struct config_entry_list *tmp       = NULL;
    if (!conf)
       return;
 
@@ -532,11 +532,19 @@ void config_file_free(config_file_t *conf)
    while (tmp)
    {
       struct config_entry_list *hold = NULL;
-      free(tmp->key);
-      free(tmp->value);
-      hold = tmp;
-      tmp = tmp->next;
-      free(hold);
+      if (tmp->key)
+         free(tmp->key);
+      if (tmp->value)
+         free(tmp->value);
+
+      tmp->value = NULL;
+      tmp->key   = NULL;
+
+      hold       = tmp;
+      tmp        = tmp->next;
+
+      if (hold)
+         free(hold);
    }
 
    inc_tmp = (struct config_include_list*)conf->includes;
@@ -549,7 +557,8 @@ void config_file_free(config_file_t *conf)
       free(hold);
    }
 
-   free(conf->path);
+   if (conf->path)
+      free(conf->path);
    free(conf);
 }
 
@@ -803,8 +812,10 @@ void config_set_double(config_file_t *conf, const char *key, double val)
    char buf[128] = {0};
 #ifdef __cplusplus
    snprintf(buf, sizeof(buf), "%f", (float)val);
-#else
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__>=199901L
    snprintf(buf, sizeof(buf), "%lf", val);
+#else
+   snprintf(buf, sizeof(buf), "%f", (float)val);
 #endif
    config_set_string(conf, key, buf);
 }
@@ -887,6 +898,9 @@ void config_file_dump(config_file_t *conf, FILE *file)
    list = (struct config_entry_list*)conf->entries;
    while (list)
    {
+      if (!list)
+         break;
+
       if (!list->readonly && list->key)
          fprintf(file, "%s = \"%s\"\n", list->key, list->value);
       list = list->next;
