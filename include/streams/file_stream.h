@@ -1,7 +1,8 @@
 /* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (strcasestr.h).  * ---------------------------------------------------------------------------------------
+ * The following license statement only applies to this file (file_stream.h).
+ * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
  * to any person obtaining a copy of this software and associated documentation files (the "Software"),
@@ -19,31 +20,56 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_COMPAT_STRCASESTR_H
-#define __LIBRETRO_SDK_COMPAT_STRCASESTR_H
+#ifndef __LIBRETRO_SDK_FILE_STREAM_H
+#define __LIBRETRO_SDK_FILE_STREAM_H
 
-#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
 
-#if defined(RARCH_INTERNAL) && defined(HAVE_CONFIG_H)
-#include "../../../config.h"
-#endif
+#include <sys/types.h>
 
-#ifndef HAVE_STRCASESTR
+#include <retro_common.h>
+#include <boolean.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Avoid possible naming collisions during link 
- * since we prefer to use the actual name. */
-#define strcasestr(haystack, needle) strcasestr_retro__(haystack, needle)
+typedef struct RFILE RFILE;
 
-char *strcasestr(const char *haystack, const char *needle);
+enum
+{
+   RFILE_MODE_READ = 0,
+   RFILE_MODE_WRITE,
+   RFILE_MODE_READ_WRITE,
+
+   /* There is no garantee these requests will be attended. */
+   RFILE_HINT_UNBUFFERED = 1<<8,
+   RFILE_HINT_MMAP       = 1<<9  /* requires RFILE_MODE_READ */
+};
+
+RFILE *retro_fopen(const char *path, unsigned mode, ssize_t len);
+
+ssize_t retro_fseek(RFILE *stream, ssize_t offset, int whence);
+
+ssize_t retro_fread(RFILE *stream, void *s, size_t len);
+
+ssize_t retro_fwrite(RFILE *stream, const void *s, size_t len);
+
+ssize_t retro_ftell(RFILE *stream);
+
+void retro_frewind(RFILE *stream);
+
+int retro_fclose(RFILE *stream);
+
+int retro_read_file(const char *path, void **buf, ssize_t *len);
+
+bool retro_write_file(const char *path, const void *data, ssize_t size);
+
+int retro_get_fd(RFILE *stream);
 
 #ifdef __cplusplus
 }
 #endif
-#endif
 
 #endif
-

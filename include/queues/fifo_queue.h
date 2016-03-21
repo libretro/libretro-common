@@ -1,7 +1,7 @@
-/* Copyright  (C) 2010-2015 The RetroArch team
+/* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (retro_file.h).
+ * The following license statement only applies to this file (fifo_queue.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,56 +20,35 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __RETRO_FILE_H
-#define __RETRO_FILE_H
+#ifndef __LIBRETRO_SDK_FIFO_BUFFER_H
+#define __LIBRETRO_SDK_FIFO_BUFFER_H
 
 #include <stdint.h>
 #include <stddef.h>
-
-#include <sys/types.h>
-
-#include <retro_common.h>
-#include <boolean.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct RFILE RFILE;
+typedef struct fifo_buffer fifo_buffer_t;
 
-enum
-{
-   RFILE_MODE_READ = 0,
-   RFILE_MODE_WRITE,
-   RFILE_MODE_READ_WRITE,
+fifo_buffer_t *fifo_new(size_t size);
 
-   /* There is no garantee these requests will be attended. */
-   RFILE_HINT_UNBUFFERED = 1<<8,
-   RFILE_HINT_MMAP       = 1<<9  /* requires RFILE_MODE_READ */
-};
+void fifo_clear(fifo_buffer_t *buffer);
 
-RFILE *retro_fopen(const char *path, unsigned mode, ssize_t len);
+void fifo_write(fifo_buffer_t *buffer, const void *in_buf, size_t size);
 
-ssize_t retro_fseek(RFILE *stream, ssize_t offset, int whence);
+void fifo_read(fifo_buffer_t *buffer, void *in_buf, size_t size);
 
-ssize_t retro_fread(RFILE *stream, void *s, size_t len);
+void fifo_free(fifo_buffer_t *buffer);
 
-ssize_t retro_fwrite(RFILE *stream, const void *s, size_t len);
+size_t fifo_read_avail(fifo_buffer_t *buffer);
 
-ssize_t retro_ftell(RFILE *stream);
-
-void retro_frewind(RFILE *stream);
-
-int retro_fclose(RFILE *stream);
-
-int retro_read_file(const char *path, void **buf, ssize_t *len);
-
-bool retro_write_file(const char *path, const void *data, ssize_t size);
-
-int retro_get_fd(RFILE *stream);
+size_t fifo_write_avail(fifo_buffer_t *buffer);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
+

@@ -1,7 +1,7 @@
-/* Copyright  (C) 2010-2015 The RetroArch team
+/* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (boolean.h).
+ * The following license statement only applies to this file (net_ifinfo.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,35 +20,30 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_FIFO_BUFFER_H
-#define __LIBRETRO_SDK_FIFO_BUFFER_H
+#ifndef _LIBRETRO_NET_IFINFO_H
+#define _LIBRETRO_NET_IFINFO_H
 
 #include <stdint.h>
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <boolean.h>
 
-typedef struct fifo_buffer fifo_buffer_t;
+struct net_ifinfo_entry
+{
+   char *name;
+   char *host;
+};
 
-fifo_buffer_t *fifo_new(size_t size);
+struct net_ifinfo
+{
+   struct net_ifinfo_entry *entries;
+   size_t size;
+}; 
 
-void fifo_clear(fifo_buffer_t *buffer);
+typedef struct net_ifinfo net_ifinfo_t;
 
-void fifo_write(fifo_buffer_t *buffer, const void *in_buf, size_t size);
+void net_ifinfo_free(net_ifinfo_t *list);
 
-void fifo_read(fifo_buffer_t *buffer, void *in_buf, size_t size);
-
-void fifo_free(fifo_buffer_t *buffer);
-
-size_t fifo_read_avail(fifo_buffer_t *buffer);
-
-size_t fifo_write_avail(fifo_buffer_t *buffer);
-
-#ifdef __cplusplus
-}
-#endif
+bool net_ifinfo_new(net_ifinfo_t *list);
 
 #endif
-

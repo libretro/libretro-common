@@ -1,7 +1,8 @@
 /* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (strcasestr.h).  * ---------------------------------------------------------------------------------------
+ * The following license statement only applies to this file (compat_fnmatch.c).
+ * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
  * to any person obtaining a copy of this software and associated documentation files (the "Software"),
@@ -19,31 +20,30 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_COMPAT_STRCASESTR_H
-#define __LIBRETRO_SDK_COMPAT_STRCASESTR_H
-
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#if defined(RARCH_INTERNAL) && defined(HAVE_CONFIG_H)
-#include "../../../config.h"
-#endif
+#include <net/net_ifinfo.h>
 
-#ifndef HAVE_STRCASESTR
+int main(int argc, const char *argv[])
+{
+   unsigned k              = 0;
+   net_ifinfo_t *list = 
+      (net_ifinfo_t*)calloc(1, sizeof(*list));
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+   if (!list)
+      return -1;
 
-/* Avoid possible naming collisions during link 
- * since we prefer to use the actual name. */
-#define strcasestr(haystack, needle) strcasestr_retro__(haystack, needle)
+   if (!net_ifinfo_new(list))
+      return -1;
 
-char *strcasestr(const char *haystack, const char *needle);
+   for (k = 0; k < list->size; k++)
+   {
+      printf("%s:%s\n", list->entries[k].name, list->entries[k].host);
+   }
 
-#ifdef __cplusplus
+   net_ifinfo_free(list);
+
+   return 0;
 }
-#endif
-#endif
-
-#endif
-
