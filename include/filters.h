@@ -23,7 +23,7 @@
 #ifndef _LIBRETRO_SDK_FILTERS_H
 #define _LIBRETRO_SDK_FILTERS_H
 
-//for MSVC; should be benign under any circumstances
+/* for MSVC; should be benign under any circumstances */
 #define _USE_MATH_DEFINES
 
 #include <stdlib.h>
