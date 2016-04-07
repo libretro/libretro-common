@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2015 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (memory_stream.h).
+ * The following license statement only applies to this file (interface_stream.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,36 +20,62 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _LIBRETRO_SDK_FILE_MEMORY_STREAM_H
-#define _LIBRETRO_SDK_FILE_MEMORY_STREAM_H
+#ifndef _LIBRETRO_SDK_INTERFACE_STREAM_H
+#define _LIBRETRO_SDK_INTERFACE_STREAM_H
 
 #include <stdint.h>
 #include <stddef.h>
 
-typedef struct memstream memstream_t;
+#include <boolean.h>
 
-memstream_t *memstream_open(unsigned writing);
+enum intfstream_type
+{
+   INTFSTREAM_FILE = 0,
+   INTFSTREAM_MEMORY
+};
 
-void memstream_close(memstream_t *stream);
+typedef struct intfstream_internal intfstream_internal_t;
 
-size_t memstream_read(memstream_t *stream, void *data, size_t bytes);
+typedef struct intfstream intfstream_t;
 
-size_t memstream_write(memstream_t *stream, const void *data, size_t bytes);
+typedef struct intfstream_info
+{
+   struct
+   {
+      uint8_t *data;
+      unsigned size;
+   } buf;
+   enum intfstream_type type;
+} intfstream_info_t;
 
-int memstream_getc(memstream_t *stream);
+void *intfstream_init(intfstream_info_t *info);
 
-void memstream_putc(memstream_t *stream, int c);
+bool intfstream_resize(intfstream_internal_t *intf,
+      intfstream_info_t *info);
 
-char *memstream_gets(memstream_t *stream, char *buffer, size_t len);
+bool intfstream_open(intfstream_internal_t *intf,
+      const char *path, unsigned mode, ssize_t len);
 
-size_t memstream_pos(memstream_t *stream);
+ssize_t intfstream_read(intfstream_internal_t *intf,
+      void *s, size_t len);
 
-void memstream_rewind(memstream_t *stream);
+ssize_t intfstream_write(intfstream_internal_t *intf,
+      const void *s, size_t len);
 
-int memstream_seek(memstream_t *stream, int offset, int whence);
+char *intfstream_gets(intfstream_internal_t *intf,
+      char *buffer, size_t len);
 
-void memstream_set_buffer(uint8_t *buffer, size_t size);
+int intfstream_getc(intfstream_internal_t *intf);
 
-size_t memstream_get_last_size(void);
+int intfstream_seek(intfstream_internal_t *intf,
+      int offset, int whence);
+
+void intfstream_rewind(intfstream_internal_t *intf);
+
+size_t intfstream_tell(intfstream_internal_t *intf);
+
+void intfstream_putc(intfstream_internal_t *intf, int c);
+
+int intfstream_close(intfstream_internal_t *intf);
 
 #endif
