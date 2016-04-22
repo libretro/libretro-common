@@ -23,6 +23,8 @@
 #ifndef __LIBRETRO_SDK_COMPAT_POSIX_STRING_H
 #define __LIBRETRO_SDK_COMPAT_POSIX_STRING_H
 
+#include <retro_common_api.h>
+
 #ifdef _MSC_VER
 #include <compat/msvc.h>
 #endif
@@ -56,8 +58,6 @@ int isblank(int c);
 #endif
 
 
-#ifdef __cplusplus
-}
-#endif
+RETRO_EXTERN_C_CLOSE
 
 #endif

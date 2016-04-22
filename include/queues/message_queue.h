@@ -25,9 +25,9 @@
 
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <retro_common_api.h>
+
+RETRO_EXTERN_C_OPEN
 
 typedef struct msg_queue msg_queue_t;
 
@@ -83,8 +83,6 @@ void msg_queue_clear(msg_queue_t *queue);
  **/
 void msg_queue_free(msg_queue_t *queue);
 
-#ifdef __cplusplus
-}
-#endif
+RETRO_EXTERN_C_CLOSE
 
 #endif

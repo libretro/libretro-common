@@ -25,9 +25,9 @@
 
 #include <glsm/glsm.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <retro_common_api.h>
+
+RETRO_EXTERN_C_OPEN
 
 /* deprecated old FF-style GL symbols */
 #define glTexCoord2f                rglTexCoord2f
@@ -231,8 +231,6 @@ GLint rglGetAttribLocation(GLuint program, const GLchar *name);
 void rglDrawBuffers(GLsizei n, const GLenum *bufs);
 void rglBindVertexArray(GLuint array);
 
-#ifdef __cplusplus
-}
-#endif
+RETRO_EXTERN_C_CLOSE
 
 #endif

@@ -26,9 +26,9 @@
 #include <stdint.h>
 #include <boolean.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <retro_common_api.h>
+
+RETRO_EXTERN_C_OPEN
 
 enum task_queue_ctl_state
 {
@@ -148,8 +148,6 @@ void task_queue_push_progress(retro_task_t *task);
 
 bool task_queue_ctl(enum task_queue_ctl_state state, void *data);
 
-#ifdef __cplusplus
-}
-#endif
+RETRO_EXTERN_C_CLOSE
 
 #endif

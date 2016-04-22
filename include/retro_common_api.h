@@ -73,6 +73,20 @@ typedef int ssize_t;
 #endif
 #endif
 
+/*
+I would like to see retro_inline.h moved in here; possibly boolean too.
+
+rationale: these are used in public APIs, and it is easier to find problems
+and write code that works the first time portably when theyre included uniformly
+than to do the analysis from scratch each time you think you need it, for each feature.
+
+Moreover it helps force you to make hard decisions: if you EVER bring in boolean.h,
+then you should pay the price everywhere, so you can see how much grief it will cause.
+
+Of course, another school of thought is that you should do as little damage as possible
+in as few places as possible...
+*/
+
 
 /* _LIBRETRO_COMMON_RETRO_COMMON_API_H */
 #endif
