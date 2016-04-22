@@ -37,7 +37,7 @@
 #undef NEED_DYNAMIC
 #endif
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 typedef void *dylib_t;
 typedef void (*function_t)(void);
@@ -66,6 +66,6 @@ char *dylib_error(void);
 function_t dylib_proc(dylib_t lib, const char *proc);
 #endif
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

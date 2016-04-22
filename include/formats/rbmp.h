@@ -27,7 +27,7 @@
 
 #include <boolean.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 enum rbmp_source_type
 {
@@ -46,6 +46,6 @@ bool rbmp_save_image(
       unsigned pitch,
       enum rbmp_source_type type);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

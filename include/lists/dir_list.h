@@ -27,7 +27,7 @@
 
 #include <lists/string_list.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 /**
  * dir_list_new:
@@ -63,6 +63,6 @@ void dir_list_sort(struct string_list *list, bool dir_first);
  **/
 void dir_list_free(struct string_list *list);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

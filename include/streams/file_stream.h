@@ -31,7 +31,7 @@
 #include <retro_common_api.h>
 #include <boolean.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 typedef struct RFILE RFILE;
 
@@ -68,6 +68,6 @@ int filestream_putc(RFILE *stream, int c);
 
 int filestream_get_fd(RFILE *stream);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

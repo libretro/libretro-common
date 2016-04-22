@@ -27,12 +27,12 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 void *memalign_alloc(size_t boundary, size_t size);
 
 void memalign_free(void *ptr);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

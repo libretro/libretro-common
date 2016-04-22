@@ -30,7 +30,7 @@
 #include <retro_inline.h>
 #include <retro_miscellaneous.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 typedef struct sthread sthread_t;
 typedef struct slock slock_t;
@@ -183,6 +183,6 @@ int scond_broadcast(scond_t *cond);
  **/
 void scond_signal(scond_t *cond);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

@@ -32,7 +32,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 /* Avoid possible naming collisions during link 
  * since we prefer to use the actual name. */
@@ -40,7 +40,7 @@ RETRO_EXTERN_C_OPEN
 
 char *strcasestr(const char *haystack, const char *needle);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

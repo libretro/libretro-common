@@ -38,18 +38,18 @@ However, we want to support building this library as C++ as well, so a
 special technique is called for.
 */
 
-#define RETRO_EXTERN_C_OPEN
-#define RETRO_EXTERN_C_CLOSE
+#define RETRO_BEGIN_DECLS
+#define RETRO_END_DECLS
 
 #ifdef __cplusplus
 
 #ifdef CXX_BUILD
 /* build wants everything to be built as c++, so no extern "C" */
 #else
-#undef RETRO_EXTERN_C_OPEN
-#undef RETRO_EXTERN_C_CLOSE
-#define RETRO_EXTERN_C_OPEN extern "C" {
-#define RETRO_EXTERN_C_CLOSE }
+#undef RETRO_BEGIN_DECLS
+#undef RETRO_END_DECLS
+#define RETRO_BEGIN_DECLS extern "C" {
+#define RETRO_END_DECLS }
 #endif
 
 #else

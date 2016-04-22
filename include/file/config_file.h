@@ -26,7 +26,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 #include <stdio.h>
 #include <stdint.h>
@@ -158,7 +158,7 @@ bool config_file_write(config_file_t *conf, const char *path);
  * Does not close the file. */
 void config_file_dump(config_file_t *conf, FILE *file);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

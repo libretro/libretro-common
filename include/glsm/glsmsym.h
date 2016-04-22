@@ -27,7 +27,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 /* deprecated old FF-style GL symbols */
 #define glTexCoord2f                rglTexCoord2f
@@ -231,6 +231,6 @@ GLint rglGetAttribLocation(GLuint program, const GLchar *name);
 void rglDrawBuffers(GLsizei n, const GLenum *bufs);
 void rglBindVertexArray(GLuint array);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

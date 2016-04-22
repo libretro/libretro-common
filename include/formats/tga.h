@@ -34,14 +34,14 @@
 
 #include <boolean.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 bool rtga_image_load_shift(uint8_t *buf,
       void *data,
       unsigned a_shift, unsigned r_shift,
       unsigned g_shift, unsigned b_shift);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

@@ -23,7 +23,7 @@
 
 #include <boolean.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 enum image_process_code
 {
@@ -50,6 +50,6 @@ bool video_texture_image_color_convert(unsigned r_shift,
 bool video_texture_image_load(struct texture_image *img, const char *path);
 void video_texture_image_free(struct texture_image *img);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

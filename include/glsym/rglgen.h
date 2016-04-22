@@ -31,7 +31,7 @@
 
 #include "rglgen_headers.h"
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 struct rglgen_sym_map;
 
@@ -41,7 +41,7 @@ void rglgen_resolve_symbols(rglgen_proc_address_t proc);
 void rglgen_resolve_symbols_custom(rglgen_proc_address_t proc,
       const struct rglgen_sym_map *map);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

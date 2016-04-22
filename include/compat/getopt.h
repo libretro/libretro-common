@@ -40,7 +40,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 struct option
 {
@@ -58,7 +58,7 @@ int getopt_long(int argc, char *argv[],
 extern char *optarg;
 extern int optind, opterr, optopt;
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 /* If these are variously #defined, then we have bigger problems */
 #ifndef no_argument

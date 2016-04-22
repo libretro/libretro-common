@@ -29,7 +29,7 @@
 #include <libretro.h>
 #include <glsym/rglgen_headers.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 #ifdef HAVE_OPENGLES2
 typedef GLfloat GLdouble;
@@ -147,6 +147,6 @@ typedef struct glsm_ctx_params
 
 bool glsm_ctl(enum glsm_state_ctl state, void *data);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

@@ -33,7 +33,7 @@
 #include <boolean.h>
 #include <retro_inline.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 /* Order in this enum is equivalent to negative sort order in filelist
  *  (i.e. DIRECTORY is on top of PLAIN_FILE) */
@@ -402,6 +402,6 @@ void fill_pathname_application_path(char *buf, size_t size);
  **/
 bool path_mkdir(const char *dir);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

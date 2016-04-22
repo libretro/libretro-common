@@ -27,7 +27,7 @@
 
 #include <boolean.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 struct RDIR;
 
@@ -53,6 +53,6 @@ bool retro_dirent_is_dir(struct RDIR *rdir);
 
 void retro_closedir(struct RDIR *rdir);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

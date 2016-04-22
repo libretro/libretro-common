@@ -25,7 +25,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 typedef struct ssem ssem_t;
 
@@ -47,6 +47,6 @@ void ssem_wait(ssem_t *semaphore);
 
 void ssem_signal(ssem_t *semaphore);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif /* __LIBRETRO_SDK_SEMAPHORE_H */

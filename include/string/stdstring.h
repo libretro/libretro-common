@@ -30,7 +30,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 bool string_is_empty(const char *data);
 
@@ -45,6 +45,6 @@ char *string_to_lower(char *s);
 char *string_replace_substring(const char *in, const char *pattern,
       const char *by);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

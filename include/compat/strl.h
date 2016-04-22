@@ -32,7 +32,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 #ifdef __MACH__
 #ifndef HAVE_STRL
@@ -52,7 +52,7 @@ size_t strlcat(char *dest, const char *source, size_t size);
 
 #endif
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

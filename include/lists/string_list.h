@@ -29,7 +29,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 union string_list_elem_attr
 {
@@ -141,6 +141,6 @@ void string_list_join_concat(char *buffer, size_t size,
 void string_list_set(struct string_list *list, unsigned idx,
       const char *str);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

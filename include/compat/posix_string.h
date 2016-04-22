@@ -29,7 +29,7 @@
 #include <compat/msvc.h>
 #endif
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 #ifdef _WIN32
 #undef strtok_r
@@ -56,6 +56,6 @@ int isblank(int c);
 #endif
 
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

@@ -25,14 +25,14 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 #include <boolean.h>
 #include <gfx/scaler/scaler.h>
 
 bool scaler_gen_filter(struct scaler_ctx *ctx);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

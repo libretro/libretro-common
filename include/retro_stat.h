@@ -30,7 +30,7 @@
 
 #include <boolean.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 /**
  * path_is_directory:
@@ -58,6 +58,6 @@ int32_t path_get_size(const char *path);
  **/
 bool mkdir_norecurse(const char *dir);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif

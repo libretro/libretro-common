@@ -30,7 +30,7 @@
 #include <boolean.h>
 #include <clamping.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 #define FILTER_UNITY (1 << 14)
 
@@ -145,7 +145,7 @@ void *scaler_alloc(size_t elem_size, size_t size);
  **/
 void scaler_free(void *ptr);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
 

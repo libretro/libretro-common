@@ -33,7 +33,7 @@
   #endif
 #endif
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 typedef void* cothread_t;
 
@@ -73,7 +73,7 @@ void co_delete(cothread_t cothread);
  */
 void co_switch(cothread_t cothread);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 /* ifndef LIBCO_H */
 #endif

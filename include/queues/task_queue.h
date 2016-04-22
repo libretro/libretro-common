@@ -28,7 +28,7 @@
 
 #include <retro_common_api.h>
 
-RETRO_EXTERN_C_OPEN
+RETRO_BEGIN_DECLS
 
 enum task_queue_ctl_state
 {
@@ -148,6 +148,6 @@ void task_queue_push_progress(retro_task_t *task);
 
 bool task_queue_ctl(enum task_queue_ctl_state state, void *data);
 
-RETRO_EXTERN_C_CLOSE
+RETRO_END_DECLS
 
 #endif
