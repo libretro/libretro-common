@@ -29,9 +29,7 @@
 #include <compat/msvc.h>
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+RETRO_EXTERN_C_OPEN
 
 #ifdef _WIN32
 #undef strtok_r
