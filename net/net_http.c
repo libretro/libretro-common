@@ -73,6 +73,7 @@ struct http_connection_t
 static int net_http_new_socket(const char *domain, int port)
 {
    int fd;
+   int ret;
 #ifndef _WIN32
 #ifndef VITA
    struct timeval timeout;
@@ -106,22 +107,21 @@ static int net_http_new_socket(const char *domain, int port)
    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof timeout);
 #endif
 #endif
-   if (connect(fd, addr->ai_addr, addr->ai_addrlen) != 0)
-   {
-      freeaddrinfo_retro(addr);
-      socket_close(fd);
-      return -1;
-   }
+   ret = connect(fd, addr->ai_addr, addr->ai_addrlen);
 
    freeaddrinfo_retro(addr);
 
+   if (ret != 0)
+      goto error;
+
    if (!socket_nonblock(fd))
-   {
-      socket_close(fd);
-      return -1;
-   }
+      goto error;
 
    return fd;
+
+error:
+   socket_close(fd);
+   return -1;
 }
 
 static void net_http_send(int fd, bool * error,
@@ -150,6 +150,7 @@ static void net_http_send(int fd, bool * error,
 
 static void net_http_send_str(int fd, bool *error, const char *text)
 {
+printf("%s",text);
    net_http_send(fd, error, text, strlen(text));
 }
 
@@ -174,9 +175,42 @@ static ssize_t net_http_recv(int fd, bool *error,
    return -1;
 }
 
+static char* urlencode(const char* url)
+{
+	unsigned i;
+	int outpos = 0;
+	int outlen = 0;
+   char *ret  = NULL;
+
+	for (i = 0; url[i] != '\0'; i++)
+	{
+		outlen++;
+		if (url[i] == ' ')
+         outlen += 2;
+	}
+	
+	ret = (char*)malloc(outlen + 1);
+	if (!ret)
+      return NULL;
+	
+	for (i = 0; url[i]; i++)
+	{
+		if (url[i] == ' ')
+		{
+			ret[outpos++] = '%';
+			ret[outpos++] = '2';
+			ret[outpos++] = '0';
+		}
+		else
+         ret[outpos++] = url[i];
+	}
+	ret[outpos] = '\0';
+	
+	return ret;
+}
+
 struct http_connection_t *net_http_connection_new(const char *url)
 {
-   size_t length;
    char **domain = NULL;
    struct http_connection_t *conn = (struct http_connection_t*)calloc(1, 
          sizeof(struct http_connection_t));
@@ -184,22 +218,17 @@ struct http_connection_t *net_http_connection_new(const char *url)
    if (!conn)
       return NULL;
 
-   length             = strlen(url) + 1;
-   conn->urlcopy      = (char*)malloc(length);
+   conn->urlcopy = urlencode(url);
 
    if (!conn->urlcopy)
       goto error;
-
-   strlcpy(conn->urlcopy, url, length);
 
    if (strncmp(url, "http://", strlen("http://")) != 0)
       goto error;
 
    conn->scan    = conn->urlcopy + strlen("http://");
-
    domain        = &conn->domain;
-
-   *domain = conn->scan;
+   *domain       = conn->scan;
 
    return conn;
 
@@ -215,11 +244,10 @@ bool net_http_connection_iterate(struct http_connection_t *conn)
 {
    if (!conn)
       return false;
-   if (*conn->scan != '/' && *conn->scan != ':' && *conn->scan != '\0')
-   {
+
+   while (*conn->scan != '/' && *conn->scan != ':' && *conn->scan != '\0')
       conn->scan++;
-      return false;
-   }
+
    return true;
 }
 
@@ -230,17 +258,16 @@ bool net_http_connection_done(struct http_connection_t *conn)
    if (!conn)
       return false;
 
-   location = &conn->location;
+   location     = &conn->location;
 
    if (*conn->scan == '\0')
       return false;
 
-   *conn->scan   = '\0';
+   *conn->scan  = '\0';
    conn->port   = 80;
 
    if (*conn->scan == ':')
    {
-
       if (!isdigit((int)conn->scan[1]))
          return false;
 
@@ -273,9 +300,9 @@ const char *net_http_connection_url(struct http_connection_t *conn)
 
 struct http_t *net_http_new(struct http_connection_t *conn)
 {
-   bool error;
-   int fd = -1;
-   struct http_t *state      = NULL;
+   bool error            = false;
+   int fd                = -1;
+   struct http_t *state  = NULL;
 
    if (!conn)
       goto error;
