@@ -72,6 +72,8 @@ RETRO_BEGIN_DECLS
 #define glEnableVertexAttribArray   rglEnableVertexAttribArray
 #define glDisableVertexAttribArray  rglDisableVertexAttribArray
 #define glVertexAttribPointer       rglVertexAttribPointer
+#define glVertexAttribIPointer      rglVertexAttribIPointer
+#define glVertexAttribLPointer      rglVertexAttribLPointer
 #define glGetUniformLocation        rglGetUniformLocation
 #define glGenBuffers                rglGenBuffers
 #define glDisable(T)                rglDisable(S##T)
@@ -95,6 +97,11 @@ RETRO_BEGIN_DECLS
 #define glUniform3fv                rglUniform3fv
 #define glUniform4f                 rglUniform4f
 #define glUniform4fv                rglUniform4fv
+#define glUniform1ui                rglUniform1ui
+#define glUniform2ui                rglUniform2ui
+#define glUniform3ui                rglUniform3ui
+#define glUniform4ui                rglUniform4ui
+#define glGetActiveUniform          rglGetActiveUniform
 #define glBlendFunc                 rglBlendFunc
 #define glBlendFuncSeparate         rglBlendFuncSeparate
 #define glDepthFunc                 rglDepthFunc
@@ -119,6 +126,8 @@ RETRO_BEGIN_DECLS
 #define glBindVertexArray           rglBindVertexArray
 #define glBlendEquation             rglBlendEquation
 #define glBlendColor                rglBlendColor
+#define glBlendEquationSeparate     rglBlendEquationSeparate
+#define glCopyImageSubData          rglCopyImageSubData
 
 void rglBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
 void rglBlendEquation(GLenum mode);
@@ -230,6 +239,41 @@ void rglUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose,
 GLint rglGetAttribLocation(GLuint program, const GLchar *name);
 void rglDrawBuffers(GLsizei n, const GLenum *bufs);
 void rglBindVertexArray(GLuint array);
+
+void rglGetActiveUniform(GLuint program, GLuint index, GLsizei bufsize,
+      GLsizei *length, GLint *size, GLenum *type, GLchar *name);
+void rglUniform1ui(GLint location, GLuint v);
+void rglUniform2ui(GLint location, GLuint v0, GLuint v1);
+void rglUniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2);
+void rglUniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3);
+void rglBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha);
+void rglCopyImageSubData( 	GLuint srcName,
+  	GLenum srcTarget,
+  	GLint srcLevel,
+  	GLint srcX,
+  	GLint srcY,
+  	GLint srcZ,
+  	GLuint dstName,
+  	GLenum dstTarget,
+  	GLint dstLevel,
+  	GLint dstX,
+  	GLint dstY,
+  	GLint dstZ,
+  	GLsizei srcWidth,
+  	GLsizei srcHeight,
+  	GLsizei srcDepth);
+void rglVertexAttribIPointer(
+      GLuint index,
+      GLint size,
+      GLenum type,
+      GLsizei stride,
+      const GLvoid * pointer);
+void rglVertexAttribLPointer(
+      GLuint index,
+      GLint size,
+      GLenum type,
+      GLsizei stride,
+      const GLvoid * pointer);
 
 RETRO_END_DECLS
 

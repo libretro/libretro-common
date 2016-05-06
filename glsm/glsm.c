@@ -654,6 +654,42 @@ void rglGetProgramiv(GLuint shader, GLenum pname, GLint *params)
  * Core in:
  * OpenGL    : 2.0 
  */
+void rglGetActiveUniform(GLuint program, GLuint index, GLsizei bufsize,
+      GLsizei *length, GLint *size, GLenum *type, GLchar *name)
+{
+   glGetActiveUniform(program, index, bufsize, length, size, type, name);
+}
+
+/*
+ *
+ * Core in:
+ * OpenGL    : 2.0 
+ */
+void rglUniform1ui(GLint location, GLuint v)
+{
+   glUniform1ui(location ,v);
+}
+
+void rglUniform2ui(GLint location, GLuint v0, GLuint v1)
+{
+   glUniform2ui(location, v0, v1);
+}
+
+void rglUniform3ui(GLint location, GLuint v0, GLuint v1, GLuint v2)
+{
+   glUniform3ui(location, v0, v1, v2);
+}
+
+void rglUniform4ui(GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3)
+{
+   glUniform4ui(location, v0, v1, v2, v3);
+}
+
+/*
+ *
+ * Core in:
+ * OpenGL    : 2.0 
+ */
 void rglUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose,
       const GLfloat *value)
 {
@@ -810,6 +846,30 @@ void rglEnableVertexAttribArray(GLuint index)
    glsm_ctl(GLSM_CTL_IMM_VBO_DRAW, NULL);
    gl_state.vertex_attrib_pointer.enabled[index] = 1;
    glEnableVertexAttribArray(index);
+}
+
+void rglVertexAttribIPointer(
+      GLuint index,
+      GLint size,
+      GLenum type,
+      GLsizei stride,
+      const GLvoid * pointer)
+{
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES3)
+   glVertexAttribIPointer(index, size, type, stride, pointer);
+#endif
+}
+
+void rglVertexAttribLPointer(
+      GLuint index,
+      GLint size,
+      GLenum type,
+      GLsizei stride,
+      const GLvoid * pointer)
+{
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES3)
+   glVertexAttribLPointer(index, size, type, stride, pointer);
+#endif
 }
 
 /*
@@ -1093,6 +1153,55 @@ void rglBlendColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
    glBlendColor(red, green, blue, alpha);
 }
 
+/*
+ *
+ * Core in:
+ * OpenGL    : 2.0 
+ */
+void rglBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha)
+{
+   glBlendEquationSeparate(modeRGB, modeAlpha);
+}
+
+/*
+ *
+ * Core in:
+ * OpenGL    : 2.0 
+ * OpenGLES  : 3.2
+ */
+void rglCopyImageSubData( 	GLuint srcName,
+  	GLenum srcTarget,
+  	GLint srcLevel,
+  	GLint srcX,
+  	GLint srcY,
+  	GLint srcZ,
+  	GLuint dstName,
+  	GLenum dstTarget,
+  	GLint dstLevel,
+  	GLint dstX,
+  	GLint dstY,
+  	GLint dstZ,
+  	GLsizei srcWidth,
+  	GLsizei srcHeight,
+  	GLsizei srcDepth)
+{
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES32)
+   glCopyImageSubData(srcName,
+         srcTarget,
+         srcX,
+         srcY,
+         srcZ,
+         dstName,
+         dstTarget,
+         dstLevel,
+         dstX,
+         dstY,
+         dstZ,
+         srcWidth,
+         srcHeight,
+         srcDepth);
+#endif
+}
 
 /*
  * Category: VAO
@@ -1397,6 +1506,11 @@ static bool glsm_state_ctx_init(void *data)
       return false;
 
    return true;
+}
+
+GLuint glsm_get_current_framebuffer(void)
+{
+   return hw_render.get_current_framebuffer();
 }
 
 bool glsm_ctl(enum glsm_state_ctl state, void *data)
