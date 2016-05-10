@@ -115,34 +115,6 @@ static retro_task_t *task_queue_get(task_queue_t *queue)
    return task;
 }
 
-static void task_queue_remove(task_queue_t *queue, retro_task_t *task)
-{
-   retro_task_t *t;
-
-   /* Remove first element if needed */
-   if (task == queue->front)
-   {
-      queue->front = task->next;
-      task->next = NULL;
-      return;
-   }
-
-   /* Parse queue */
-   t = queue->front;
-   while (t && t->next)
-   {
-      /* Remove task and update queue */
-      if (t->next == task)
-      {
-         t->next = task->next;
-         task->next = NULL;
-         break;
-      }
-
-      /* Update iterator */
-      t = t->next;
-   }
-}
 
 static void retro_task_internal_gather(void)
 {
@@ -171,8 +143,8 @@ static void retro_task_regular_push_running(retro_task_t *task)
 
 static void retro_task_regular_cancel(void *task)
 {
-   retro_task_t *t = task;
-   t->cancelled = true;
+   retro_task_t *t = (retro_task_t*)task;
+   t->cancelled    = true;
 }
  
 static void retro_task_regular_gather(void)
@@ -249,7 +221,7 @@ static void retro_task_regular_retrieve(task_retriever_data_t *data)
       if (task->handler == data->handler)
       {
          /* Create new link */
-         info = malloc(sizeof(task_retriever_info_t));
+         info       = (task_retriever_info_t*)malloc(sizeof(task_retriever_info_t));
          info->data = malloc(data->element_size);
          info->next = NULL;
 
@@ -293,6 +265,35 @@ static slock_t *finished_lock   = NULL;
 static scond_t *worker_cond     = NULL;
 static sthread_t *worker_thread = NULL;
 static bool worker_continue     = true; /* use running_lock when touching it */
+
+static void task_queue_remove(task_queue_t *queue, retro_task_t *task)
+{
+   retro_task_t *t = NULL;
+
+   /* Remove first element if needed */
+   if (task == queue->front)
+   {
+      queue->front = task->next;
+      task->next   = NULL;
+      return;
+   }
+
+   /* Parse queue */
+   t = queue->front;
+   while (t && t->next)
+   {
+      /* Remove task and update queue */
+      if (t->next == task)
+      {
+         t->next    = task->next;
+         task->next = NULL;
+         break;
+      }
+
+      /* Update iterator */
+      t = t->next;
+   }
+}
 
 static void retro_task_threaded_push_running(retro_task_t *task)
 {
@@ -436,7 +437,9 @@ static void threaded_worker(void *userdata)
          slock_unlock(finished_lock);
       }
 
+#if 0
       retro_sleep(10);
+#endif
    }
 
    slock_unlock(running_lock);
@@ -533,7 +536,7 @@ bool task_queue_ctl(enum task_queue_ctl_state state, void *data)
          }
          break;
       case TASK_QUEUE_CTL_RETRIEVE:
-         impl_current->retrieve(data);
+         impl_current->retrieve((task_retriever_data_t*)data);
          break;
       case TASK_QUEUE_CTL_CHECK:
          {
