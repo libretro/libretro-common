@@ -1,7 +1,7 @@
-/* Copyright  (C) 2010-2015 The RetroArch team
+/* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (rjpeg.h).
+ * The following license statement only applies to this file (features_cpu.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,22 +20,56 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_FORMAT_RJPEG_H__
-#define __LIBRETRO_SDK_FORMAT_RJPEG_H__
+#ifndef _LIBRETRO_SDK_CPU_INFO_H
+#define _LIBRETRO_SDK_CPU_INFO_H
 
 #include <stdint.h>
-#include <stddef.h>
 
-#include <retro_common_api.h>
+#include <libretro.h>
 
-#include <boolean.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-RETRO_BEGIN_DECLS
+/**
+ * cpu_features_get_perf_counter:
+ *
+ * Gets performance counter.
+ *
+ * Returns: performance counter.
+ **/
+retro_perf_tick_t cpu_features_get_perf_counter(void);
 
-bool rjpeg_image_load(uint8_t *buf, void *data, size_t size,
-      unsigned a_shift, unsigned r_shift, unsigned g_shift, unsigned b_shift);
+/**
+ * cpu_features_get_time_usec:
+ *
+ * Gets time in microseconds.  *
+ * Returns: time in microseconds.
+ **/
+retro_time_t cpu_features_get_time_usec(void);
 
-RETRO_END_DECLS
+/**
+ * cpu_features_get:
+ *
+ * Gets CPU features..
+ *
+ * Returns: bitmask of all CPU features available.
+ **/
+uint64_t cpu_features_get(void);
+
+/**
+ * cpu_features_get_core_amount:
+ *
+ * Gets the amount of available CPU cores.
+ *
+ * Returns: amount of CPU cores available.
+ **/
+unsigned cpu_features_get_core_amount(void);
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 
