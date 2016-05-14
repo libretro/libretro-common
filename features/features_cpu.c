@@ -32,6 +32,7 @@
 #include <compat/strl.h>
 #include <streams/file_stream.h>
 #include <libretro.h>
+#include <features/features_cpu.h>
 
 #if defined(_WIN32) && !defined(_XBOX)
 #include <windows.h>
@@ -117,7 +118,22 @@ static int clock_gettime(int clk_ik, struct timespec *t)
 retro_perf_tick_t cpu_features_get_perf_counter(void)
 {
    retro_perf_tick_t time_ticks = 0;
-#if defined(__linux__) || defined(__QNX__) || defined(__MACH__)
+#if defined(_WIN32)
+   long tv_sec, tv_usec;
+   static const unsigned __int64 epoch = 11644473600000000ULL;
+   FILETIME file_time;
+   SYSTEMTIME system_time;
+   ULARGE_INTEGER ularge;
+
+   GetSystemTime(&system_time);
+   SystemTimeToFileTime(&system_time, &file_time);
+   ularge.LowPart  = file_time.dwLowDateTime;
+   ularge.HighPart = file_time.dwHighDateTime;
+
+   tv_sec     = (long)((ularge.QuadPart - epoch) / 10000000L);
+   tv_usec    = (long)(system_time.wMilliseconds * 1000);
+   time_ticks = (1000000 * tv_sec + tv_usec);
+#elif defined(__linux__) || defined(__QNX__) || defined(__MACH__)
    struct timespec tv;
    if (clock_gettime(CLOCK_MONOTONIC, &tv) == 0)
       time_ticks = (retro_perf_tick_t)tv.tv_sec * 1000000000 +
@@ -143,22 +159,6 @@ retro_perf_tick_t cpu_features_get_perf_counter(void)
    struct timeval tv;
    gettimeofday(&tv,NULL);
    time_ticks = (1000000 * tv.tv_sec + tv.tv_usec);
-#elif defined(_WIN32)
-   long tv_sec, tv_usec;
-   static const unsigned __int64 epoch = 11644473600000000Ui64;
-   FILETIME file_time;
-   SYSTEMTIME system_time;
-   ULARGE_INTEGER ularge;
-
-   GetSystemTime(&system_time);
-   SystemTimeToFileTime(&system_time, &file_time);
-   ularge.LowPart = file_time.dwLowDateTime;
-   ularge.HighPart = file_time.dwHighDateTime;
-
-   tv_sec = (long)((ularge.QuadPart - epoch) / 10000000L);
-   tv_usec = (long)(system_time.wMilliseconds * 1000);
-
-   time_ticks = (1000000 * tv_sec + tv_usec);
 #endif
 
    return time_ticks;
@@ -286,103 +286,31 @@ static void arm_enable_runfast_mode(void)
 }
 #endif
 
-#if defined(__linux__)
-
-#ifdef __ARM_ARCH__
-/* Extract the content of a the first occurrence of a given field in
- * the content of /proc/cpuinfo and return it as a heap-allocated
- * string that must be freed by the caller.
- *
- * Return NULL if not found
- */
-static char *extract_cpuinfo_field(char* buffer,
-      ssize_t length, const char* field)
+#if defined(__linux__) && !defined(CPU_X86)
+static unsigned char check_arm_cpu_feature(const char* feature)
 {
-   int len;
-   const char *q;
-   int  fieldlen = strlen(field);
-   char* bufend  = buffer + length;
-   char* result  = NULL;
-   /* Look for first field occurrence,
-    * and ensures it starts the line. */
-   const char *p = buffer;
+   unsigned char status = 0;
+   FILE *fp = fopen("/proc/cpuinfo", "r");
 
-   for (;;)
+   if (fp)
    {
-      p = memmem(p, bufend-p, field, fieldlen);
-      if (p == NULL)
-         return result;
+      char line[1024];
 
-      if (p == buffer || p[-1] == '\n')
+      while (fgets(line , sizeof(line) , fp) != NULL)
+      {
+         if (strncmp(line, "Features\t: ", 11))
+            continue;
+
+         if (strstr(line + 11, feature) != NULL)
+            status = 1;
+
          break;
+      }
 
-      p += fieldlen;
+      fclose(fp);
    }
-
-   /* Skip to the first column followed by a space */
-   p += fieldlen;
-   p  = memchr(p, ':', bufend-p);
-   if (p == NULL || p[1] != ' ')
-      return result;
-
-   /* Find the end of the line */
-   p += 2;
-   q  = memchr(p, '\n', bufend-p);
-   if (q == NULL)
-      q = bufend;
-
-   /* Copy the line into a heap-allocated buffer */
-   len    = q-p;
-   result = malloc(len+1);
-   if (result == NULL)
-      return result;
-
-   memcpy(result, p, len);
-   result[len] = '\0';
-
-   return result;
+   return status;
 }
-
-/* Checks that a space-separated list of items
- * contains one given 'item'.
- * Returns 1 if found, 0 otherwise.
- */
-static int has_list_item(const char* list, const char* item)
-{
-    const char*  p = list;
-    int    itemlen = strlen(item);
-
-    if (list == NULL)
-        return 0;
-
-    while (*p)
-    {
-        const char*  q;
-
-        /* skip spaces */
-        while (*p == ' ' || *p == '\t')
-            p++;
-
-        /* find end of current list item */
-        q = p;
-        while (*q && *q != ' ' && *q != '\t')
-            q++;
-
-        if (itemlen == q-p && !memcmp(p, item, itemlen))
-            return 1;
-
-        /* skip to next item */
-        p = q;
-    }
-    return 0;
-}
-#endif
-
-typedef struct
-{
-    uint32_t mask;
-} CpuList;
-
 
 #if !defined(_SC_NPROCESSORS_ONLN)
 /* Parse an decimal integer starting from 'input', but not going further
@@ -736,120 +664,7 @@ uint64_t cpu_features_get(void)
          cpu |= RETRO_SIMD_MMXEXT;
    }
 #elif defined(__linux__)
-
-   static bool cpu_inited_once = false;
-   static  uint64_t g_cpuFeatures;
-
-   enum
-   {
-      CPU_ARM_FEATURE_ARMv7       = (1 << 0),
-      CPU_ARM_FEATURE_VFPv3       = (1 << 1),
-      CPU_ARM_FEATURE_NEON        = (1 << 2),
-      CPU_ARM_FEATURE_LDREX_STREX = (1 << 3)
-   };
-
-   if (!cpu_inited_once)
-   {
-      ssize_t  length;
-      void *buf = NULL;
-
-      g_cpuFeatures = 0;
-
-      if (filestream_read_file("/proc/cpuinfo", &buf, &length) == 1)
-      {
-#ifdef __ARM_ARCH__
-         /* Extract architecture from the "CPU Architecture" field.
-          * The list is well-known, unlike the the output of
-          * the 'Processor' field which can vary greatly.
-          *
-          * See the definition of the 'proc_arch' array in
-          * $KERNEL/arch/arm/kernel/setup.c and the 'c_show' function in
-          * same file.
-          */
-         char* cpu_arch = extract_cpuinfo_field(buf, length, "CPU architecture");
-
-         if (cpu_arch)
-         {
-            char*  end;
-            int    has_armv7 = 0;
-            /* read the initial decimal number, ignore the rest */
-            long   arch_number = strtol(cpu_arch, &end, 10);
-
-            /* Here we assume that ARMv8 will be upwards compatible with v7
-             * in the future. Unfortunately, there is no 'Features' field to
-             * indicate that Thumb-2 is supported.
-             */
-            if (end > cpu_arch && arch_number >= 7)
-               has_armv7 = 1;
-
-            /* Unfortunately, it seems that certain ARMv6-based CPUs
-             * report an incorrect architecture number of 7!
-             *
-             * See http://code.google.com/p/android/issues/detail?id=10812
-             *
-             * We try to correct this by looking at the 'elf_format'
-             * field reported by the 'Processor' field, which is of the
-             * form of "(v7l)" for an ARMv7-based CPU, and "(v6l)" for
-             * an ARMv6-one.
-             */
-            if (has_armv7)
-            {
-               char *cpu_proc = extract_cpuinfo_field(buf, length,
-                     "Processor");
-
-               if (cpu_proc != NULL)
-               {
-                  if (has_list_item(cpu_proc, "(v6l)"))
-                  {
-                     /* CPU processor and architecture mismatch. */
-                     has_armv7 = 0;
-                  }
-                  free(cpu_proc);
-               }
-            }
-
-            if (has_armv7)
-               g_cpuFeatures |= CPU_ARM_FEATURE_ARMv7;
-
-            /* The LDREX / STREX instructions are available from ARMv6 */
-            if (arch_number >= 6)
-               g_cpuFeatures |= CPU_ARM_FEATURE_LDREX_STREX;
-
-            free(cpu_arch);
-         }
-
-         /* Extract the list of CPU features from 'Features' field */
-         char* cpu_features = extract_cpuinfo_field(buf, length, "Features");
-
-         if (cpu_features)
-         {
-            if (has_list_item(cpu_features, "vfpv3"))
-               g_cpuFeatures |= CPU_ARM_FEATURE_VFPv3;
-
-            else if (has_list_item(cpu_features, "vfpv3d16"))
-               g_cpuFeatures |= CPU_ARM_FEATURE_VFPv3;
-
-            /* Note: Certain kernels only report NEON but not VFPv3
-             * in their features list. However, ARM mandates
-             * that if NEON is implemented, so must be VFPv3
-             * so always set the flag.
-             */
-            if (has_list_item(cpu_features, "neon"))
-               g_cpuFeatures |= CPU_ARM_FEATURE_NEON | CPU_ARM_FEATURE_VFPv3;
-            free(cpu_features);
-         }
-#endif /* __ARM_ARCH__ */
-
-         if (buf)
-            free(buf);
-         buf = NULL;
-      }
-      cpu_inited_once = true;
-   }
-
-   cpu_flags = g_cpuFeatures;
-
-   if (cpu_flags & CPU_ARM_FEATURE_NEON)
+   if (check_arm_cpu_feature("neon"))
    {
       cpu |= RETRO_SIMD_NEON;
 #ifdef __ARM_NEON__
@@ -857,8 +672,24 @@ uint64_t cpu_features_get(void)
 #endif
    }
 
-   if (cpu_flags & CPU_ARM_FEATURE_VFPv3)
+   if (check_arm_cpu_feature("vfpv3"))
       cpu |= RETRO_SIMD_VFPV3;
+
+   if (check_arm_cpu_feature("vfpv4"))
+      cpu |= RETRO_SIMD_VFPV4;
+
+#if 0
+    check_arm_cpu_feature("swp");
+    check_arm_cpu_feature("half");
+    check_arm_cpu_feature("thumb");
+    check_arm_cpu_feature("fastmult");
+    check_arm_cpu_feature("vfp");
+    check_arm_cpu_feature("edsp");
+    check_arm_cpu_feature("thumbee");
+    check_arm_cpu_feature("tls");
+    check_arm_cpu_feature("idiva");
+    check_arm_cpu_feature("idivt");
+#endif
 
 #elif defined(__ARM_NEON__)
    cpu |= RETRO_SIMD_NEON;

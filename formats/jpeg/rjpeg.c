@@ -33,6 +33,7 @@
 #include <retro_inline.h>
 #include <boolean.h>
 #include <formats/image.h>
+#include <formats/rjpeg.h>
 #include <features/features_cpu.h>
 
 enum
@@ -63,6 +64,13 @@ typedef struct
    int ystep;   /* how far through vertical expansion we are */
    int ypos;    /* which pre-expansion row we're on */
 } rjpeg__resample;
+
+struct rjpeg
+{
+   uint8_t *buff_data;
+   uint32_t *output_image;
+   void *empty;
+};
 
 #ifdef _MSC_VER
 #define RJPEG_HAS_LROTL
@@ -175,7 +183,7 @@ static void rjpeg__rewind(rjpeg__context *s)
 }
 
 static int      rjpeg__jpeg_test(rjpeg__context *s);
-static uint8_t *rjpeg__jpeg_load(rjpeg__context *s, int *x, int *y, int *comp, int req_comp);
+static uint8_t *rjpeg__jpeg_load(rjpeg__context *s, unsigned *x, unsigned *y, int *comp, int req_comp);
 
 /* this is not threadsafe */
 static const char *rjpeg__g_failure_reason;
@@ -199,7 +207,7 @@ static INLINE int rjpeg__err(const char *str)
 
 static int rjpeg__vertically_flip_on_load = 0;
 
-static unsigned char *rjpeg__load_main(rjpeg__context *s, int *x, int *y, int *comp, int req_comp)
+static unsigned char *rjpeg__load_main(rjpeg__context *s, unsigned *x, unsigned *y, int *comp, int req_comp)
 {
    if (rjpeg__jpeg_test(s))
       return rjpeg__jpeg_load(s,x,y,comp,req_comp);
@@ -207,7 +215,7 @@ static unsigned char *rjpeg__load_main(rjpeg__context *s, int *x, int *y, int *c
    return rjpeg__errpuc("unknown image type", "Image not of any known type, or corrupt");
 }
 
-static unsigned char *rjpeg__load_flip(rjpeg__context *s, int *x, int *y, int *comp, int req_comp)
+static unsigned char *rjpeg__load_flip(rjpeg__context *s, unsigned *x, unsigned *y, int *comp, int req_comp)
 {
    unsigned char *result = rjpeg__load_main(s, x, y, comp, req_comp);
 
@@ -235,7 +243,7 @@ static unsigned char *rjpeg__load_flip(rjpeg__context *s, int *x, int *y, int *c
    return result;
 }
 
-static uint8_t *rjpeg_load_from_memory(const uint8_t *buffer, int len, int *x, int *y, int *comp, int req_comp)
+static uint8_t *rjpeg_load_from_memory(const uint8_t *buffer, int len, unsigned *x, unsigned *y, int *comp, int req_comp)
 {
    rjpeg__context s;
    rjpeg__start_mem(&s,buffer,len);
@@ -2273,7 +2281,7 @@ static void rjpeg__cleanup_jpeg(rjpeg__jpeg *j)
    }
 }
 
-static uint8_t *rjpeg_load_jpeg_image(rjpeg__jpeg *z, int *out_x, int *out_y, int *comp, int req_comp)
+static uint8_t *rjpeg_load_jpeg_image(rjpeg__jpeg *z, unsigned *out_x, unsigned *out_y, int *comp, int req_comp)
 {
    int n, decode_n;
    z->s->img_n = 0; /* make rjpeg__cleanup_jpeg safe */
@@ -2403,7 +2411,7 @@ static uint8_t *rjpeg_load_jpeg_image(rjpeg__jpeg *z, int *out_x, int *out_y, in
    }
 }
 
-static unsigned char *rjpeg__jpeg_load(rjpeg__context *s, int *x, int *y, int *comp, int req_comp)
+static unsigned char *rjpeg__jpeg_load(rjpeg__context *s, unsigned *x, unsigned *y, int *comp, int req_comp)
 {
    rjpeg__jpeg j;
    j.s = s;
@@ -2440,23 +2448,76 @@ static INLINE void video_frame_convert_rgba_to_bgra(
    }
 }
 
-bool rjpeg_image_load(uint8_t *_buf, void *data, size_t size,
+int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
+      size_t size, unsigned *width, unsigned *height)
+{
+   int comp;
+   uint8_t **buf                 = (uint8_t**)buf_data;
+
+   if (!rjpeg)
+      return IMAGE_PROCESS_ERROR;
+
+   rjpeg->output_image           = (uint32_t*)rjpeg_load_from_memory(*buf, size, width, height, &comp, 4);
+
+   return IMAGE_PROCESS_END;
+}
+
+bool rjpeg_image_load(uint8_t *buf, void *data, size_t size,
       unsigned a_shift, unsigned r_shift,
       unsigned g_shift, unsigned b_shift)
 {
-   int comp;
-   int x = 0;
-   int y = 0;
+   unsigned width  = 0;
+   unsigned height = 0;
    struct texture_image *out_img = (struct texture_image*)data;
+   rjpeg_t *rjpeg  = rjpeg_alloc();
 
-   out_img->pixels = (uint32_t*)rjpeg_load_from_memory(_buf, size, &x, &y, &comp, 4);
+   if (!rjpeg)
+      goto error;
 
-   out_img->width   = x;
-   out_img->height  = y;
+   if (!rjpeg_set_buf_ptr(rjpeg, &buf))
+      goto error;
 
-   if (r_shift == 0 && b_shift == 16) { } /* RGBA, doesn't need conversion */
-   else
-      video_frame_convert_rgba_to_bgra(_buf, out_img->pixels, x);
+   if (rjpeg_process_image(rjpeg, (void**)&buf, size, &width, &height) != IMAGE_PROCESS_END)
+      goto error;
+
+   out_img->pixels = (uint32_t*)rjpeg->output_image;
+   out_img->width   = width;
+   out_img->height  = height;
+
+    if (r_shift == 0 && b_shift == 16) { } /* RGBA, doesn't need conversion */
+    else
+       video_frame_convert_rgba_to_bgra(buf, out_img->pixels, width);
 
    return true;
+
+error:
+   if (rjpeg)
+      free(rjpeg);
+   return false;
+}
+
+bool rjpeg_set_buf_ptr(rjpeg_t *rjpeg, void *data)
+{
+   if (!rjpeg)
+      return false;
+
+   rjpeg->buff_data = (uint8_t*)data;
+
+   return true;
+}
+
+void rjpeg_free(rjpeg_t *rjpeg)
+{
+   if (!rjpeg)
+      return;
+
+   free(rjpeg);
+}
+
+rjpeg_t *rjpeg_alloc(void)
+{
+   rjpeg_t *rjpeg = (rjpeg_t*)calloc(1, sizeof(*rjpeg));
+   if (!rjpeg)
+      return NULL;
+   return rjpeg;
 }

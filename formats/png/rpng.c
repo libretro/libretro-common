@@ -844,7 +844,7 @@ static bool png_parse_ihdr(uint8_t *buf,
    return true;
 }
 
-bool rpng_nbio_load_image_argb_iterate(rpng_t *rpng)
+bool rpng_iterate_image(rpng_t *rpng)
 {
    unsigned i;
    struct png_chunk chunk = {0};
@@ -942,9 +942,13 @@ error:
    return false;
 }
 
-int rpng_nbio_load_image_argb_process(rpng_t *rpng,
-      uint32_t **data, unsigned *width, unsigned *height)
+int rpng_process_image(rpng_t *rpng,
+      void **_data, size_t size, unsigned *width, unsigned *height)
 {
+   uint32_t **data = (uint32_t**)_data;
+
+   (void)size;
+
    if (!rpng->process.initialized)
    {
       if (!rpng->process.stream_backend)
@@ -958,9 +962,8 @@ int rpng_nbio_load_image_argb_process(rpng_t *rpng,
 
    if (!rpng->process.inflate_initialized)
    {
-      int ret = rpng_load_image_argb_process_inflate_init(rpng, data,
-               width, height);
-      if (ret == -1)
+      if (rpng_load_image_argb_process_inflate_init(rpng, data,
+               width, height) == -1)
          return PNG_PROCESS_ERROR;
       return 0;
    }
@@ -968,7 +971,7 @@ int rpng_nbio_load_image_argb_process(rpng_t *rpng,
    return png_reverse_filter_iterate(rpng, data);
 }
 
-void rpng_nbio_load_image_free(rpng_t *rpng)
+void rpng_free(rpng_t *rpng)
 {
    if (!rpng)
       return;
@@ -986,7 +989,7 @@ void rpng_nbio_load_image_free(rpng_t *rpng)
    free(rpng);
 }
 
-bool rpng_nbio_load_image_argb_start(rpng_t *rpng)
+bool rpng_start(rpng_t *rpng)
 {
    unsigned i;
    char header[8] = {0};
@@ -1019,12 +1022,12 @@ bool rpng_is_valid(rpng_t *rpng)
    return false;
 }
 
-bool rpng_set_buf_ptr(rpng_t *rpng, uint8_t *data)
+bool rpng_set_buf_ptr(rpng_t *rpng, void *data)
 {
    if (!rpng)
       return false;
 
-   rpng->buff_data = data;
+   rpng->buff_data = (uint8_t*)data;
 
    return true;
 }
