@@ -1010,9 +1010,9 @@ struct retro_memory_descriptor
 
    /* To go from emulated address to physical address, the following 
     * order applies:
-    * Subtract 'start', pick off 'disconnect', apply 'len', add 'offset'.
-    *
-    * The address space name must consist of only a-zA-Z0-9_-, 
+    * Subtract 'start', pick off 'disconnect', apply 'len', add 'offset'. */
+
+   /* The address space name must consist of only a-zA-Z0-9_-, 
     * should be as short as feasible (maximum length is 8 plus the NUL),
     * and may not be any other address space plus one or more 0-9A-F 
     * at the end.
@@ -1032,12 +1032,31 @@ struct retro_memory_descriptor
     * 'a'+'A' - valid (neither is a prefix of each other)
     * 'AR'+blank - valid ('R' is not in 0-9A-F)
     * 'ARB'+blank - valid (the B can't be part of the address either, because 
-    * there is no namespace 'AR')
+    *                      there is no namespace 'AR')
     * blank+'B' - not valid, because it's ambigous which address space B1234 
-    * would refer to.
+    *             would refer to.
     * The length can't be used for that purpose; the frontend may want 
     * to append arbitrary data to an address, without a separator. */
    const char *addrspace;
+
+   /* TODO: When finalizing this one, add a description field, which should be
+    * "WRAM" or something roughly equally long. */
+
+   /* TODO: When finalizing this one, replace 'select' with 'limit', which tells
+    * which bits can vary and still refer to the same address (limit = ~select).
+    * TODO: limit? range? vary? something else? */
+
+   /* TODO: When finalizing this one, if 'len' is above what 'select' (or
+    * 'limit') allows, it's bankswitched. Bankswitched data must have both 'len'
+    * and 'select' != 0, and the mappings don't tell how the system switches the
+    * banks. */
+
+   /* TODO: When finalizing this one, fix the 'len' bit removal order.
+    * For len=0x1800, pointer 0x1C00 should go to 0x1400, not 0x0C00.
+    * Algorithm: Take bits highest to lowest, but if it goes above len, clear
+    * the most recent addition and continue on the next bit.
+    * TODO: Can the above be optimized? Is "remove the lowest bit set in both
+    * pointer and 'len'" equivalent? */
 };
 
 /* The frontend may use the largest value of 'start'+'select' in a 

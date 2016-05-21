@@ -30,6 +30,7 @@
 #endif
 
 #include <boolean.h>
+#include <formats/image.h>
 #include <formats/rpng.h>
 #include <file/archive_file.h>
 
@@ -84,9 +85,8 @@ struct png_chunk
    uint8_t *data;
 };
 
-struct rpng_process_t
+struct rpng_process
 {
-   bool initialized;
    bool inflate_initialized;
    bool adam7_pass_initialized;
    bool pass_initialized;
@@ -116,7 +116,7 @@ struct rpng_process_t
 
 struct rpng
 {
-   struct rpng_process_t process;
+   struct rpng_process *process;
    bool has_ihdr;
    bool has_idat;
    bool has_iend;
@@ -125,14 +125,6 @@ struct rpng
    struct png_ihdr ihdr;
    uint8_t *buff_data;
    uint32_t palette[256];
-};
-
-enum png_process_code
-{
-   PNG_PROCESS_ERROR     = -2,
-   PNG_PROCESS_ERROR_END = -1,
-   PNG_PROCESS_NEXT      =  0,
-   PNG_PROCESS_END       =  1
 };
 
 static INLINE uint32_t dword_be(const uint8_t *buf)
@@ -409,7 +401,7 @@ static void png_reverse_filter_adam7_deinterlace_pass(uint32_t *data,
    }
 }
 
-static void png_reverse_filter_deinit(struct rpng_process_t *pngp)
+static void png_reverse_filter_deinit(struct rpng_process *pngp)
 {
    if (pngp->decoded_scanline)
       free(pngp->decoded_scanline);
@@ -433,7 +425,7 @@ static const struct adam7_pass passes[] = {
 };
 
 static int png_reverse_filter_init(const struct png_ihdr *ihdr,
-      struct rpng_process_t *pngp)
+      struct rpng_process *pngp)
 {
    size_t pass_size;
 
@@ -499,7 +491,7 @@ error:
 }
 
 static int png_reverse_filter_copy_line(uint32_t *data, const struct png_ihdr *ihdr,
-      struct rpng_process_t *pngp, unsigned filter)
+      struct rpng_process *pngp, unsigned filter)
 {
    unsigned i;
 
@@ -539,7 +531,7 @@ static int png_reverse_filter_copy_line(uint32_t *data, const struct png_ihdr *i
          break;
 
       default:
-         return PNG_PROCESS_ERROR_END;
+         return IMAGE_PROCESS_ERROR_END;
    }
 
    switch (ihdr->color_type)
@@ -565,13 +557,13 @@ static int png_reverse_filter_copy_line(uint32_t *data, const struct png_ihdr *i
 
    memcpy(pngp->prev_scanline, pngp->decoded_scanline, pngp->pitch);
 
-   return PNG_PROCESS_NEXT;
+   return IMAGE_PROCESS_NEXT;
 }
 
 static int png_reverse_filter_regular_iterate(uint32_t **data, const struct png_ihdr *ihdr,
-      struct rpng_process_t *pngp)
+      struct rpng_process *pngp)
 {
-   int ret = PNG_PROCESS_END;
+   int ret = IMAGE_PROCESS_END;
 
    if (pngp->h < ihdr->height)
    {
@@ -581,7 +573,7 @@ static int png_reverse_filter_regular_iterate(uint32_t **data, const struct png_
             ihdr, pngp, filter);
    }
 
-   if (ret == PNG_PROCESS_END || ret == PNG_PROCESS_ERROR_END)
+   if (ret == IMAGE_PROCESS_END || ret == IMAGE_PROCESS_ERROR_END)
       goto end;
 
    pngp->h++;
@@ -591,7 +583,7 @@ static int png_reverse_filter_regular_iterate(uint32_t **data, const struct png_
    *data                       += ihdr->width;
    pngp->data_restore_buf_size += ihdr->width;
 
-   return PNG_PROCESS_NEXT;
+   return IMAGE_PROCESS_NEXT;
 
 end:
    png_reverse_filter_deinit(pngp);
@@ -604,32 +596,32 @@ end:
 
 static int png_reverse_filter_adam7_iterate(uint32_t **data_,
       const struct png_ihdr *ihdr,
-      struct rpng_process_t *pngp)
+      struct rpng_process *pngp)
 {
    int ret = 0;
    bool to_next = pngp->pass.pos < ARRAY_SIZE(passes);
    uint32_t *data = *data_;
 
    if (!to_next)
-      return PNG_PROCESS_END;
+      return IMAGE_PROCESS_END;
 
    ret = png_reverse_filter_init(ihdr, pngp);
 
    if (ret == 1)
-      return PNG_PROCESS_NEXT;
+      return IMAGE_PROCESS_NEXT;
    if (ret == -1)
-      return PNG_PROCESS_ERROR_END;
+      return IMAGE_PROCESS_ERROR_END;
 
    if (png_reverse_filter_init(&pngp->ihdr, pngp) == -1)
-      return PNG_PROCESS_ERROR;
+      return IMAGE_PROCESS_ERROR;
 
    do{
       ret = png_reverse_filter_regular_iterate(&pngp->data,
             &pngp->ihdr, pngp);
-   }while(ret == PNG_PROCESS_NEXT);
+   }while(ret == IMAGE_PROCESS_NEXT);
 
-   if (ret == PNG_PROCESS_ERROR || ret == PNG_PROCESS_ERROR_END)
-      return PNG_PROCESS_ERROR;
+   if (ret == IMAGE_PROCESS_ERROR || ret == IMAGE_PROCESS_ERROR_END)
+      return IMAGE_PROCESS_ERROR;
 
    pngp->inflate_buf            += pngp->pass.size;
    pngp->adam7_restore_buf_size += pngp->pass.size;
@@ -646,25 +638,25 @@ static int png_reverse_filter_adam7_iterate(uint32_t **data_,
    pngp->pass.size   = 0;
    pngp->adam7_pass_initialized = false;
 
-   return PNG_PROCESS_NEXT;
+   return IMAGE_PROCESS_NEXT;
 }
 
 static int png_reverse_filter_adam7(uint32_t **data_,
       const struct png_ihdr *ihdr,
-      struct rpng_process_t *pngp)
+      struct rpng_process *pngp)
 {
    int ret = png_reverse_filter_adam7_iterate(data_,
          ihdr, pngp);
 
    switch (ret)
    {
-      case PNG_PROCESS_ERROR_END:
-      case PNG_PROCESS_END:
+      case IMAGE_PROCESS_ERROR_END:
+      case IMAGE_PROCESS_END:
          break;
-      case PNG_PROCESS_NEXT:
+      case IMAGE_PROCESS_NEXT:
          pngp->pass.pos++;
          return 0;
-      case PNG_PROCESS_ERROR:
+      case IMAGE_PROCESS_ERROR:
          if (pngp->data)
             free(pngp->data);
          pngp->inflate_buf -= pngp->adam7_restore_buf_size;
@@ -683,22 +675,23 @@ static int png_reverse_filter_iterate(rpng_t *rpng, uint32_t **data)
       return false;
 
    if (rpng->ihdr.interlace)
-      return png_reverse_filter_adam7(data, &rpng->ihdr, &rpng->process);
+      return png_reverse_filter_adam7(data, &rpng->ihdr, rpng->process);
 
-   return png_reverse_filter_regular_iterate(data, &rpng->ihdr, &rpng->process);
+   return png_reverse_filter_regular_iterate(data, &rpng->ihdr, rpng->process);
 }
 
 static int rpng_load_image_argb_process_inflate_init(rpng_t *rpng,
       uint32_t **data, unsigned *width, unsigned *height)
 {
    int zstatus;
-   bool to_continue = (rpng->process.stream_backend->stream_get_avail_in(rpng->process.stream) > 0
-         && rpng->process.stream_backend->stream_get_avail_out(rpng->process.stream) > 0);
+   struct rpng_process *process = (struct rpng_process*)rpng->process;
+   bool to_continue        = (process->stream_backend->stream_get_avail_in(process->stream) > 0
+         && process->stream_backend->stream_get_avail_out(process->stream) > 0);
 
    if (!to_continue)
       goto end;
 
-   zstatus = rpng->process.stream_backend->stream_decompress_data_to_file_iterate(rpng->process.stream);
+   zstatus = process->stream_backend->stream_decompress_data_to_file_iterate(process->stream);
 
    switch (zstatus)
    {
@@ -713,7 +706,7 @@ static int rpng_load_image_argb_process_inflate_init(rpng_t *rpng,
    return 0;
 
 end:
-   rpng->process.stream_backend->stream_free(rpng->process.stream);
+   process->stream_backend->stream_free(process->stream);
 
    *width  = rpng->ihdr.width;
    *height = rpng->ihdr.height;
@@ -728,22 +721,20 @@ end:
    if (!*data)
       goto false_end;
 
-   rpng->process.adam7_restore_buf_size = 0;
-   rpng->process.restore_buf_size = 0;
-   rpng->process.palette = rpng->palette;
+   process->adam7_restore_buf_size = 0;
+   process->restore_buf_size       = 0;
+   process->palette                = rpng->palette;
 
    if (rpng->ihdr.interlace != 1)
-      if (png_reverse_filter_init(&rpng->ihdr, &rpng->process) == -1)
+      if (png_reverse_filter_init(&rpng->ihdr, process) == -1)
          goto false_end;
 
-   rpng->process.inflate_initialized = true;
+   process->inflate_initialized = true;
    return 1;
 
 error:
-   rpng->process.stream_backend->stream_free(rpng->process.stream);
-
 false_end:
-   rpng->process.inflate_initialized = false;
+   process->inflate_initialized = false;
    return -1;
 }
 
@@ -774,39 +765,43 @@ bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *buf)
    return true;
 }
 
-static bool rpng_load_image_argb_process_init(rpng_t *rpng,
+static struct rpng_process *rpng_process_init(rpng_t *rpng,
       uint32_t **data, unsigned *width, unsigned *height)
 {
-   rpng->process.inflate_buf_size = 0;
-   rpng->process.inflate_buf      = NULL;
+   uint8_t *inflate_buf         = NULL;
+   struct rpng_process *process = (struct rpng_process*)calloc(1, sizeof(*process));
+
+   if (!process)
+      return NULL;
+
+   process->stream_backend = file_archive_get_default_file_backend();
 
    png_pass_geom(&rpng->ihdr, rpng->ihdr.width,
-         rpng->ihdr.height, NULL, NULL, &rpng->process.inflate_buf_size);
+         rpng->ihdr.height, NULL, NULL, &process->inflate_buf_size);
    if (rpng->ihdr.interlace == 1) /* To be sure. */
-      rpng->process.inflate_buf_size *= 2;
+      process->inflate_buf_size *= 2;
 
-   rpng->process.stream = rpng->process.stream_backend->stream_new();
+   process->stream = process->stream_backend->stream_new();
 
-   if (!rpng->process.stream)
-      return false;
+   if (!process->stream)
+      return NULL;
 
-   if (!rpng->process.stream_backend->stream_decompress_init(rpng->process.stream))
-      return false;
+   if (!process->stream_backend->stream_decompress_init(process->stream))
+      return NULL;
 
-   rpng->process.inflate_buf = (uint8_t*)malloc(rpng->process.inflate_buf_size);
-   if (!rpng->process.inflate_buf)
-      return false;
+   inflate_buf = (uint8_t*)malloc(process->inflate_buf_size);
+   if (!inflate_buf)
+      return NULL;
 
-   rpng->process.stream_backend->stream_set(
-         rpng->process.stream,
+   process->inflate_buf = inflate_buf;
+   process->stream_backend->stream_set(
+         process->stream,
          rpng->idat_buf.size,
-         rpng->process.inflate_buf_size,
+         process->inflate_buf_size,
          rpng->idat_buf.data,
-         rpng->process.inflate_buf);
+         process->inflate_buf);
 
-   rpng->process.initialized = true;
-
-   return true;
+   return process;
 }
 
 static bool read_chunk_header(uint8_t *buf, struct png_chunk *chunk)
@@ -949,26 +944,38 @@ int rpng_process_image(rpng_t *rpng,
 
    (void)size;
 
-   if (!rpng->process.initialized)
+   if (!rpng->process)
    {
-      if (!rpng->process.stream_backend)
-         rpng->process.stream_backend = file_archive_get_default_file_backend();
+      struct rpng_process *process = rpng_process_init(
+            rpng, data, width, height);
 
-      if (!rpng_load_image_argb_process_init(rpng, data, width,
-               height))
-         return PNG_PROCESS_ERROR;
+      if (!process)
+         goto error;
+
+      rpng->process = process;
       return 0;
    }
 
-   if (!rpng->process.inflate_initialized)
+   if (!rpng->process->inflate_initialized)
    {
       if (rpng_load_image_argb_process_inflate_init(rpng, data,
                width, height) == -1)
-         return PNG_PROCESS_ERROR;
+         goto error;
       return 0;
    }
 
    return png_reverse_filter_iterate(rpng, data);
+
+error:
+   if (rpng->process)
+   {
+      if (rpng->process->inflate_buf)
+         free(rpng->process->inflate_buf);
+      if (rpng->process->stream)
+         rpng->process->stream_backend->stream_free(rpng->process->stream);
+      free(rpng->process);
+   }
+   return IMAGE_PROCESS_ERROR;
 }
 
 void rpng_free(rpng_t *rpng)
@@ -978,12 +985,17 @@ void rpng_free(rpng_t *rpng)
 
    if (rpng->idat_buf.data)
       free(rpng->idat_buf.data);
-   if (rpng->process.inflate_buf)
-      free(rpng->process.inflate_buf);
-   if (rpng->process.stream)
+   if (rpng->process)
    {
-      rpng->process.stream_backend->stream_free(rpng->process.stream);
-      free(rpng->process.stream);
+      if (rpng->process->inflate_buf)
+         free(rpng->process->inflate_buf);
+      if (rpng->process->stream)
+      {
+         if (rpng->process->stream_backend)
+            rpng->process->stream_backend->stream_free(rpng->process->stream);
+         free(rpng->process->stream);
+      }
+      free(rpng->process);
    }
 
    free(rpng);
