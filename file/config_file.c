@@ -43,6 +43,7 @@
 #include <file/file_path.h>
 #include <retro_stat.h>
 #include <lists/string_list.h>
+#include <string/stdstring.h>
 #include <rhash.h>
 
 #define MAX_INCLUDE_DEPTH 16
@@ -265,7 +266,7 @@ static char *strip_comment(char *str)
    char *strend = str + strlen(str);
    bool cut_comment = true;
 
-   while (*str)
+   while (!string_is_empty(str))
    {
       char *comment = NULL;
       char *literal = strchr(str, '\"');
