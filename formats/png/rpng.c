@@ -765,8 +765,7 @@ bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *buf)
    return true;
 }
 
-static struct rpng_process *rpng_process_init(rpng_t *rpng,
-      uint32_t **data, unsigned *width, unsigned *height)
+static struct rpng_process *rpng_process_init(rpng_t *rpng, unsigned *width, unsigned *height)
 {
    uint8_t *inflate_buf         = NULL;
    struct rpng_process *process = (struct rpng_process*)calloc(1, sizeof(*process));
@@ -784,10 +783,16 @@ static struct rpng_process *rpng_process_init(rpng_t *rpng,
    process->stream = process->stream_backend->stream_new();
 
    if (!process->stream)
+   {
+      free(process);
       return NULL;
+   }
 
    if (!process->stream_backend->stream_decompress_init(process->stream))
+   {
+      free(process);
       return NULL;
+   }
 
    inflate_buf = (uint8_t*)malloc(process->inflate_buf_size);
    if (!inflate_buf)
@@ -956,13 +961,13 @@ int rpng_process_image(rpng_t *rpng,
    if (!rpng->process)
    {
       struct rpng_process *process = rpng_process_init(
-            rpng, data, width, height);
+            rpng, width, height);
 
       if (!process)
          goto error;
 
       rpng->process = process;
-      return 0;
+      return IMAGE_PROCESS_NEXT;
    }
 
    if (!rpng->process->inflate_initialized)
@@ -970,7 +975,7 @@ int rpng_process_image(rpng_t *rpng,
       if (rpng_load_image_argb_process_inflate_init(rpng, data,
                width, height) == -1)
          goto error;
-      return 0;
+      return IMAGE_PROCESS_NEXT;
    }
 
    return png_reverse_filter_iterate(rpng, data);

@@ -302,10 +302,10 @@ static bool parse_line(config_file_t *conf,
       struct config_entry_list *list, char *line)
 {
    char *comment   = NULL;
-   char *key       = (char*)malloc(9);
    char *key_tmp   = NULL;
    size_t cur_size = 8;
    size_t idx      = 0;
+   char *key       = (char*)malloc(9);
 
    if (!key)
       return false;
@@ -888,8 +888,9 @@ bool config_file_write(config_file_t *conf, const char *path)
 
 void config_file_dump(config_file_t *conf, FILE *file)
 {
-   struct config_entry_list *list = NULL;
+   struct config_entry_list       *list = NULL;
    struct config_include_list *includes = conf->includes;
+
    while (includes)
    {
       fprintf(file, "#include \"%s\"\n", includes->path);
@@ -897,11 +898,9 @@ void config_file_dump(config_file_t *conf, FILE *file)
    }
 
    list = (struct config_entry_list*)conf->entries;
+
    while (list)
    {
-      if (!list)
-         break;
-
       if (!list->readonly && list->key)
          fprintf(file, "%s = \"%s\"\n", list->key, list->value);
       list = list->next;
