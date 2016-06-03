@@ -129,6 +129,19 @@ RFILE *filestream_open(const char *path, unsigned mode, ssize_t len)
 
    switch (mode & 0xff)
    {
+      case RFILE_MODE_READ_TEXT:
+#if defined(VITA) || defined(PSP)
+         mode_int = 0777;
+         flags    = PSP_O_RDONLY;
+#else
+#if defined(HAVE_BUFFERED_IO)
+         if ((stream->hints & RFILE_HINT_UNBUFFERED) == 0)
+            mode_str = "r";
+#endif
+         /* No "else" here */
+         flags    = O_RDONLY;
+#endif
+         break;
       case RFILE_MODE_READ:
 #if defined(VITA) || defined(PSP)
          mode_int = 0777;
@@ -230,6 +243,63 @@ error:
    return NULL;
 }
 
+char *filestream_getline(RFILE *stream)
+{
+   char* newline     = (char*)malloc(9);
+   char* newline_tmp = NULL;
+   size_t cur_size   = 8;
+   size_t idx        = 0;
+   int in            = filestream_getc(stream);
+
+   if (!newline)
+      return NULL;
+
+   while (in != EOF && in != '\n')
+   {
+      if (idx == cur_size)
+      {
+         cur_size *= 2;
+         newline_tmp = (char*)realloc(newline, cur_size + 1);
+
+         if (!newline_tmp)
+         {
+            free(newline);
+            return NULL;
+         }
+
+         newline = newline_tmp;
+      }
+
+      newline[idx++] = in;
+      in             = filestream_getc(stream);
+   }
+
+   newline[idx] = '\0';
+   return newline; 
+}
+
+char *filestream_gets(RFILE *stream, char *s, size_t len)
+{
+   if (!stream)
+      return NULL;
+#if defined(HAVE_BUFFERED_IO)
+   return fgets(s, len, stream->fp);
+#else
+   return gets(s);
+#endif
+}
+
+int filestream_getc(RFILE *stream)
+{
+   if (!stream)
+      return 0;
+#if defined(HAVE_BUFFERED_IO)
+   return fgetc(stream->fp);
+#else
+   return getc(stream->fp);
+#endif
+}
+
 ssize_t filestream_seek(RFILE *stream, ssize_t offset, int whence)
 {
    if (!stream)
@@ -289,6 +359,18 @@ ssize_t filestream_seek(RFILE *stream, ssize_t offset, int whence)
 
 error:
    return -1;
+}
+
+int filestream_eof(RFILE *stream)
+{
+   ssize_t current_position = filestream_tell(stream);
+   ssize_t end_position     = filestream_seek(stream, 0, SEEK_END);
+
+   filestream_seek(stream, current_position, SEEK_SET);
+
+   if (current_position >= end_position)
+      return 1;
+   return 0;
 }
 
 ssize_t filestream_tell(RFILE *stream)

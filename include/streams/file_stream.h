@@ -38,6 +38,7 @@ typedef struct RFILE RFILE;
 enum
 {
    RFILE_MODE_READ = 0,
+   RFILE_MODE_READ_TEXT,
    RFILE_MODE_WRITE,
    RFILE_MODE_READ_WRITE,
 
@@ -61,6 +62,14 @@ void filestream_rewind(RFILE *stream);
 int filestream_close(RFILE *stream);
 
 int filestream_read_file(const char *path, void **buf, ssize_t *len);
+
+char *filestream_gets(RFILE *stream, char *s, size_t len);
+
+char *filestream_getline(RFILE *stream);
+
+int filestream_getc(RFILE *stream);
+
+int filestream_eof(RFILE *stream);
 
 bool filestream_write_file(const char *path, const void *data, ssize_t size);
 

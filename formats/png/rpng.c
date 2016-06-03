@@ -61,6 +61,7 @@ enum png_chunk_type
    PNG_CHUNK_IHDR,
    PNG_CHUNK_IDAT,
    PNG_CHUNK_PLTE,
+   PNG_CHUNK_tRNS,
    PNG_CHUNK_IEND
 };
 
@@ -121,6 +122,7 @@ struct rpng
    bool has_idat;
    bool has_iend;
    bool has_plte;
+   bool has_trns;
    struct idat_buffer idat_buf;
    struct png_ihdr ihdr;
    uint8_t *buff_data;
@@ -144,6 +146,7 @@ static enum png_chunk_type png_chunk_type(const struct png_chunk *chunk)
       { "IDAT", PNG_CHUNK_IDAT },
       { "IEND", PNG_CHUNK_IEND },
       { "PLTE", PNG_CHUNK_PLTE },
+      { "tRNS", PNG_CHUNK_tRNS },
    };
 
    for (i = 0; i < ARRAY_SIZE(chunk_map); i++)
@@ -324,18 +327,100 @@ static void png_reverse_filter_copy_line_plt(uint32_t *data,
       const uint8_t *decoded, unsigned width,
       unsigned depth, const uint32_t *palette)
 {
-   unsigned i, bit;
-   unsigned mask = (1 << depth) - 1;
-
-   bit = 0;
-
-   for (i = 0; i < width; i++, bit += depth)
+   switch (depth)
    {
-      unsigned byte = bit >> 3;
-      unsigned val  = decoded[byte] >> (8 - depth - (bit & 7));
-
-      val          &= mask;
-      data[i]       = palette[val];
+      case 1:
+         {
+            unsigned w = width / 8;
+            unsigned i;
+            
+            for (i = 0; i < w; i++, decoded++)
+            {
+               *data++ = palette[(*decoded >> 7) & 1];
+               *data++ = palette[(*decoded >> 6) & 1];
+               *data++ = palette[(*decoded >> 5) & 1];
+               *data++ = palette[(*decoded >> 4) & 1];
+               *data++ = palette[(*decoded >> 3) & 1];
+               *data++ = palette[(*decoded >> 2) & 1];
+               *data++ = palette[(*decoded >> 1) & 1];
+               *data++ = palette[*decoded & 1];
+            }
+            
+            switch (width & 7)
+            {
+               case 7:
+                  data[6] = palette[(*decoded >> 1) & 1];
+               case 6:
+                  data[5] = palette[(*decoded >> 2) & 1];
+               case 5:
+                  data[4] = palette[(*decoded >> 3) & 1];
+               case 4:
+                  data[3] = palette[(*decoded >> 4) & 1];
+               case 3:
+                  data[2] = palette[(*decoded >> 5) & 1];
+               case 2: 
+                  data[1] = palette[(*decoded >> 6) & 1];
+               case 1:
+                  data[0] = palette[(*decoded >> 7) & 1];
+                  break;
+            }
+         }
+         break;
+      
+      case 2:
+         {
+            unsigned w = width / 4;
+            unsigned i;
+            
+            for (i = 0; i < w; i++, decoded++)
+            {
+               *data++ = palette[(*decoded >> 6) & 3];
+               *data++ = palette[(*decoded >> 4) & 3];
+               *data++ = palette[(*decoded >> 2) & 3];
+               *data++ = palette[*decoded & 3];
+            }
+            
+            switch (width & 3)
+            {
+               case 3:
+                  data[2] = palette[(*decoded >> 2) & 3];
+               case 2: 
+                  data[1] = palette[(*decoded >> 4) & 3];
+               case 1:
+                  data[0] = palette[(*decoded >> 6) & 3];
+                  break;
+            }
+         }
+         break;
+      
+      case 4:
+         {
+            unsigned w = width / 2;
+            unsigned i;
+            
+            for (i = 0; i < w; i++, decoded++)
+            {
+               *data++ = palette[*decoded >> 4];
+               *data++ = palette[*decoded & 0x0f];
+            }
+            
+            if (width & 1)
+            {
+               *data = palette[*decoded >> 4];
+            }
+         }
+         break;
+      
+      case 8:
+         {
+            unsigned i;
+            
+            for (i = 0; i < width; i++, decoded++, data++)
+            {
+               *data = palette[*decoded];
+            }
+         }
+         break;
    }
 }
 
@@ -754,6 +839,18 @@ static bool png_read_plte(uint8_t *buf,
    return true;
 }
 
+static bool png_read_trns(uint8_t *buf, uint32_t *palette, unsigned entries)
+{
+   unsigned i;
+
+   for (i = 0; i < entries; i++, buf++, palette++)
+   {
+      *palette = (*palette & 0x00ffffff) | *buf << 24;
+   }
+
+   return true;
+}
+
 bool png_realloc_idat(const struct png_chunk *chunk, struct idat_buffer *buf)
 {
    uint8_t *new_buffer = (uint8_t*)realloc(buf->data, buf->size + chunk->size);
@@ -900,7 +997,7 @@ bool rpng_iterate_image(rpng_t *rpng)
          {
             unsigned entries = chunk.size / 3;
 
-            if (!rpng->has_ihdr || rpng->has_plte || rpng->has_iend || rpng->has_idat)
+            if (!rpng->has_ihdr || rpng->has_plte || rpng->has_iend || rpng->has_idat || rpng->has_trns)
                goto error;
 
             if (chunk.size % 3)
@@ -916,6 +1013,26 @@ bool rpng_iterate_image(rpng_t *rpng)
 
             rpng->has_plte = true;
          }
+         break;
+
+      case PNG_CHUNK_tRNS:
+         if (rpng->has_idat)
+            goto error;
+
+         if (rpng->ihdr.color_type == PNG_IHDR_COLOR_PLT)
+         {
+            /* we should compare with the number of palette entries */
+            if (chunk.size > 256)
+               goto error;
+
+            buf += 8;
+
+            if (!png_read_trns(buf, rpng->palette, chunk.size))
+               goto error;
+         }
+         /* TODO: support colorkey in grayscale and truecolor images */
+
+         rpng->has_trns = true;
          break;
 
       case PNG_CHUNK_IDAT:
