@@ -42,11 +42,11 @@
 #  include <psp2/io/fcntl.h>
 #  include <psp2/io/dirent.h>
 
-#define PSP_O_RDONLY PSP2_O_RDONLY
-#define PSP_O_RDWR   PSP2_O_RDWR
-#define PSP_O_CREAT  PSP2_O_CREAT
-#define PSP_O_WRONLY PSP2_O_WRONLY
-#define PSP_O_TRUNC  PSP2_O_TRUNC
+#define PSP_O_RDONLY SCE_O_RDONLY
+#define PSP_O_RDWR   SCE_O_RDWR
+#define PSP_O_CREAT  SCE_O_CREAT
+#define PSP_O_WRONLY SCE_O_WRONLY
+#define PSP_O_TRUNC  SCE_O_TRUNC
 #else
 #  if defined(PSP)
 #    include <pspiofilemgr.h>
@@ -291,10 +291,16 @@ char *filestream_gets(RFILE *stream, char *s, size_t len)
 
 int filestream_getc(RFILE *stream)
 {
+   char c = 0;
+   (void)c;
    if (!stream)
       return 0;
 #if defined(HAVE_BUFFERED_IO)
-   return fgetc(stream->fp);
+    return fgetc(stream->fp);
+#elif defined(VITA) || defined(PSP)
+    if(filestream_read(stream, &c, 1) == 1)
+       return (int)c;
+    return EOF;
 #else
    return getc(stream->fd);
 #endif
@@ -363,8 +369,8 @@ error:
 
 int filestream_eof(RFILE *stream)
 {
-   ssize_t current_position = filestream_tell(stream);
-   ssize_t end_position     = filestream_seek(stream, 0, SEEK_END);
+   size_t current_position = filestream_tell(stream);
+   size_t end_position     = filestream_seek(stream, 0, SEEK_END);
 
    filestream_seek(stream, current_position, SEEK_SET);
 
