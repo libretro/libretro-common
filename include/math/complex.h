@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (intrinsics.h).
+ * The following license statement only applies to this file (complex.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -19,71 +19,62 @@
  * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-
-#ifndef __LIBRETRO_SDK_COMPAT_INTRINSICS_H
-#define __LIBRETRO_SDK_COMPAT_INTRINSICS_H
+#ifndef __LIBRETRO_SDK_MATH_COMPLEX_H__
+#define __LIBRETRO_SDK_MATH_COMPLEX_H__
 
 #include <stdint.h>
-#include <stddef.h>
-#include <string.h>
 
-#include <retro_common_api.h>
 #include <retro_inline.h>
 
-#ifdef _MSC_VER
-#include <intrin.h>
-#endif
-
-RETRO_BEGIN_DECLS
-
-/* Count Leading Zero, unsigned 16bit input value */
-static INLINE unsigned compat_clz_u16(uint16_t val)
+typedef struct
 {
-#ifdef __GNUC__
-   return __builtin_clz(val << 16 | 0x8000);
-#else
-   unsigned ret = 0;
+   float real;
+   float imag;
+} fft_complex_t;
 
-   while(!(val & 0x8000) && ret < 16)
-   {
-      val <<= 1;
-      ret++;
-   }
+static INLINE fft_complex_t fft_complex_mul(fft_complex_t a,
+      fft_complex_t b)
+{
+   fft_complex_t out = {
+      a.real * b.real - a.imag * b.imag,
+      a.imag * b.real + a.real * b.imag,
+   };
 
-   return ret;
-#endif
+   return out;
+
 }
 
-/* Count Trailing Zero */
-#if defined(__GNUC__) && !defined(RARCH_CONSOLE)
-static INLINE int compat_ctz(unsigned x)
+static INLINE fft_complex_t fft_complex_add(fft_complex_t a,
+      fft_complex_t b)
 {
-   return __builtin_ctz(x);
-}
-#elif _MSC_VER >= 1400
-static INLINE int compat_ctz(unsigned x)
-{
-   unsigned long r = 0;
-   _BitScanReverse((unsigned long*)&r, x);
-   return (int)r;
-}
-#else
-/* Only checks at nibble granularity, 
- * because that's what we need. */
-static INLINE int compat_ctz(unsigned x)
-{
-   if (x & 0x000f)
-      return 0;
-   if (x & 0x00f0)
-      return 4;
-   if (x & 0x0f00)
-      return 8;
-   if (x & 0xf000)
-      return 12;
-   return 16;
-}
-#endif
+   fft_complex_t out = {
+      a.real + b.real,
+      a.imag + b.imag,
+   };
 
-RETRO_END_DECLS
+   return out;
+
+}
+
+static INLINE fft_complex_t fft_complex_sub(fft_complex_t a,
+      fft_complex_t b)
+{
+   fft_complex_t out = {
+      a.real - b.real,
+      a.imag - b.imag,
+   };
+
+   return out;
+
+}
+
+static INLINE fft_complex_t fft_complex_conj(fft_complex_t a)
+{
+   fft_complex_t out = {
+      a.real, -a.imag,
+   };
+
+   return out;
+}
 
 #endif
