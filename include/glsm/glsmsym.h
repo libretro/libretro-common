@@ -394,7 +394,9 @@ void rglTexSubImage2D( 	GLenum target,
   	const GLvoid * pixels);
 void rglDeleteVertexArrays(GLsizei n, const GLuint *arrays);
 void *rglFenceSync(GLenum condition, GLbitfield flags);
+#if !defined(HAVE_OPENGLES2)
 void rglWaitSync(void *data, GLbitfield flags, GLuint64 timeout);
+#endif
 
 RETRO_END_DECLS
 
