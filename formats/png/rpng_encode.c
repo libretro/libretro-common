@@ -366,7 +366,13 @@ end:
    free(paeth_filtered);
 
    if (stream_backend)
-      stream_backend->stream_free(stream);
+   {
+      if (stream)
+      {
+         if (stream_backend->stream_free)
+            stream_backend->stream_free(stream);
+      }
+   }
    return ret;
 }
 
