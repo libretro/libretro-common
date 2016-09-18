@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (utf.h).
+ * The following license statement only applies to this file (vector_4.c).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,28 +20,43 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _LIBRETRO_ENCODINGS_UTF_H
-#define _LIBRETRO_ENCODINGS_UTF_H
-
 #include <stdint.h>
-#include <stddef.h>
+#include <math.h>
 
-#include <boolean.h>
+#include <gfx/math/vector_4.h>
 
-size_t utf8_conv_utf32(uint32_t *out, size_t out_chars,
-      const char *in, size_t in_size);
+void vec4_add(float *dst, const float *src)
+{
+   unsigned i;
+   unsigned n = 4;
 
-bool utf16_conv_utf8(uint8_t *out, size_t *out_chars,
-      const uint16_t *in, size_t in_size);
+   for (i = 0; i < n; i++)
+      dst[i] += src[i];
+}
 
-size_t utf8len(const char *string);
+void vec4_subtract(float *dst, const float *src)
+{
+   unsigned i;
+   unsigned n = 4;
 
-size_t utf8cpy(char *d, size_t d_len, const char *s, size_t chars);
+   for (i = 0; i < n; i++)
+      dst[i] -= src[i];
+}
 
-const char *utf8skip(const char *str, size_t chars);
+void vec4_scale(float *dst, const float scale)
+{
+   unsigned i;
+   unsigned n = 4;
 
-uint32_t utf8_walk(const char **string);
+   for (i = 0; i < n; i++)
+      dst[i] *= scale;
+}
 
-bool utf16_to_char_string(const uint16_t *in, char *s, size_t len);
+void vec4_copy(float *dst, const float *src)
+{
+   unsigned i;
+   unsigned n = 4;
 
-#endif
+   for (i = 0; i < n; i++)
+      dst[i] = src[i];
+}

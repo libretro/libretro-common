@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (utf.h).
+ * The following license statement only applies to this file (vector_4.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,28 +20,20 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _LIBRETRO_ENCODINGS_UTF_H
-#define _LIBRETRO_ENCODINGS_UTF_H
+#ifndef __LIBRETRO_SDK_GFX_MATH_VECTOR_4_H__
+#define __LIBRETRO_SDK_GFX_MATH_VECTOR_4_H__
 
 #include <stdint.h>
-#include <stddef.h>
 
-#include <boolean.h>
+typedef float vec4_t[4];
 
-size_t utf8_conv_utf32(uint32_t *out, size_t out_chars,
-      const char *in, size_t in_size);
+void vec4_add(float *dst, const float *src);
 
-bool utf16_conv_utf8(uint8_t *out, size_t *out_chars,
-      const uint16_t *in, size_t in_size);
+void vec4_subtract(float *dst, const float *src);
 
-size_t utf8len(const char *string);
+void vec4_scale(float *dst, const float scale);
 
-size_t utf8cpy(char *d, size_t d_len, const char *s, size_t chars);
-
-const char *utf8skip(const char *str, size_t chars);
-
-uint32_t utf8_walk(const char **string);
-
-bool utf16_to_char_string(const uint16_t *in, char *s, size_t len);
+void vec4_copy(float *dst, const float *src);
 
 #endif
+
