@@ -248,11 +248,15 @@ static int file_archive_extract_cb(const char *name, const char *valid_exts,
       delim = path_get_archive_delim(userdata->archive_path);
 
       if (delim)
+      {
          strlcpy(wanted_file, delim + 1, sizeof(wanted_file));
 
-      if (!string_is_equal_noncase(userdata->extracted_file_path,
-                wanted_file))
-        return 1; /* keep searching for the right file */
+         if (!string_is_equal_noncase(userdata->extracted_file_path,
+                   wanted_file))
+           return 1; /* keep searching for the right file */
+      }
+      else
+         strlcpy(wanted_file, userdata->archive_path, sizeof(wanted_file));
 
       if (file_archive_perform_mode(new_path,
                 valid_exts, cdata, cmode, csize, size,
@@ -384,26 +388,21 @@ int file_archive_parse_file_iterate(
             state->type = ARCHIVE_TRANSFER_DEINIT_ERROR;
          break;
       case ARCHIVE_TRANSFER_ITERATE:
+         if (file_archive_get_file_backend(file))
          {
             const struct file_archive_file_backend *backend =
                file_archive_get_file_backend(file);
+            int ret = backend->archive_parse_file_iterate_step(state,
+                  valid_exts, userdata, file_cb);
+            if (ret != 1)
+               state->type = ARCHIVE_TRANSFER_DEINIT;
+            if (ret == -1)
+               state->type = ARCHIVE_TRANSFER_DEINIT_ERROR;
 
-            if (backend)
-            {
-               int ret = backend->archive_parse_file_iterate_step(state,
-                     valid_exts, userdata, file_cb);
-               if (ret != 1)
-                  state->type = ARCHIVE_TRANSFER_DEINIT;
-               if (ret == -1)
-                  state->type = ARCHIVE_TRANSFER_DEINIT_ERROR;
-
-               /* early return to prevent deinit from never firing */
-               return 0;
-            }
-            else
-               return -1;
+            /* early return to prevent deinit from never firing */
+            return 0;
          }
-         break;
+         return -1;
       case ARCHIVE_TRANSFER_DEINIT_ERROR:
          *returnerr = false;
       case ARCHIVE_TRANSFER_DEINIT:
