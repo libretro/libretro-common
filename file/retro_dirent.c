@@ -24,6 +24,7 @@
 #include <stdio.h>
 
 #include <retro_common.h>
+#include <encodings/win32.h>
 
 #include <boolean.h>
 #include <retro_stat.h>
@@ -34,7 +35,9 @@ struct RDIR *retro_opendir(const char *name)
 {
 #if defined(_WIN32)
    char path_buf[1024] = {0};
+#ifdef UNICODE
    wchar_t pathW[1024] = {0};
+#endif
 #endif
    struct RDIR *rdir = (struct RDIR*)calloc(1, sizeof(*rdir));
 
@@ -42,9 +45,13 @@ struct RDIR *retro_opendir(const char *name)
       return NULL;
 
 #if defined(_WIN32)
+#ifdef UNICODE
    snprintf(path_buf, sizeof(path_buf), "%s\\*", name);
    MultiByteToWideChar(CP_UTF8, 0, path_buf, -1, pathW, sizeof(pathW) / sizeof(pathW[0]));
    rdir->directory = FindFirstFileW(pathW, &rdir->entry);
+#else
+   rdir->directory = FindFirstFile(path_buf, &rdir->entry);
+#endif
 #elif defined(VITA) || defined(PSP)
    rdir->directory = sceIoDopen(name);
 #elif defined(_3DS)
@@ -77,7 +84,7 @@ int retro_readdir(struct RDIR *rdir)
 {
 #if defined(_WIN32)
    if(rdir->next)
-      return (FindNextFileW(rdir->directory, &rdir->entry) != 0);
+      return (FindNextFile(rdir->directory, &rdir->entry) != 0);
    else {
       rdir->next = true;
       return (rdir->directory != INVALID_HANDLE_VALUE);
@@ -97,7 +104,9 @@ const char *retro_dirent_get_name(struct RDIR *rdir)
 {
 #if defined(_WIN32)
    memset(rdir->path, 0, sizeof(rdir->path));
-   utf16_to_char_string(rdir->entry.cFileName, rdir->path, sizeof(rdir->path));
+#ifdef UNICODE
+   utf16_to_char_string((const uint16_t*)rdir->entry.cFileName, rdir->path, sizeof(rdir->path));
+#endif
    return rdir->path;
 #elif defined(VITA) || defined(PSP) || defined(__CELLOS_LV2__)
    return rdir->entry.d_name;
@@ -120,7 +129,7 @@ const char *retro_dirent_get_name(struct RDIR *rdir)
 bool retro_dirent_is_dir(struct RDIR *rdir, const char *path)
 {
 #if defined(_WIN32)
-   const WIN32_FIND_DATAW *entry = (const WIN32_FIND_DATAW*)&rdir->entry;
+   const WIN32_FIND_DATA *entry = (const WIN32_FIND_DATA*)&rdir->entry;
    return entry->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
 #elif defined(PSP) || defined(VITA)
    const SceIoDirent *entry = (const SceIoDirent*)&rdir->entry;
