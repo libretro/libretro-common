@@ -45,10 +45,6 @@
 #include <time.h>
 #endif
 
-#ifdef _WIN32
-#include <encodings/win32.h>
-#endif
-
 #if defined(_WIN32) && !defined(_XBOX)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

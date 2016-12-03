@@ -26,7 +26,6 @@
 #include <errno.h>
 
 #if defined(_WIN32)
-#include <encodings/win32.h>
 #  ifdef _MSC_VER
 #    define setmode _setmode
 #  endif
@@ -75,17 +74,10 @@ struct RFILE
 
 #define HAVE_BUFFERED_IO 1
 
-#ifdef _WIN32
-#define MODE_STR_READ L"r"
-#define MODE_STR_READ_UNBUF L"rb"
-#define MODE_STR_WRITE_UNBUF L"wb"
-#define MODE_STR_WRITE_PLUS L"w+"
-#else
 #define MODE_STR_READ "r"
 #define MODE_STR_READ_UNBUF "rb"
 #define MODE_STR_WRITE_UNBUF "wb"
 #define MODE_STR_WRITE_PLUS "w+"
-#endif
 
 #if defined(HAVE_BUFFERED_IO)
    FILE *fp;
@@ -115,12 +107,7 @@ RFILE *filestream_open(const char *path, unsigned mode, ssize_t len)
    int            flags = 0;
    int         mode_int = 0;
 #if defined(HAVE_BUFFERED_IO)
-#ifdef _WIN32
-   const wchar_t *mode_str = NULL;
-   wchar_t path_wide[PATH_MAX_LENGTH] = {0};
-#else
    const char *mode_str = NULL;
-#endif
 #endif
    RFILE        *stream = (RFILE*)calloc(1, sizeof(*stream));
 
@@ -211,12 +198,7 @@ RFILE *filestream_open(const char *path, unsigned mode, ssize_t len)
 #if defined(HAVE_BUFFERED_IO)
    if ((stream->hints & RFILE_HINT_UNBUFFERED) == 0)
    {
-#ifdef _WIN32
-      MultiByteToWideChar(CP_UTF8, 0, path, -1, path_wide, sizeof(path_wide) / sizeof(path_wide[0]));
-      stream->fp = _wfopen(path_wide, mode_str);
-#else
       stream->fp = fopen(path, mode_str);
-#endif
       if (!stream->fp)
          goto error;
    }
@@ -293,7 +275,7 @@ char *filestream_getline(RFILE *stream)
    }
 
    newline[idx] = '\0';
-   return newline;
+   return newline; 
 }
 
 char *filestream_gets(RFILE *stream, char *s, size_t len)
@@ -344,7 +326,7 @@ ssize_t filestream_seek(RFILE *stream, ssize_t offset, int whence)
 #endif
 
 #ifdef HAVE_MMAP
-   /* Need to check stream->mapped because this function is
+   /* Need to check stream->mapped because this function is 
     * called in filestream_open() */
    if (stream->mapped && stream->hints & RFILE_HINT_MMAP)
    {
@@ -414,7 +396,7 @@ ssize_t filestream_tell(RFILE *stream)
       return ftell(stream->fp);
 #endif
 #ifdef HAVE_MMAP
-   /* Need to check stream->mapped because this function
+   /* Need to check stream->mapped because this function 
     * is called in filestream_open() */
    if (stream->mapped && stream->hints & RFILE_HINT_MMAP)
       return stream->mappos;
