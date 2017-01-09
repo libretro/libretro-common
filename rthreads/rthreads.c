@@ -236,6 +236,9 @@ void sthread_join(sthread_t *thread)
  */
 bool sthread_isself(sthread_t *thread)
 {
+  /* This thread can't possibly be a null thread */
+  if (!thread) return false;
+
 #ifdef USE_WIN32_THREADS
    return GetCurrentThread() == thread->thread;
 #else
