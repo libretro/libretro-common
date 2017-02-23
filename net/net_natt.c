@@ -99,14 +99,15 @@ static bool natt_open_port(struct natt_status *status,
 {
 #ifndef HAVE_SOCKET_LEGACY
 #if HAVE_MINIUPNPC
+   int r;
    char host[PATH_MAX_LENGTH], ext_host[PATH_MAX_LENGTH],
         port_str[6], ext_port_str[6];
-   const char *proto_str;
-   struct addrinfo hints = {0}, *ext_addrinfo;
-   int r;
+   struct addrinfo hints         = {0};
+   const char *proto_str         = NULL;
+   struct addrinfo *ext_addrinfo = NULL;
 
    /* if NAT traversal is uninitialized or unavailable, oh well */
-   if (!urls.controlURL[0])
+   if (!urls.controlURL || !urls.controlURL[0])
       return false;
 
    /* figure out the internal info */
@@ -117,7 +118,7 @@ static bool natt_open_port(struct natt_status *status,
    /* add the port mapping */
    r = UPNP_AddAnyPortMapping(urls.controlURL, data.first.servicetype, port_str,
       port_str, host, "retroarch", proto_str, NULL, "3600", ext_port_str);
-   if (r == 501 /* Action Failed */)
+   if (r != 0)
    {
       /* try the older AddPortMapping */
       memcpy(ext_port_str, port_str, 6);
@@ -156,6 +157,7 @@ static bool natt_open_port(struct natt_status *status,
       return false;
    }
 
+   freeaddrinfo_retro(ext_addrinfo);
    return true;
 
 #else
