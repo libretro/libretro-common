@@ -42,6 +42,24 @@ typedef struct math_matrix_4x4
    float data[16];
 } math_matrix_4x4;
 
+#define matrix_4x4_copy(dst, src) \
+   MAT_ELEM_4X4(dst, 0, 0) = MAT_ELEM_4X4(src, 0, 0); \
+   MAT_ELEM_4X4(dst, 0, 1) = MAT_ELEM_4X4(src, 0, 1); \
+   MAT_ELEM_4X4(dst, 0, 2) = MAT_ELEM_4X4(src, 0, 2); \
+   MAT_ELEM_4X4(dst, 0, 3) = MAT_ELEM_4X4(src, 0, 3); \
+   MAT_ELEM_4X4(dst, 1, 0) = MAT_ELEM_4X4(src, 1, 0); \
+   MAT_ELEM_4X4(dst, 1, 1) = MAT_ELEM_4X4(src, 1, 1); \
+   MAT_ELEM_4X4(dst, 1, 2) = MAT_ELEM_4X4(src, 1, 2); \
+   MAT_ELEM_4X4(dst, 1, 3) = MAT_ELEM_4X4(src, 1, 3); \
+   MAT_ELEM_4X4(dst, 2, 0) = MAT_ELEM_4X4(src, 2, 0); \
+   MAT_ELEM_4X4(dst, 2, 1) = MAT_ELEM_4X4(src, 2, 1); \
+   MAT_ELEM_4X4(dst, 2, 2) = MAT_ELEM_4X4(src, 2, 2); \
+   MAT_ELEM_4X4(dst, 2, 3) = MAT_ELEM_4X4(src, 2, 3); \
+   MAT_ELEM_4X4(dst, 3, 0) = MAT_ELEM_4X4(src, 3, 0); \
+   MAT_ELEM_4X4(dst, 3, 1) = MAT_ELEM_4X4(src, 3, 1); \
+   MAT_ELEM_4X4(dst, 3, 2) = MAT_ELEM_4X4(src, 3, 2); \
+   MAT_ELEM_4X4(dst, 3, 3) = MAT_ELEM_4X4(src, 3, 3)
+
 /*
  * Sets mat to an identity matrix
  */
