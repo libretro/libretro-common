@@ -607,7 +607,7 @@ enum retro_mod
 #define RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME 18
                                            /* const bool * --
                                             * If true, the libretro implementation supports calls to 
-                                            * retro_load_game() with NULL as argument.
+                                            * retro_load_game() with NULL as `path` and `data` arguments.
                                             * Used by cores which can run without particular game data.
                                             * This should be called within retro_set_environment() only.
                                             */
@@ -1976,11 +1976,13 @@ struct retro_variable
 struct retro_game_info
 {
    const char *path;       /* Path to game, UTF-8 encoded.
-                            * Usually used as a reference.
-                            * May be NULL if rom was loaded from stdin
-                            * or similar. 
-                            * retro_system_info::need_fullpath guaranteed 
-                            * that this path is valid. */
+                            * Must be set to load content, even if `data` is provided
+                            * instead of a proper file path.
+                            * Try very hard to set a useful value, which cores may use
+                            * as a content ID for building other paths (save files, for instance)
+                            * "Dummy" or "STDIN" are legal, if nothing else will do.
+                            * Having retro_system_info::need_fullpath set guarantees that this
+                            * path is valid. Can be NULL if "NO GAME" support is being used. */
    const void *data;       /* Memory buffer of loaded game. Will be NULL 
                             * if need_fullpath was set. */
    size_t      size;       /* Size of memory buffer. */
