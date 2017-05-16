@@ -45,37 +45,6 @@
 #define AUDIO_MIXER_MAX_VOICES      8
 #define AUDIO_MIXER_TEMP_OGG_BUFFER 8192
 
-enum audio_mixer_type
-{
-   AUDIO_MIXER_TYPE_NONE = 0,
-   AUDIO_MIXER_TYPE_WAV,
-   AUDIO_MIXER_TYPE_OGG
-};
-
-struct audio_mixer_sound
-{
-   enum audio_mixer_type type;
-   
-   union
-   {
-      struct
-      {
-         /* wav */
-         unsigned frames;
-         const float* pcm;
-      } wav;
-      
-#ifdef HAVE_STB_VORBIS
-      struct
-      {
-         /* ogg */
-         unsigned size;
-         const void* data;
-      } ogg;
-#endif
-   } types;
-};
-
 struct audio_mixer_voice
 {
    bool     repeat;
@@ -242,7 +211,7 @@ void audio_mixer_done(void)
       s_voices[i].type = AUDIO_MIXER_TYPE_NONE;
 }
 
-audio_mixer_sound_t* audio_mixer_load_wav(const char* path, void *buffer, int32_t size)
+audio_mixer_sound_t* audio_mixer_load_wav(void *buffer, int32_t size)
 {
    /* WAV data */
    rwav_t wav;
@@ -289,14 +258,14 @@ audio_mixer_sound_t* audio_mixer_load_wav(const char* path, void *buffer, int32_
    return sound;
 }
 
-audio_mixer_sound_t* audio_mixer_load_ogg(const char* path, void *buffer, int32_t size)
+audio_mixer_sound_t* audio_mixer_load_ogg(void *buffer, int32_t size)
 {
 #ifdef HAVE_STB_VORBIS
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
    
    if (!sound)
       return NULL;
-   
+
    sound->type           = AUDIO_MIXER_TYPE_OGG;
    sound->types.ogg.size = size;
    sound->types.ogg.data = buffer;
@@ -449,7 +418,7 @@ audio_mixer_voice_t* audio_mixer_play(audio_mixer_sound_t* sound, bool repeat,
 void audio_mixer_stop(audio_mixer_voice_t* voice)
 {
    if (voice && voice->stop_cb)
-      voice->stop_cb(voice, AUDIO_MIXER_SOUND_STOPPED);
+      voice->stop_cb(voice->sound, AUDIO_MIXER_SOUND_STOPPED);
 }
 
 static void audio_mixer_mix_wav(float* buffer, size_t num_frames,
@@ -473,7 +442,7 @@ again:
       if (voice->repeat)
       {
          if (voice->stop_cb)
-            voice->stop_cb(voice, AUDIO_MIXER_SOUND_REPEATED);
+            voice->stop_cb(voice->sound, AUDIO_MIXER_SOUND_REPEATED);
 
          buf_free                  -= pcm_available;
          pcm_available              = sound->types.wav.frames * 2;
@@ -483,7 +452,7 @@ again:
       }
 
       if (voice->stop_cb)
-         voice->stop_cb(voice, AUDIO_MIXER_SOUND_FINISHED);
+         voice->stop_cb(voice->sound, AUDIO_MIXER_SOUND_FINISHED);
 
       voice->type = AUDIO_MIXER_TYPE_NONE;
    }
@@ -520,7 +489,7 @@ again:
          if (voice->repeat)
          {
             if (voice->stop_cb)
-               voice->stop_cb(voice, AUDIO_MIXER_SOUND_REPEATED);
+               voice->stop_cb(voice->sound, AUDIO_MIXER_SOUND_REPEATED);
 
             stb_vorbis_seek_start(voice->types.ogg.stream);
             goto again;
@@ -528,7 +497,7 @@ again:
          else
          {
             if (voice->stop_cb)
-               voice->stop_cb(voice, AUDIO_MIXER_SOUND_FINISHED);
+               voice->stop_cb(voice->sound, AUDIO_MIXER_SOUND_FINISHED);
 
             voice->type = AUDIO_MIXER_TYPE_NONE;
             return;

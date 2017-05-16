@@ -27,15 +27,50 @@
 #include <stddef.h>
 #include <stdlib.h>
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <boolean.h>
 #include <retro_common_api.h>
 
 RETRO_BEGIN_DECLS
 
+enum audio_mixer_type
+{
+   AUDIO_MIXER_TYPE_NONE = 0,
+   AUDIO_MIXER_TYPE_WAV,
+   AUDIO_MIXER_TYPE_OGG
+};
+
+struct audio_mixer_sound
+{
+   enum audio_mixer_type type;
+   
+   union
+   {
+      struct
+      {
+         /* wav */
+         unsigned frames;
+         const float* pcm;
+      } wav;
+      
+#ifdef HAVE_STB_VORBIS
+      struct
+      {
+         /* ogg */
+         unsigned size;
+         const void* data;
+      } ogg;
+#endif
+   } types;
+};
+
 typedef struct audio_mixer_sound audio_mixer_sound_t;
 typedef struct audio_mixer_voice audio_mixer_voice_t;
 
-typedef void (*audio_mixer_stop_cb_t)(audio_mixer_voice_t* voice, unsigned reason);
+typedef void (*audio_mixer_stop_cb_t)(audio_mixer_sound_t* sound, unsigned reason);
 
 /* Reasons passed to the stop callback. */
 #define AUDIO_MIXER_SOUND_FINISHED 0
@@ -46,8 +81,8 @@ void audio_mixer_init(unsigned rate);
 
 void audio_mixer_done(void);
 
-audio_mixer_sound_t* audio_mixer_load_wav(const char* path, void *buffer, int32_t size);
-audio_mixer_sound_t* audio_mixer_load_ogg(const char* path, void *buffer, int32_t size);
+audio_mixer_sound_t* audio_mixer_load_wav(void *buffer, int32_t size);
+audio_mixer_sound_t* audio_mixer_load_ogg(void *buffer, int32_t size);
 
 void audio_mixer_destroy(audio_mixer_sound_t* sound);
 
