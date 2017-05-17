@@ -92,7 +92,7 @@ char *inet_ntoa(struct SceNetInAddr in)
 {
 	static char ip_addr[INET_ADDRSTRLEN + 1];
 
-	if(sceNetInetNtop(AF_INET, &in, ip_addr, INET_ADDRSTRLEN) == NULL)
+   if (inet_ntop_compat(AF_INET, &in, i_paddr, INET_ADDRSTRLEN) == NULL)
 		strlcpy(ip_addr, "Invalid", sizeof(ip_addr));
 
 	return ip_addr;
@@ -336,7 +336,7 @@ void network_deinit(void)
 
 uint16_t inet_htons(uint16_t hostshort)
 {
-#ifdef VITA
+#if defined(VITA) || defined(__ORBIS__)
    return sceNetHtons(hostshort);
 #else
    return htons(hostshort);
@@ -345,7 +345,7 @@ uint16_t inet_htons(uint16_t hostshort)
 
 int inet_ptrton(int af, const char *src, void *dst)
 {
-#if defined(VITA)
+#if defined(VITA) || defined(__ORBIS__)
    return sceNetInetPton(af, src, dst);	
 #elif defined(GEKKO) || defined(_WIN32)
    /* TODO/FIXME - should use InetPton on Vista and later */
@@ -362,6 +362,9 @@ struct in_addr6_compat
 
 const char *inet_ntop_compat(int af, const void *src, char *dst, socklen_t cnt)
 {
+#if defined(VITA) || defined(__ORBIS__)
+   return sceNetInetNtop(af,src,dst,cnt);
+#else
    if (af == AF_INET)
    {
       struct sockaddr_in in;
@@ -386,4 +389,5 @@ const char *inet_ntop_compat(int af, const void *src, char *dst, socklen_t cnt)
 #endif
 
    return NULL;
+#endif
 }
