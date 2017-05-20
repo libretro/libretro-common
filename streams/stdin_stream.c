@@ -24,12 +24,21 @@
 #include <ctype.h>
 
 #ifdef _WIN32
+#ifndef _XBOX
+#include <windows.h>
+#endif
 #include <direct.h>
 #else
 #include <unistd.h>
 #endif
 
-#ifdef _WIN32
+#if defined(_WIN32) && defined(_XBOX)
+size_t read_stdin(char *buf, size_t size)
+{
+   /* Not implemented. */
+   return 0;
+}
+#elif defined(_WIN32)
 size_t read_stdin(char *buf, size_t size)
 {
    DWORD i;
