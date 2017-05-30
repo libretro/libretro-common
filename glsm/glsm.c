@@ -2130,38 +2130,73 @@ static void glsm_state_unbind(void)
          glDisable(gl_state.cap_translate[i]);
    }
 
-   glBlendFunc(GL_ONE, GL_ZERO);
+   if (gl_state.blendfunc.used) {
+      glBlendFunc(GL_ONE, GL_ZERO);
+      gl_state.blendfunc.used = false;
+   }
 
-   if (gl_state.colormask.used)
+   if (gl_state.colormask.used) {
       glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-   if (gl_state.blendfunc_separate.used)
+      gl_state.colormask.used = false;
+   }
+
+   if (gl_state.blendfunc_separate.used) {
       glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+      gl_state.blendfunc_separate.used = false;
+   }
 
-   if (gl_state.cullface.used)
+   if (gl_state.cullface.used) {
       glCullFace(GL_BACK);
+      gl_state.cullface.used = false;
+   }
 
-   if (gl_state.depthmask.used)
+   if (gl_state.depthmask.used) {
       glDepthMask(GL_TRUE);
+      gl_state.depthmask.used = false;
+   }
 
-   if (gl_state.polygonoffset.used)
+   if (gl_state.polygonoffset.used) {
       glPolygonOffset(0, 0);
+      gl_state.polygonoffset.used = false;
+   }
+
+   if (gl_state.scissor.used) {
+      glScissor(0, 0, 0, 0);
+      gl_state.scissor.used = false;
+   }
 
    glUseProgram(0);
    glClearColor(0,0,0,0.0f);
 
-   if (gl_state.depthrange.used)
+   if (gl_state.depthrange.used) {
       rglDepthRange(0, 1);
+      gl_state.depthrange.used = false;
+   }
 
-   glStencilMask(1);
-   glFrontFace(GL_CCW);
-   if (gl_state.depthfunc.used)
+   if (gl_state.stencilmask.used) {
+      glStencilMask(1);
+      gl_state.stencilmask.used = false;
+   }
+
+   if (gl_state.frontface.used) {
+      glFrontFace(GL_CCW);
+      gl_state.frontface.used = false;
+   }
+
+   if (gl_state.depthfunc.used) {
       glDepthFunc(GL_LESS);
+      gl_state.depthfunc.used = false;
+   }
 
-   if (gl_state.stencilop.used)
+   if (gl_state.stencilop.used) {
       glStencilOp(GL_KEEP,GL_KEEP, GL_KEEP);
+      gl_state.stencilop.used = false;
+   }
 
-   if (gl_state.stencilfunc.used)
+   if (gl_state.stencilfunc.used) {
       glStencilFunc(GL_ALWAYS,0,1);
+      gl_state.stencilfunc.used = false;
+   }
 
    /* Clear textures */
    for (i = 0; i < glsm_max_textures; i ++)
