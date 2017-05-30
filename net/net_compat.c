@@ -369,7 +369,7 @@ const char *inet_ntop_compat(int af, const void *src, char *dst, socklen_t cnt)
    return sceNetInetNtop(af,src,dst,cnt);
 #elif defined(WIIU)
    return inet_ntop(af, src, dst, cnt);
-#else
+#elif defined(_WIN32)
    if (af == AF_INET)
    {
       struct sockaddr_in in;
@@ -392,9 +392,9 @@ const char *inet_ntop_compat(int af, const void *src, char *dst, socklen_t cnt)
       return dst;
    }
 #endif
+#endif
 
    return NULL;
-#endif
 }
 
 bool udp_send_packet(const char *host,
@@ -411,7 +411,7 @@ bool udp_send_packet(const char *host,
 
    snprintf(port_buf, sizeof(port_buf), "%hu", (unsigned short)port);
 
-   if (getaddrinfo_retro(host, port_buf, &hints, &res) < 0)
+   if (getaddrinfo_retro(host, port_buf, &hints, &res) != 0)
       return false;
 
    /* Send to all possible targets.
