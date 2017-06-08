@@ -608,7 +608,7 @@ again:
 }
 #endif
 
-void audio_mixer_mix(float* buffer, size_t num_frames)
+void audio_mixer_mix(float* buffer, size_t num_frames, float volume_override, bool override)
 {
    unsigned i;
    size_t j                   = 0;
@@ -621,7 +621,7 @@ void audio_mixer_mix(float* buffer, size_t num_frames)
    
    for (i = 0; i < AUDIO_MIXER_MAX_VOICES; i++, voice++)
    {
-      float volume = voice->volume;
+      float volume = (override) ? volume_override : voice->volume;
 
       switch (voice->type)
       {
