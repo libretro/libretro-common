@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2017 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (audio_mixer.h).
+ * The following license statement only applies to this file (net_socket.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,56 +20,30 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_AUDIO_MIXER__H
-#define __LIBRETRO_SDK_AUDIO_MIXER__H
+#ifndef _LIBRETRO_SDK_NET_SOCKET_SSL_H
+#define _LIBRETRO_SDK_NET_SOCKET_SSL_H
 
-#include <stdint.h>
-#include <stddef.h>
 #include <stdlib.h>
-
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
 #include <boolean.h>
 #include <retro_common_api.h>
 
 RETRO_BEGIN_DECLS
 
-enum audio_mixer_type
-{
-   AUDIO_MIXER_TYPE_NONE = 0,
-   AUDIO_MIXER_TYPE_WAV,
-   AUDIO_MIXER_TYPE_OGG,
-   AUDIO_MIXER_TYPE_MOD
-};
+void* ssl_socket_init(int fd, const char *domain);
 
-typedef struct audio_mixer_sound audio_mixer_sound_t;
-typedef struct audio_mixer_voice audio_mixer_voice_t;
+int ssl_socket_connect(void *state_data, void *data, bool timeout_enable, bool nonblock);
 
-typedef void (*audio_mixer_stop_cb_t)(audio_mixer_sound_t* sound, unsigned reason);
+int ssl_socket_send_all_blocking(void *state_data, const void *data_, size_t size, bool no_signal);
 
-/* Reasons passed to the stop callback. */
-#define AUDIO_MIXER_SOUND_FINISHED 0
-#define AUDIO_MIXER_SOUND_STOPPED  1
-#define AUDIO_MIXER_SOUND_REPEATED 2
+ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_, size_t size, bool no_signal);
 
-void audio_mixer_init(unsigned rate);
+int ssl_socket_receive_all_blocking(void *state_data, void *data_, size_t size);
 
-void audio_mixer_done(void);
+ssize_t ssl_socket_receive_all_nonblocking(void *state_data, bool *error, void *data_, size_t size);
 
-audio_mixer_sound_t* audio_mixer_load_wav(void *buffer, int32_t size);
-audio_mixer_sound_t* audio_mixer_load_ogg(void *buffer, int32_t size);
-audio_mixer_sound_t* audio_mixer_load_mod(void *buffer, int32_t size);
+void ssl_socket_close(void *state_data);
 
-void audio_mixer_destroy(audio_mixer_sound_t* sound);
-
-audio_mixer_voice_t* audio_mixer_play(audio_mixer_sound_t* sound,
-      bool repeat, float volume, audio_mixer_stop_cb_t stop_cb);
-
-void audio_mixer_stop(audio_mixer_voice_t* voice);
-
-void audio_mixer_mix(float* buffer, size_t num_frames, float volume_override, bool override);
+void ssl_socket_free(void *state_data);
 
 RETRO_END_DECLS
 
