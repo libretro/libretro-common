@@ -83,9 +83,10 @@ int rfputc(int character, RFILE * stream)
 
 int rfprintf(RFILE * stream, const char * format, ...)
 {
+   int result;
 	va_list vl;
 	va_start(vl, format);
-	int result = filestream_vprintf(stream, format, vl);
+	result = filestream_vprintf(stream, format, vl);
 	va_end(vl);
 	return result;
 }

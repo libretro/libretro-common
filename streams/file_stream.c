@@ -545,8 +545,9 @@ int filestream_vprintf(RFILE *stream, const char* format, va_list args)
 int filestream_printf(RFILE *stream, const char* format, ...)
 {
 	va_list vl;
+   int result;
 	va_start(vl, format);
-	int result = filestream_vprintf(stream, format, vl);
+	result = filestream_vprintf(stream, format, vl);
 	va_end(vl);
 	return result;
 }
