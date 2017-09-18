@@ -1,7 +1,7 @@
 /* Copyright  (C) 2010-2017 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this file (intrinsics.h).
+ * The following license statement only applies to this file (chd_stream.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,65 +20,36 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_COMPAT_INTRINSICS_H
-#define __LIBRETRO_SDK_COMPAT_INTRINSICS_H
+#ifndef _LIBRETRO_SDK_FILE_CHD_STREAM_H
+#define _LIBRETRO_SDK_FILE_CHD_STREAM_H
 
 #include <stdint.h>
 #include <stddef.h>
-#include <string.h>
 
 #include <retro_common_api.h>
-#include <retro_inline.h>
-
-#if defined(_MSC_VER) && !defined(_XBOX)
-#if (_MSC_VER > 1310)
-#include <intrin.h>
-#endif
-#endif
 
 RETRO_BEGIN_DECLS
 
-/* Count Leading Zero, unsigned 16bit input value */
-static INLINE unsigned compat_clz_u16(uint16_t val)
-{
-#ifdef __GNUC__
-   return __builtin_clz(val << 16 | 0x8000);
-#else
-   unsigned ret = 0;
+typedef struct chdstream chdstream_t;
 
-   while(!(val & 0x8000) && ret < 16)
-   {
-      val <<= 1;
-      ret++;
-   }
+#define CHDSTREAM_TRACK_FIRST_DATA (-1)
+#define CHDSTREAM_TRACK_LAST (-2)
 
-   return ret;
-#endif
-}
+chdstream_t *chdstream_open(const char *path, int32_t track);
 
-/* Count Trailing Zero */
-static INLINE int compat_ctz(unsigned x)
-{
-#if defined(__GNUC__) && !defined(RARCH_CONSOLE)
-   return __builtin_ctz(x);
-#elif _MSC_VER >= 1400 && !defined(_XBOX)
-   unsigned long r = 0;
-   _BitScanReverse((unsigned long*)&r, x);
-   return (int)r;
-#else
-/* Only checks at nibble granularity, 
- * because that's what we need. */
-   if (x & 0x000f)
-      return 0;
-   if (x & 0x00f0)
-      return 4;
-   if (x & 0x0f00)
-      return 8;
-   if (x & 0xf000)
-      return 12;
-   return 16;
-#endif
-}
+void chdstream_close(chdstream_t *stream);
+
+ssize_t chdstream_read(chdstream_t *stream, void *data, size_t bytes);
+
+int chdstream_getc(chdstream_t *stream);
+
+char *chdstream_gets(chdstream_t *stream, char *buffer, size_t len);
+
+size_t chdstream_tell(chdstream_t *stream);
+
+void chdstream_rewind(chdstream_t *stream);
+
+int chdstream_seek(chdstream_t *stream, ssize_t offset, int whence);
 
 RETRO_END_DECLS
 
