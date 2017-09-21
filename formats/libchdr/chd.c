@@ -41,20 +41,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "chd.h"
-#include "cdrom.h"
-#include "flac.h"
-#include "huffman.h"
+#include <libchdr/chd.h>
+#include <libchdr/minmax.h>
+#include <libchdr/cdrom.h>
+#include <libchdr/flac.h>
+#include <libchdr/huffman.h>
 #include "zlib.h"
 #include "LzmaEnc.h"
 #include "LzmaDec.h"
-#include "retro_inline.h"
+#include <retro_inline.h>
 
 #define TRUE 1
 #define FALSE 0
-
-#define MAX(x, y) (((x) > (y)) ? (x) : (y))
-#define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
 #define CHD_MAKE_TAG(a,b,c,d)       (((a) << 24) | ((b) << 16) | ((c) << 8) | (d))
 
@@ -483,7 +481,7 @@ chd_error lzma_codec_init(void* codec, uint32_t hunkbytes)
    CLzmaEncHandle enc;
 	Byte decoder_props[LZMA_PROPS_SIZE];
    lzma_allocator* alloc;
-   SizeT props_size;
+   size_t props_size;
 	lzma_codec_data* lzma_codec = (lzma_codec_data*) codec;
 
 	/* construct the decoder */
@@ -554,7 +552,7 @@ chd_error lzma_codec_decompress(void* codec, const uint8_t *src, uint32_t comple
 {
 	ELzmaStatus status;
    SRes res;
-   SizeT consumedlen, decodedlen;
+   size_t consumedlen, decodedlen;
 	/* initialize */
 	lzma_codec_data* lzma_codec = (lzma_codec_data*) codec;
 	LzmaDec_Init(&lzma_codec->decoder);
