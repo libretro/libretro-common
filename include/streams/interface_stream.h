@@ -32,8 +32,6 @@
 
 RETRO_BEGIN_DECLS
 
-typedef struct _chd_file chd_file;
-
 enum intfstream_type
 {
    INTFSTREAM_FILE = 0,
@@ -56,7 +54,7 @@ typedef struct intfstream_info
    } memory;
    struct
    {
-      chd_file *handle;
+      void *handle;
       int32_t track;
    } chd;
    enum intfstream_type type;
