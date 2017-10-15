@@ -37,6 +37,7 @@
 #endif
 #include <compat/strcasestr.h>
 #include <retro_miscellaneous.h>
+#include <encodings/utf.h>
 
 #if defined(_WIN32)
 #ifdef _MSC_VER
@@ -86,6 +87,15 @@
 #include <unistd.h> /* stat() is defined here */
 #endif
 
+/* Assume W-functions do not work below VC2005 and Xbox platforms */
+#if defined(_MSC_VER) && _MSC_VER < 1400 || defined(_XBOX)
+
+#ifndef LEGACY_WIN32
+#define LEGACY_WIN32
+#endif
+
+#endif
+
 enum stat_mode
 {
    IS_DIRECTORY = 0,
@@ -115,9 +125,34 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
        return false;
 #elif defined(_WIN32)
    struct _stat buf;
-   DWORD file_info = GetFileAttributes(path);
+   char *path_local;
+   wchar_t *path_wide;
+   DWORD file_info;
 
-   _stat(path, &buf);
+   if (!path || !*path)
+      return false;
+
+   (void)path_wide;
+   (void)path_local;
+   (void)file_info;
+
+#if defined(LEGACY_WIN32)
+   path_local = utf8_to_local_string_alloc(path);
+   file_info  = GetFileAttributes(path_local);
+
+   _stat(path_local, &buf);
+
+   if (path_local)
+     free(path_local);
+#else
+   path_wide = utf8_to_utf16_string_alloc(path);
+   file_info = GetFileAttributesW(path_wide);
+
+   _wstat(path_wide, &buf);
+
+   if (path_wide)
+      free(path_wide);
+#endif
 
    if (file_info == INVALID_FILE_ATTRIBUTES)
       return false;
@@ -883,4 +918,44 @@ void fill_short_pathname_representation_noext(char* out_rep,
 {
    fill_short_pathname_representation(out_rep, in_path, size);
    path_remove_extension(out_rep);
+}
+
+int path_file_remove(const char *path)
+{
+   char *path_local    = NULL;
+   wchar_t *path_wide  = NULL;
+
+   if (!path || !*path)
+      return false;
+
+   (void)path_local;
+   (void)path_wide;
+
+#if defined(_WIN32) && !defined(_XBOX)
+#if defined(_MSC_VER) && _MSC_VER < 1400
+   path_local = utf8_to_local_string_alloc(path);
+
+   if (path_local)
+   {
+      bool ret = remove(path_local);
+      free(path_local);
+
+      return ret;
+   }
+#else
+   path_wide = utf8_to_utf16_string_alloc(path);
+
+   if (path_wide)
+   {
+      bool ret = _wremove(path_wide);
+      free(path_wide);
+
+      return ret;
+   }
+#endif
+#else
+   return remove(path);
+#endif
+
+   return -1;
 }

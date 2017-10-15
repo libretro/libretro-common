@@ -31,6 +31,10 @@
 
 #include <encodings/utf.h>
 
+#if defined(_WIN32) && !defined(_XBOX)
+#include <windows.h>
+#endif
+
 static INLINE unsigned leading_ones(uint8_t c)
 {
    unsigned ones = 0;
@@ -154,6 +158,9 @@ size_t utf8cpy(char *d, size_t d_len, const char *s, size_t chars)
    const uint8_t *sb     = (const uint8_t*)s;
    const uint8_t *sb_org = sb;
 
+   if (!s)
+      return 0;
+
    while (*sb && chars-- > 0)
    {
       sb++;
@@ -189,6 +196,10 @@ const char *utf8skip(const char *str, size_t chars)
 size_t utf8len(const char *string)
 {
    size_t ret = 0;
+
+   if (!string)
+      return 0;
+
    while (*string)
    {
       if ((*string & 0xC0) != 0x80)
@@ -259,4 +270,147 @@ bool utf16_to_char_string(const uint16_t *in, char *s, size_t len)
    utf16_data = NULL;
 
    return ret;
+}
+
+/* Returned pointer MUST be freed by the caller if non-NULL. */
+static char* mb_to_mb_string_alloc(const char *str, enum CodePage cp_in, enum CodePage cp_out)
+{
+   char *path_buf = NULL;
+   wchar_t *path_buf_wide = NULL;
+   int path_buf_len = 0;
+   int path_buf_wide_len = 0;
+
+   if (!str || !*str)
+      return NULL;
+
+#if !defined(_WIN32) || defined(_XBOX)
+   /* assume string needs no modification if not on Windows */
+   return strdup(str);
+#else
+#ifdef UNICODE
+   /* TODO/FIXME: Not implemented. */
+   return strdup(str);
+#else
+
+   path_buf_wide_len = MultiByteToWideChar(cp_in, 0, str, -1, NULL, 0);
+
+   if (path_buf_wide_len)
+   {
+      path_buf_wide = (wchar_t*)calloc(path_buf_wide_len + sizeof(wchar_t), sizeof(wchar_t));
+
+      if (path_buf_wide)
+      {
+         MultiByteToWideChar(cp_in, 0, str, -1, path_buf_wide, path_buf_wide_len);
+
+         if (*path_buf_wide)
+         {
+            path_buf_len = WideCharToMultiByte(cp_out, 0, path_buf_wide, -1, NULL, 0, NULL, NULL);
+
+            if (path_buf_len)
+            {
+               path_buf = (char*)calloc(path_buf_len + sizeof(char), sizeof(char));
+
+               if (path_buf)
+               {
+                  WideCharToMultiByte(cp_out, 0, path_buf_wide, -1, path_buf, path_buf_len, NULL, NULL);
+
+                  free(path_buf_wide);
+
+                  if (*path_buf)
+                     return path_buf;
+                  else
+                  {
+                     free(path_buf);
+                     return NULL;
+                  }
+               }
+            }
+         }
+      }
+   }
+#endif
+#endif
+
+   if (path_buf_wide)
+      free(path_buf_wide);
+
+   return NULL;
+}
+
+/* Returned pointer MUST be freed by the caller if non-NULL. */
+char* utf8_to_local_string_alloc(const char *str)
+{
+   return mb_to_mb_string_alloc(str, CODEPAGE_UTF8, CODEPAGE_LOCAL);
+}
+
+/* Returned pointer MUST be freed by the caller if non-NULL. */
+char* local_to_utf8_string_alloc(const char *str)
+{
+   return mb_to_mb_string_alloc(str, CODEPAGE_LOCAL, CODEPAGE_UTF8);
+}
+
+/* Returned pointer MUST be freed by the caller if non-NULL. */
+wchar_t* utf8_to_utf16_string_alloc(const char *str)
+{
+   size_t len, out_len;
+   wchar_t *buf;
+
+   if (!str || !*str)
+      return NULL;
+
+#ifdef _WIN32
+   len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
+
+   buf = (wchar_t*)calloc(len, sizeof(wchar_t));
+
+   out_len = MultiByteToWideChar(CP_UTF8, 0, str, -1, buf, len);
+#else
+   /* NOTE: For now, assume non-Windows platforms' locale is already UTF-8. */
+   len = mbstowcs(NULL, str, 0) + 1;
+
+   buf = (wchar_t*)calloc(len, sizeof(wchar_t));
+
+   out_len = mbstowcs(buf, str, len);
+#endif
+
+   if (out_len < 0)
+   {
+      free(buf);
+      return NULL;
+   }
+
+   return buf;
+}
+
+/* Returned pointer MUST be freed by the caller if non-NULL. */
+char* utf16_to_utf8_string_alloc(const wchar_t *str)
+{
+   size_t len, out_len;
+   char *buf;
+
+   if (!str || !*str)
+      return NULL;
+
+#ifdef _WIN32
+   len = WideCharToMultiByte(CP_UTF8, 0, str, -1, NULL, 0, NULL, NULL);
+
+   buf = (char*)calloc(len, sizeof(char));
+
+   out_len = WideCharToMultiByte(CP_UTF8, 0, str, -1, buf, len, NULL, NULL);
+#else
+   /* NOTE: For now, assume non-Windows platforms' locale is already UTF-8. */
+   len = wcstombs(NULL, str, 0) + 1;
+
+   buf = (char*)calloc(len, sizeof(char));
+
+   out_len = wcstombs(buf, str, len);
+#endif
+
+   if (out_len < 0)
+   {
+      free(buf);
+      return NULL;
+   }
+
+   return buf;
 }
