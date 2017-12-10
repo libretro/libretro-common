@@ -297,6 +297,10 @@ static char* mb_to_mb_string_alloc(const char *str,
    return strdup(str);
 #else
 
+   /* Windows 95 will return 0 from these functions with a UTF8 codepage set without MSLU. From an unknown MSDN version (others omit this info):
+    *   - CP_UTF8 Windows 98/Me, Windows NT 4.0 and later: Translate using UTF-8. When this is set, dwFlags must be zero.
+    *   - Windows 95: Under the Microsoft Layer for Unicode, MultiByteToWideChar also supports CP_UTF7 and CP_UTF8.
+    */
    path_buf_wide_len = MultiByteToWideChar(cp_in, 0, str, -1, NULL, 0);
 
    if (path_buf_wide_len)
@@ -334,9 +338,16 @@ static char* mb_to_mb_string_alloc(const char *str,
                   return NULL;
                }
             }
+            else
+            {
+               free(path_buf_wide);
+               return strdup(str);
+            }
          }
       }
    }
+   else
+      return strdup(str);
 
    if (path_buf_wide)
       free(path_buf_wide);
@@ -384,6 +395,21 @@ wchar_t* utf8_to_utf16_string_alloc(const char *str)
          return NULL;
 
       out_len = MultiByteToWideChar(CP_UTF8, 0, str, -1, buf, len);
+   }
+   else
+   {
+      /* fallback to ANSI codepage instead */
+      len = MultiByteToWideChar(CP_ACP, 0, str, -1, NULL, 0);
+
+      if (len)
+      {
+         buf = (wchar_t*)calloc(len, sizeof(wchar_t));
+
+         if (!buf)
+            return NULL;
+
+         out_len = MultiByteToWideChar(CP_ACP, 0, str, -1, buf, len);
+      }
    }
 
    if (out_len < 0)
@@ -441,6 +467,21 @@ char* utf16_to_utf8_string_alloc(const wchar_t *str)
          return NULL;
 
       out_len = WideCharToMultiByte(CP_UTF8, 0, str, -1, buf, len, NULL, NULL);
+   }
+   else
+   {
+      /* fallback to ANSI codepage instead */
+      len = WideCharToMultiByte(CP_ACP, 0, str, -1, NULL, 0, NULL, NULL);
+
+      if (len)
+      {
+         buf = (char*)calloc(len, sizeof(char));
+
+         if (!buf)
+            return NULL;
+
+         out_len = WideCharToMultiByte(CP_ACP, 0, str, -1, buf, len, NULL, NULL);
+      }
    }
 
    if (out_len < 0)
