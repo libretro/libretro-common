@@ -62,7 +62,7 @@ CC      := $(compiler)
 CXX     := $(subst CC,++,$(compiler))
 flags   := -fPIC $(extra_flags) -I$(LIBRETRO_COMM_DIR)/include
 asflags := -fPIC  $(extra_flags)
-LDFLAGS := 
+LDFLAGS :=
 flags   += -std=c99 -DMD5_BUILD_UTILITY -DSHA1_BUILD_UTILITY
 
 
