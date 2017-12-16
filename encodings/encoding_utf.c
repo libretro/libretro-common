@@ -35,7 +35,7 @@
 #include <windows.h>
 #endif
 
-static INLINE unsigned leading_ones(uint8_t c)
+static unsigned leading_ones(uint8_t c)
 {
    unsigned ones = 0;
    while (c & 0x80)
@@ -209,7 +209,7 @@ size_t utf8len(const char *string)
    return ret;
 }
 
-static INLINE uint8_t utf8_walkbyte(const char **string)
+static uint8_t utf8_walkbyte(const char **string)
 {
    return *((*string)++);
 }
@@ -282,7 +282,7 @@ static char* mb_to_mb_string_alloc(const char *str,
 
    if (!str || !*str)
       return NULL;
-    
+
    (void)path_buf;
    (void)path_buf_wide;
    (void)path_buf_len;
@@ -390,7 +390,7 @@ wchar_t* utf8_to_utf16_string_alloc(const char *str)
    if (len)
    {
       buf = (wchar_t*)calloc(len, sizeof(wchar_t));
-      
+
       if (!buf)
          return NULL;
 
@@ -424,7 +424,7 @@ wchar_t* utf8_to_utf16_string_alloc(const char *str)
    if (len)
    {
       buf = (wchar_t*)calloc(len, sizeof(wchar_t));
-      
+
       if (!buf)
          return NULL;
 

@@ -44,7 +44,6 @@
 #include <file/file_path.h>
 #include <lists/string_list.h>
 #include <string/stdstring.h>
-#include <rhash.h>
 #include <streams/file_stream.h>
 
 #define MAX_INCLUDE_DEPTH 16
@@ -54,7 +53,6 @@ struct config_entry_list
    /* If we got this from an #include,
     * do not allow overwrite. */
    bool readonly;
-   uint32_t key_hash;
 
    char *key;
    char *value;
@@ -79,40 +77,6 @@ struct config_file
 
 static config_file_t *config_file_new_internal(
       const char *path, unsigned depth);
-
-static char *getaline(RFILE *file)
-{
-   char* newline     = (char*)malloc(9);
-   char* newline_tmp = NULL;
-   size_t cur_size   = 8;
-   size_t idx        = 0;
-   int in            = filestream_getc(file);
-
-   if (!newline)
-      return NULL;
-
-   while (in != EOF && in != '\n')
-   {
-      if (idx == cur_size)
-      {
-         cur_size *= 2;
-         newline_tmp = (char*)realloc(newline, cur_size + 1);
-
-         if (!newline_tmp)
-         {
-            free(newline);
-            return NULL;
-         }
-
-         newline = newline_tmp;
-      }
-
-      newline[idx++] = in;
-      in = filestream_getc(file);
-   }
-   newline[idx] = '\0';
-   return newline;
-}
 
 static char *strip_comment(char *str)
 {
@@ -226,7 +190,7 @@ static void add_child_list(config_file_t *parent, config_file_t *child)
    /* Rebase tail. */
    if (parent->entries)
    {
-      struct config_entry_list *head = 
+      struct config_entry_list *head =
          (struct config_entry_list*)parent->entries;
 
       while (head->next)
@@ -347,11 +311,11 @@ static bool parse_line(config_file_t *conf,
 
       key[idx++] = *line++;
    }
-   key[idx] = '\0';
-   list->key = key;
-   list->key_hash = djb2_calculate(key);
+   key[idx]      = '\0';
+   list->key     = key;
 
-   list->value = extract_value(line, true);
+   list->value   = extract_value(line, true);
+
    if (!list->value)
    {
       list->key = NULL;
@@ -390,7 +354,9 @@ static config_file_t *config_file_new_internal(
       goto error;
 
    conf->include_depth = depth;
-   file                = filestream_open(path, RFILE_MODE_READ_TEXT, 0x4000);
+   file                = filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
 
    if (!file)
    {
@@ -411,12 +377,11 @@ static config_file_t *config_file_new_internal(
       }
 
       list->readonly  = false;
-      list->key_hash  = 0;
       list->key       = NULL;
       list->value     = NULL;
       list->next      = NULL;
 
-      line            = getaline(file);
+      line            = filestream_getline(file);
 
       if (!line)
       {
@@ -525,7 +490,7 @@ config_file_t *config_file_new_from_string(const char *from_string)
    conf->tail          = NULL;
    conf->includes      = NULL;
    conf->include_depth = 0;
-   
+
    lines = string_split(from_string, "\n");
    if (!lines)
       return conf;
@@ -543,7 +508,6 @@ config_file_t *config_file_new_from_string(const char *from_string)
       }
 
       list->readonly  = false;
-      list->key_hash  = 0;
       list->key       = NULL;
       list->value     = NULL;
       list->next      = NULL;
@@ -578,17 +542,12 @@ config_file_t *config_file_new(const char *path)
 static struct config_entry_list *config_get_entry(const config_file_t *conf,
       const char *key, struct config_entry_list **prev)
 {
-   struct config_entry_list *entry;
-   struct config_entry_list *previous = NULL;
-
-   uint32_t hash = djb2_calculate(key);
-
-   if (prev)
-      previous = *prev;
+   struct config_entry_list *entry    = NULL;
+   struct config_entry_list *previous = prev ? *prev : NULL;
 
    for (entry = conf->entries; entry; entry = entry->next)
    {
-      if (hash == entry->key_hash && string_is_equal(key, entry->key))
+      if (string_is_equal(key, entry->key))
          return entry;
 
       previous = entry;
@@ -808,7 +767,6 @@ void config_set_string(config_file_t *conf, const char *key, const char *val)
       return;
 
    entry->readonly  = false;
-   entry->key_hash  = 0;
    entry->key       = strdup(key);
    entry->value     = strdup(val);
    entry->next      = NULL;
