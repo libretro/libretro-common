@@ -124,10 +124,10 @@ int64_t retro_vfs_file_seek_internal(libretro_vfs_implementation_file *stream, i
 #ifdef HAVE_MMAP
    /* Need to check stream->mapped because this function is
     * called in filestream_open() */
-   if (stream->mapped && stream->hints & 
+   if (stream->mapped && stream->hints &
          RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS)
    {
-      /* fseek() returns error on under/overflow but 
+      /* fseek() returns error on under/overflow but
        * allows cursor > EOF for
          read-only file descriptors. */
       switch (whence)

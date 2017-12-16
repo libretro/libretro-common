@@ -97,7 +97,7 @@ bool filestream_exists(const char *path)
 
    if (!path || !*path)
       return false;
-   
+
    dummy = filestream_open(path,
          RETRO_VFS_FILE_ACCESS_READ,
          RETRO_VFS_FILE_ACCESS_HINT_NONE);
