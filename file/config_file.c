@@ -709,7 +709,7 @@ bool config_get_array(config_file_t *conf, const char *key,
 bool config_get_path(config_file_t *conf, const char *key,
       char *buf, size_t size)
 {
-#if defined(RARCH_CONSOLE)
+#if defined(RARCH_CONSOLE) || !defined(RARCH_INTERNAL)
    if (config_get_array(conf, key, buf, size))
       return true;
 #else
@@ -791,7 +791,7 @@ void config_unset(config_file_t *conf, const char *key)
 
 void config_set_path(config_file_t *conf, const char *entry, const char *val)
 {
-#if defined(RARCH_CONSOLE)
+#if defined(RARCH_CONSOLE) || !defined(RARCH_INTERNAL)
    config_set_string(conf, entry, val);
 #else
    char buf[PATH_MAX_LENGTH];
@@ -963,3 +963,63 @@ bool config_file_exists(const char *path)
    config_file_free(config);
    return true;
 }
+
+#if 0
+static void test_config_file_parse_contains(
+      const char * cfgtext,
+      const char *key, const char *val)
+{
+   config_file_t *cfg = config_file_new_from_string(cfgtext);
+   char          *out = NULL;
+   bool            ok = false;
+
+   if (!cfg)
+      abort();
+
+   ok = config_get_string(cfg, key, &out);
+   if (ok != (bool)val)
+      abort();
+   if (!val)
+      return;
+
+   if (out == NULL)
+      out = strdup("");
+   if (strcmp(out, val) != 0)
+      abort();
+   free(out);
+}
+
+static void test_config_file(void)
+{
+   test_config_file_parse_contains("foo = \"bar\"\n",   "foo", "bar");
+   test_config_file_parse_contains("foo = \"bar\"",     "foo", "bar");
+   test_config_file_parse_contains("foo = \"bar\"\r\n", "foo", "bar");
+   test_config_file_parse_contains("foo = \"bar\"",     "foo", "bar");
+
+#if 0
+   /* turns out it treats empty as nonexistent - 
+    * should probably be fixed */
+   test_config_file_parse_contains("foo = \"\"\n",   "foo", "");
+   test_config_file_parse_contains("foo = \"\"",     "foo", "");
+   test_config_file_parse_contains("foo = \"\"\r\n", "foo", "");
+   test_config_file_parse_contains("foo = \"\"",     "foo", "");
+#endif
+
+   test_config_file_parse_contains("foo = \"\"\n",   "bar", NULL);
+   test_config_file_parse_contains("foo = \"\"",     "bar", NULL);
+   test_config_file_parse_contains("foo = \"\"\r\n", "bar", NULL);
+   test_config_file_parse_contains("foo = \"\"",     "bar", NULL);
+}
+
+/* compile with:
+ gcc config_file.c -g -I ../include/ \
+ ../streams/file_stream.c ../vfs/vfs_implementation.c ../lists/string_list.c \
+ ../compat/compat_strl.c file_path.c ../compat/compat_strcasestr.c \
+ && ./a.out
+*/
+
+int main(void)
+{
+	test_config_file();
+}
+#endif
