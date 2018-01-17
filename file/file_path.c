@@ -33,6 +33,9 @@
 #include <retro_assert.h>
 #include <string/stdstring.h>
 
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 #ifndef __MACH__
 #include <compat/strl.h>
 #include <compat/posix_string.h>
@@ -1145,8 +1148,6 @@ void fill_pathname_application_path(char *s, size_t len)
          }
       }
    }
-
-   /* RARCH_ERR("Cannot resolve application path! This should not happen.\n"); */
 #endif
 }
 #endif
