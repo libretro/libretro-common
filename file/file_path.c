@@ -367,7 +367,8 @@ const char *path_get_archive_delim(const char *path)
  */
 const char *path_get_extension(const char *path)
 {
-   const char *ext = strrchr(path_basename(path), '.');
+   const char *ext = !string_is_empty(path) 
+      ? strrchr(path_basename(path), '.') : NULL;
    if (!ext)
       return "";
    return ext + 1;
@@ -385,7 +386,8 @@ const char *path_get_extension(const char *path)
  */
 char *path_remove_extension(char *path)
 {
-   char *last = (char*)strrchr(path_basename(path), '.');
+   char *last = !string_is_empty(path) 
+      ? (char*)strrchr(path_basename(path), '.') : NULL;
    if (!last)
       return NULL;
    if (*last)
@@ -493,7 +495,7 @@ char *find_last_slash(const char *str)
  **/
 void fill_pathname_slash(char *path, size_t size)
 {
-   size_t path_len = strlen(path);
+   size_t        path_len = strlen(path);
    const char *last_slash = find_last_slash(path);
 
    /* Try to preserve slash type. */
@@ -595,6 +597,40 @@ void fill_pathname_basedir_noext(char *out_dir,
 }
 
 /**
+ * fill_pathname_parent_dir_name:
+ * @out_dir            : output directory
+ * @in_dir             : input directory
+ * @size               : size of output directory
+ *
+ * Copies only the parent directory name of @in_dir into @out_dir.
+ * The two buffers must not overlap. Removes trailing '/'.
+ * Returns true on success, false if a slash was not found in the path.
+ **/
+bool fill_pathname_parent_dir_name(char *out_dir,
+      const char *in_dir, size_t size)
+{
+   char *temp = strdup(in_dir);
+   char *last = find_last_slash(temp);
+   bool ret = false;
+
+   *last = '\0';
+
+   in_dir = find_last_slash(temp);
+
+   if (in_dir && in_dir + 1)
+   {
+      strlcpy(out_dir, in_dir + 1, size);
+      ret = true;
+   }
+   else
+      ret = false;
+
+   free(temp);
+
+   return ret;
+}
+
+/**
  * fill_pathname_parent_dir:
  * @out_dir            : output directory
  * @in_dir             : input directory
@@ -655,9 +691,10 @@ void fill_str_dated_filename(char *out_filename,
    format[0] = '\0';
 
    strftime(format, sizeof(format), "-%y%m%d-%H%M%S.", localtime(&cur_time));
-   strlcpy(out_filename, in_str, size);
-   strlcat(out_filename, format, size);
-   strlcat(out_filename, ext, size);
+
+   fill_pathname_join_concat_noext(out_filename,
+         in_str, format, ext,
+         size);
 }
 
 /**
@@ -837,6 +874,16 @@ void fill_pathname_join_special_ext(char *out_path,
 
    strlcat(out_path, last, size);
    strlcat(out_path, ext, size);
+}
+
+void fill_pathname_join_concat_noext(
+      char *out_path,
+      const char *dir, const char *path,
+      const char *concat,
+      size_t size)
+{
+   fill_pathname_noext(out_path, dir, path, size);
+   strlcat(out_path, concat, size);
 }
 
 void fill_pathname_join_concat(char *out_path,

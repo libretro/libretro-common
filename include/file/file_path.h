@@ -291,6 +291,19 @@ void fill_pathname_basedir_noext(char *out_dir,
       const char *in_path, size_t size);
 
 /**
+ * fill_pathname_parent_dir_name:
+ * @out_dir            : output directory
+ * @in_dir             : input directory
+ * @size               : size of output directory
+ *
+ * Copies only the parent directory name of @in_dir into @out_dir.
+ * The two buffers must not overlap. Removes trailing '/'.
+ * Returns true on success, false if a slash was not found in the path.
+ **/
+bool fill_pathname_parent_dir_name(char *out_dir,
+      const char *in_dir, size_t size);
+
+/**
  * fill_pathname_parent_dir:
  * @out_dir            : output directory
  * @in_dir             : input directory
@@ -334,6 +347,12 @@ void fill_pathname_join(char *out_path, const char *dir,
 void fill_pathname_join_special_ext(char *out_path,
       const char *dir,  const char *path,
       const char *last, const char *ext,
+      size_t size);
+
+void fill_pathname_join_concat_noext(
+      char *out_path,
+      const char *dir, const char *path,
+      const char *concat,
       size_t size);
 
 void fill_pathname_join_concat(char *out_path,
