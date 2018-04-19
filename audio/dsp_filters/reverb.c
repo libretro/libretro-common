@@ -192,17 +192,18 @@ static void revmodel_init(struct revmodel *rev,int srate)
   static const int comb_lengths[8] = { 1116,1188,1277,1356,1422,1491,1557,1617 };
   static const int allpass_lengths[4] = { 225,341,441,556 };
   double r = srate * (1 / 44100.0);
+  unsigned c;
 
    rev->bufcomb=malloc(numcombs*sizeof(float*));
-   for (int c = 0; c < numcombs; ++c)
+   for (c = 0; c < numcombs; ++c)
    {
 	   rev->bufcomb[c] = malloc(r*comb_lengths[c]*sizeof(float));
 	   rev->combL[c].buffer  =  rev->bufcomb[c];
          rev->combL[c].bufsize=r*comb_lengths[c];
   }
 
-  rev->bufallpass=(float**)malloc(numallpasses*sizeof(float*));
-   for (int c = 0; c < numallpasses; ++c)
+  rev->bufallpass=malloc(numallpasses*sizeof(float*));
+   for (c = 0; c < numallpasses; ++c)
    {
 	   rev->bufallpass[c] = malloc(r*allpass_lengths[c]*sizeof(float));
 	   rev->allpassL[c].buffer  =  rev->bufallpass[c];
@@ -230,15 +231,16 @@ struct reverb_data
 static void reverb_free(void *data)
 {
    struct reverb_data *rev = (struct reverb_data*)data;
+   unsigned i;
 
-   for (int i = 0; i < numcombs; i++) {
+   for (i = 0; i < numcombs; i++) {
    free(rev->left.bufcomb[i]);
    free(rev->right.bufcomb[i]);
    }
    free(rev->left.bufcomb);
    free(rev->right.bufcomb);
 
-   for (int i = 0; i < numallpasses; i++) {
+   for (i = 0; i < numallpasses; i++) {
    free(rev->left.bufallpass[i]);
    free(rev->right.bufallpass[i]);
    }
