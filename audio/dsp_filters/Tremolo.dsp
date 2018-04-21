@@ -1,7 +1,7 @@
 filters = 1
-filter0 = vibrato
+filter0 = tremolo
 
 # Defaults.
-#vibrato_frequency = 5.0
-#vibrato_depth = 0.5
+#tremolo_frequency = 4.0
+#tremolo_depth = 0.9
 
