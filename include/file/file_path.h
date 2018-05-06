@@ -100,13 +100,35 @@ const char *path_get_extension(const char *path);
  * path_remove_extension:
  * @path               : path
  *
- * Removes the extension from the path and returns the result.
- * Removes all text after and including the last '.'.
+ * Mutates path by removing its extension. Removes all
+ * text after and including the last '.'.
  * Only '.'s after the last slash are considered.
  *
- * Returns: path with the extension part removed.
+ * Returns: 
+ * 1) If path has an extension, returns path with the
+ *    extension removed.
+ * 2) If there is no extension, returns NULL.
+ * 3) If path is empty or NULL, returns NULL 
+ *
+ * See also: path_no_extension
  */
 char *path_remove_extension(char *path);
+
+/**
+ * path_no_extension:
+ * @path               : path
+ *
+ * Mutates path by removing its extension, if any. Removes
+ * all text after and including the last '.'.
+ * Only '.'s after the last slash are considered.
+ *
+ * Returns:
+ * 1) If path had no extension, returns path
+ * 2) If path had an extension, returns path with the
+ *    extension removed
+ * 3) If path is empty or NULL, returns NULL 
+ */
+char *path_no_extension(char *path);
 
 /**
  * path_basename:
@@ -432,7 +454,7 @@ void path_basedir_wrapper(char *path);
 #endif
 
 /**
- * path_default_slash and path_default_slash_c:
+ * path_default_slash:
  *
  * Gets the default slash separator.
  *
@@ -440,10 +462,8 @@ void path_basedir_wrapper(char *path);
  */
 #ifdef _WIN32
 #define path_default_slash() "\\"
-#define path_default_slash_c() '\\'
 #else
 #define path_default_slash() "/"
-#define path_default_slash_c() '/'
 #endif
 
 /**
