@@ -378,22 +378,49 @@ const char *path_get_extension(const char *path)
  * path_remove_extension:
  * @path               : path
  *
- * Removes the extension from the path and returns the result.
- * Removes all text after and including the last '.'.
+ * Mutates path by removing its extension. Removes all
+ * text after and including the last '.'.
  * Only '.'s after the last slash are considered.
  *
- * Returns: path with the extension part removed.
- * If there is no extension at the end of path,
- * returns a pointer to the unaltered original path.
+ * Returns: 
+ * 1) If path has an extension, returns path with the
+ *    extension removed.
+ * 2) If there is no extension, returns NULL.
+ * 3) If path is empty or NULL, returns NULL 
+ *
+ * See also: path_no_extension
  */
 char *path_remove_extension(char *path)
 {
-   char *last = !string_is_empty(path) 
-      ? (char*)strrchr(path_basename(path), '.') : NULL;
-   if (!last)
+   if (string_is_empty(path_get_extension(path)))
       return NULL;
-   if (*last)
+
+   return path_no_extension(path);
+}
+
+/**
+ * path_no_extension:
+ * @path               : path
+ *
+ * Mutates path by removing its extension, if any. Removes
+ * all text after and including the last '.'.
+ * Only '.'s after the last slash are considered.
+ *
+ * Returns:
+ * 1) If path had no extension, returns path
+ * 2) If path had an extension, returns path with the
+ *    extension removed
+ * 3) If path is empty or NULL, returns NULL 
+ */
+char *path_no_extension(char *path)
+{
+   if(string_is_empty(path))
+     return NULL;
+   
+   char *last = (char*)strrchr(path_basename(path), '.');
+   if (last)
       *last = '\0';
+
    return path;
 }
 
