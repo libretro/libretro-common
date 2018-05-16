@@ -544,7 +544,7 @@ enum retro_mod
                                             * use the directory where the content is located by inspecting
                                             * game->path.
                                             *
-                                            * NOTE: Historically some cores used this folder "save" data such as
+                                            * NOTE: Historically some cores used this folder for "save" data such as
                                             * memory cards, etc. That behavior is deprecated when GET_SAVE_DIRECTORY
                                             * is available.
                                             */
