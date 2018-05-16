@@ -530,16 +530,23 @@ enum retro_mod
 #define RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY 9
                                            /* const char ** --
                                             * Returns the "system" directory of the frontend.
-                                            * This directory can be used to store system specific
+                                            * This directory should be used to store system specific
                                             * content such as BIOSes, configuration data, etc.
-                                            * The returned value can be NULL.
-                                            * If so, no such directory is defined,
-                                            * and it's up to the implementation to find a suitable directory.
                                             *
-                                            * NOTE: Some cores used this folder also for "save" data such as
-                                            * memory cards, etc, for lack of a better place to put it.
-                                            * This is now discouraged, and if possible, cores should try to
-                                            * use the new GET_SAVE_DIRECTORY.
+                                            * If the frontend cannot designate a system directory, it will return
+                                            * NULL to indicate that the core should attempt to operate without a
+                                            * system directory set.
+                                            *
+                                            * The libretro API does not support the frontend changing the
+                                            * system directory during core operation. It is recommended to
+                                            * check the system directory once during retro_load_game() so that
+                                            * if a system directory is unavailable, the core has the option to
+                                            * use the directory where the content is located by inspecting
+                                            * game->path.
+                                            *
+                                            * NOTE: Historically some cores used this folder "save" data such as
+                                            * memory cards, etc. That behavior is deprecated when GET_SAVE_DIRECTORY
+                                            * is available.
                                             */
 #define RETRO_ENVIRONMENT_SET_PIXEL_FORMAT 10
                                            /* const enum retro_pixel_format * --
@@ -772,9 +779,17 @@ enum retro_mod
                                             * This directory can be used to store specific assets that the
                                             * core relies upon, such as art assets,
                                             * input data, etc etc.
-                                            * The returned value can be NULL.
-                                            * If so, no such directory is defined,
-                                            * and it's up to the implementation to find a suitable directory.
+                                            *
+                                            * If the frontend cannot designate an assets directory, it will return
+                                            * NULL to indicate that the core should attempt to operate without a
+                                            * assets directory set.
+                                            *
+                                            * The libretro API does not support the frontend changing the
+                                            * assets directory during core operation. It is recommended to
+                                            * check the assets directory once during retro_load_game() so that
+                                            * if an asset directory is unavailable, the core has the option to
+                                            * use the directory where the content is located by inspecting
+                                            * game->path.                                         
                                             */
 #define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY 31
                                            /* const char ** --
@@ -787,7 +802,14 @@ enum retro_mod
                                             * NULL to indicate that the core should attempt to operate without a
                                             * save directory set.
                                             *
-                                            * NOTE: early libretro cores used the system directory for save
+                                            * The libretro API does not support the frontend changing the
+                                            * save directory during core operation. It is recommended to
+                                            * check the save directory once during retro_load_game() so that
+                                            * if a save directory is unavailable, the core has the option to
+                                            * use the directory where the content is located by inspecting
+                                            * game->path.
+                                            *
+                                            * NOTE: Early libretro cores used the system directory for save
                                             * files. Cores that need to be backwards-compatible can still check
                                             * GET_SYSTEM_DIRECTORY.
                                             */
