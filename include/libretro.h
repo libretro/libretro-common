@@ -668,13 +668,14 @@ enum retro_mod
                                             */
 #define RETRO_ENVIRONMENT_GET_LIBRETRO_PATH 19
                                            /* const char ** --
-                                            * Retrieves the absolute path from where this libretro
-                                            * implementation was loaded.
-                                            * NULL is returned if the libretro was loaded statically
+                                            * Retrieves the absolute path from which the active libretro
+                                            * core was loaded.
+                                            * NULL is returned if the core was loaded statically
                                             * (i.e. linked statically to frontend), or if the path cannot be
                                             * determined.
-                                            * Mostly useful in cooperation with SET_SUPPORT_NO_GAME as assets can
-                                            * be loaded without ugly hacks.
+                                            * Useful in cooperation with SET_SUPPORT_NO_GAME as a final
+                                            * fallback when system, save, and asset directories cannot because
+                                            * determined.
                                             */
 
                                            /* Environment 20 was an obsolete version of SET_AUDIO_CALLBACK.
