@@ -286,7 +286,7 @@ enum retro_language
 /* Regular save RAM. This RAM is usually found on a game cartridge,
  * backed up by a battery.
  * If save game data is too complex for a single memory buffer,
- * the SAVE_DIRECTORY callback can be used.
+ * the SAVE_DIRECTORY callback should be used.
  */
 #define RETRO_MEMORY_SAVE_RAM    0
 
