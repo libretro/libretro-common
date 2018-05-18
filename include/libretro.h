@@ -539,7 +539,7 @@ enum retro_mod
                                             *
                                             * The frontend should use its knowledge of the environment to find
                                             * any possible fallbacks and if not return NULL to indicate that no
-                                            * system directory is available and so core can determine whether to
+                                            * system directory is available so the core can determine whether to
                                             * operate without a system directory set.
                                             *
                                             * One historical fallback at times when it is impossible to
@@ -803,7 +803,7 @@ enum retro_mod
                                             *
                                             * The frontend should use its knowledge of the environment to find
                                             * any possible fallbacks and if not return NULL to indicate that no
-                                            * assets directory is available and so core can determine whether to
+                                            * assets directory is available so the core can determine whether to
                                             * operate without a system directory set.
                                             *
                                             * FOR CORES
@@ -828,7 +828,7 @@ enum retro_mod
                                             *
                                             * The frontend should use its knowledge of the environment to find
                                             * any possible fallbacks and if not return NULL to indicate that no
-                                            * save directory is available and so core can determine whether to
+                                            * save directory is available so the core can determine whether to
                                             * operate without a save directory set.
                                             *
                                             * One historical fallback at times when it is impossible to
