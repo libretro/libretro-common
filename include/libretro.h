@@ -286,8 +286,8 @@ enum retro_language
 /* Regular save RAM. This RAM is usually found on a game cartridge,
  * backed up by a battery.
  * If save game data is too complex for a single memory buffer,
- * the SAVE_DIRECTORY (preferably) or SYSTEM_DIRECTORY environment
- * callback can be used. */
+ * the SAVE_DIRECTORY callback can be used.
+ */
 #define RETRO_MEMORY_SAVE_RAM    0
 
 /* Some games have a built-in clock to keep track of time.
@@ -531,22 +531,38 @@ enum retro_mod
                                            /* const char ** --
                                             * Returns the "system" directory of the frontend.
                                             * This directory should be used to store system specific
-                                            * content such as BIOSes, configuration data, etc.
+                                            * content such as BIOSes or static metadata data and config files.
+                                            * 
+                                            * FOR FRONTENDS
+                                            * When possible, frontends should specify a system directory
+                                            * and ensure that the directory exists with at least "read" access.
                                             *
-                                            * If the frontend cannot designate a system directory, it will return
-                                            * NULL to indicate that the core should attempt to operate without a
-                                            * system directory set.
+                                            * The frontend should use its knowledge of the environment to find
+                                            * any possible fallbacks and if not return NULL to indicate that no
+                                            * system directory is available and so core can determine whether to
+                                            * operate without a system directory set.
                                             *
+                                            * One historical fallback at times when it is impossible to
+                                            * designate a separate system folder has been to use the same
+                                            * directory as the content being loaded, although this approach
+                                            * does not work for contentless cores.
+                                            *
+                                            * FOR CORES
                                             * The libretro API does not support the frontend changing the
                                             * system directory during core operation. It is recommended to
-                                            * check the system directory once during retro_load_game() so that
-                                            * if a system directory is unavailable, the core has the option to
-                                            * use the directory where the content is located by inspecting
-                                            * game->path.
+                                            * check the system directory once, by convention during retro_load_game().
                                             *
-                                            * NOTE: Historically some cores used this folder for "save" data such as
-                                            * memory cards, etc. That behavior is deprecated when GET_SAVE_DIRECTORY
-                                            * is available.
+                                            * It is recommended that cores use a subfolder of the the system
+                                            * directory with the same name as the core to keep from cluttering
+                                            * environments with a shared system directory.
+                                            *
+                                            * Historically, if provided a NULL value some cores would try to use the
+                                            * path of the content being loaded by inspecting game->path during 
+                                            * retro_load_game()in case the frontend did not implement its own path
+                                            * checking.
+                                            *
+                                            * NOTE: Historically some cores used the system folder for "save" data such as
+                                            * memory cards, etc. That behavior is deprecated.
                                             */
 #define RETRO_ENVIRONMENT_SET_PIXEL_FORMAT 10
                                            /* const enum retro_pixel_format * --
@@ -776,42 +792,62 @@ enum retro_mod
 #define RETRO_ENVIRONMENT_GET_CORE_ASSETS_DIRECTORY 30
                                            /* const char ** --
                                             * Returns the "core assets" directory of the frontend.
-                                            * This directory can be used to store specific assets that the
-                                            * core relies upon, such as art assets,
-                                            * input data, etc etc.
+                                            * This directory should be used to store optional assets for the
+                                            * core, as opposed to the system folder. Examples of assets include
+                                            * artwork, input data, etc.
                                             *
-                                            * If the frontend cannot designate an assets directory, it will return
-                                            * NULL to indicate that the core should attempt to operate without a
-                                            * assets directory set.
+                                            * FOR FRONTENDS
+                                            * When possible, frontends should specify a system directory
+                                            * and ensure that the directory exists with at least "read" access.
                                             *
+                                            * The frontend should use its knowledge of the environment to find
+                                            * any possible fallbacks and if not return NULL to indicate that no
+                                            * assets directory is available and so core can determine whether to
+                                            * operate without a system directory set.
+                                            *
+                                            * FOR CORES
                                             * The libretro API does not support the frontend changing the
                                             * assets directory during core operation. It is recommended to
-                                            * check the assets directory once during retro_load_game() so that
-                                            * if an asset directory is unavailable, the core has the option to
-                                            * use the directory where the content is located by inspecting
-                                            * game->path.                                         
+                                            * check the assets directory once, by convention during retro_load_game().
+                                            *
+                                            * It is recommended that cores use a subfolder of the the assets
+                                            * directory with the same name as the core to keep from cluttering
+                                            * environments with a shared system directory.                               
                                             */
 #define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY 31
                                            /* const char ** --
-                                            * Returns the "save" directory of the frontend, unless there is no
-                                            * save directory available. The save directory should be used to
-                                            * store SRAM, memory cards, high scores, etc, if the libretro core
-                                            * cannot use the regular memory interface (retro_get_memory_data()).
+                                            * Returns the "save" directory of the frontend.
+                                            * The save directory should be used to store SRAM, memory cards,
+                                            * high scores, etc, if the libretro core cannot use the regular memory
+                                            * interface (retro_get_memory_data()).
                                             *
-                                            * If the frontend cannot designate a save directory, it will return
-                                            * NULL to indicate that the core should attempt to operate without a
-                                            * save directory set.
+                                            * FOR FRONTENDS
+                                            * When possible, frontends should specify a save directory
+                                            * and ensure that the directory exists with read and write access.
                                             *
+                                            * The frontend should use its knowledge of the environment to find
+                                            * any possible fallbacks and if not return NULL to indicate that no
+                                            * save directory is available and so core can determine whether to
+                                            * operate without a save directory set.
+                                            *
+                                            * One historical fallback at times when it is impossible to
+                                            * designate a separate save folder has been to use the same
+                                            * directory as the content being loaded, although this approach
+                                            * does not work for contentless cores.
+                                            *
+                                            * FOR CORES
                                             * The libretro API does not support the frontend changing the
                                             * save directory during core operation. It is recommended to
-                                            * check the save directory once during retro_load_game() so that
-                                            * if a save directory is unavailable, the core has the option to
-                                            * use the directory where the content is located by inspecting
-                                            * game->path.
+                                            * check the save directory once, by convention during retro_load_game().
                                             *
-                                            * NOTE: Early libretro cores used the system directory for save
-                                            * files. Cores that need to be backwards-compatible can still check
-                                            * GET_SYSTEM_DIRECTORY.
+                                            * It is recommended that cores use a subfolder of the the save
+                                            * directory with the same name as the core to keep from cluttering
+                                            * environments with a shared save directory.
+                                            *
+                                            * Historically, if provided a NULL value some cores would try to use the
+                                            * path of the content being loaded by inspecting game->path during 
+                                            * retro_load_game()in case the frontend did not implement its own path
+                                            * checking.
                                             */
 #define RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO 32
                                            /* const struct retro_system_av_info * --
