@@ -552,7 +552,7 @@ enum retro_mod
                                             * system directory during core operation. It is recommended to
                                             * check the system directory once, by convention during retro_load_game().
                                             *
-                                            * It is recommended that cores use a subfolder of the the system
+                                            * It is recommended that cores use a subfolder of the system
                                             * directory with the same name as the core to keep from cluttering
                                             * environments with a shared system directory.
                                             *
@@ -811,7 +811,7 @@ enum retro_mod
                                             * assets directory during core operation. It is recommended to
                                             * check the assets directory once, by convention during retro_load_game().
                                             *
-                                            * It is recommended that cores use a subfolder of the the assets
+                                            * It is recommended that cores use a subfolder of the assets
                                             * directory with the same name as the core to keep from cluttering
                                             * environments with a shared system directory.                               
                                             */
@@ -841,7 +841,7 @@ enum retro_mod
                                             * save directory during core operation. It is recommended to
                                             * check the save directory once, by convention during retro_load_game().
                                             *
-                                            * It is recommended that cores use a subfolder of the the save
+                                            * It is recommended that cores use a subfolder of the save
                                             * directory with the same name as the core to keep from cluttering
                                             * environments with a shared save directory.
                                             *
