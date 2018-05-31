@@ -801,7 +801,6 @@ enum retro_mod
                                             * and it's up to the implementation to find a suitable directory.
                                             */
 #define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY 31
-#define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY 31
                                            /* 
                                             * RETURNS  ----------------------
                                             * const char **: the "save" directory of the frontend.
