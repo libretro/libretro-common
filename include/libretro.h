@@ -556,7 +556,7 @@ enum retro_mod
                                             *
                                             * HISTORICAL NOTES  -------------
                                             * 1. Before RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY was added to the libretro
-                                            * API, cores conventionallly woul use the path of the content being loaded
+                                            * API, cores conventionallly would use the path of the content being loaded
                                             * by inspecting content->path during retro_load_game(). This approach can
                                             * still be used for cores that need to support frontends from before
                                             * RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY became part of the API.
