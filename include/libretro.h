@@ -562,7 +562,7 @@ enum retro_mod
                                             * RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY became part of the API.
                                             * 2. After RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY was added, but before
                                             * RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY was added to the libretro
-                                            * API, cores conventionally used the SYSTEM directory for "save" data that
+                                            * API, cores conventionally used the SYSTEM directory for "save" data. That
                                             * behavior is no longer recommended.
                                             */
 #define RETRO_ENVIRONMENT_SET_PIXEL_FORMAT 10
