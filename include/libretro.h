@@ -806,7 +806,7 @@ enum retro_mod
                                             * RETURNS  ----------------------
                                             * const char **: the "save" directory of the frontend.
                                             *
-                                            * The SAVE directory should be used to store SRAM, memory cards, high scors,
+                                            * The SAVE directory should be used to store SRAM, memory cards, high scores,
                                             * and any other core-generated data if the core cannot use the regular memory
                                             * interface (retro_get_memory_data()).
                                             *
