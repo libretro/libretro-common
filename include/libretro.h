@@ -2350,7 +2350,13 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info);
  * will only poll input based on that particular device type. It is only a
  * hint to the libretro core when a core cannot automatically detect the
  * appropriate input device type on its own. It is also relevant when a
- * core can change its behavior depending on device type. */
+ * core can change its behavior depending on device type.
+ *
+ * As part of the core's implementation of retro_set_controller_port_device,
+ * the core should call RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS to notify the
+ * frontend if the descriptions for any controls have changed as a
+ * result of changing the device type.
+ */
 RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device);
 
 /* Resets the current game. */
