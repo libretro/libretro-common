@@ -218,11 +218,17 @@ int filestream_scanf(RFILE *stream, const char* format, ...)
          int subret;
          int sublen;
          
-         *subfmtiter++ = *format++;
+         bool asterisk = false;
+         
+         *subfmtiter++ = *format++; /* '%' */
          
          /* %[*][width][length]specifier */
          
-         if (*subfmtiter == '*') abort(); /* unimplemented */
+         if (*format == '*')
+         {
+            asterisk = true;
+            *subfmtiter++ = *format++;
+         }
          
          while (isdigit(*format)) *subfmtiter++ = *format++; /* width */
          
@@ -237,16 +243,27 @@ int filestream_scanf(RFILE *stream, const char* format, ...)
             *subfmtiter++ = *format++;
          }
          
-         /* specifier - always a single character */
-         if (*format == '[') abort(); /* unimplemented */
-         *subfmtiter++ = *format++;
+         /* specifier - always a single character (except ]) */
+         if (*format == '[')
+         {
+            *subfmtiter++ = *format++;
+            while (*format != ']') *subfmtiter++ = *format++;
+         }
+         else *subfmtiter++ = *format++;
          
          *subfmtiter++ = '%';
          *subfmtiter++ = 'n';
          *subfmtiter++ = '\0';
          
          if (sizeof(void*) != sizeof(long*)) abort(); /* all pointers must have the same size */
-         if (sscanf(bufiter, subfmt, va_arg(args, void*), &sublen) != 1) break;
+         if (asterisk)
+         {
+            if (sscanf(bufiter, subfmt, &sublen) != 0) break;
+         }
+         else
+         {
+            if (sscanf(bufiter, subfmt, va_arg(args, void*), &sublen) != 1) break;
+         }
          
          ret++;
          bufiter += sublen;
