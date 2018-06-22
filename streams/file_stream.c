@@ -246,8 +246,8 @@ int filestream_scanf(RFILE *stream, const char* format, ...)
          /* specifier - always a single character (except ]) */
          if (*format == '[')
          {
-            *subfmtiter++ = *format++;
             while (*format != ']') *subfmtiter++ = *format++;
+            *subfmtiter++ = *format++;
          }
          else *subfmtiter++ = *format++;
          
