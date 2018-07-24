@@ -2205,6 +2205,10 @@ struct retro_system_info
     *    - retro_game_info::path may be NULL
     *    - retro_game_info::data and retro_game_info::size are guaranteed
     *      to be valid
+    *
+    * See also: 
+    *    - RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY
+    *    - RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY
     */
    bool        need_fullpath;
 
