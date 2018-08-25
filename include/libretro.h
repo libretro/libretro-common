@@ -2209,7 +2209,8 @@ struct retro_system_info
     *    - retro_game_info::data and retro_game_info::size are invalid
     *
     * If need_fullpath is false and retro_load_game() is called:
-    *    - retro_game_info::path may be NULL
+    *    - retro_game_info::path will contain the filename of the content
+    *      being loaded (ie the basename of the content)
     *    - retro_game_info::data and retro_game_info::size are guaranteed
     *      to be valid
     *
