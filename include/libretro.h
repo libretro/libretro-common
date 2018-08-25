@@ -2210,9 +2210,13 @@ struct retro_system_info
     *
     * If need_fullpath is false and retro_load_game() is called:
     *    - retro_game_info::path will contain the filename of the content
-    *      being loaded (ie the basename of the content)
+    *      being loaded (ie the basename of the content).
     *    - retro_game_info::data and retro_game_info::size are guaranteed
     *      to be valid
+    *    - Note: Historically frontends were not guaranteed to return a
+    *      path or filename when need_fullpath is false. Cores needing
+    *      to remain compatible with legacy frontends should ensure that
+    *      retro_game_info::path is valid.
     *
     * See also: 
     *    - RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY
