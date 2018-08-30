@@ -208,7 +208,7 @@ static void revmodel_init(struct revmodel *rev,int srate)
 	   rev->allpassL[c].buffer  =  rev->bufallpass[c];
          memset(rev->allpassL[c].buffer,0,r*allpass_lengths[c]*sizeof(float));
          rev->allpassL[c].bufsize=r*allpass_lengths[c];
-         rev->allpassL[0].feedback = 0.5f;
+         rev->allpassL[c].feedback = 0.5f;
   }
 
    revmodel_setwet(rev, initialwet);
