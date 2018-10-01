@@ -1,7 +1,7 @@
-/* Copyright (C) 2010-2018 The RetroArch team
+/* Copyright  (C) 2010-2016 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this libretro SDK code part (glsym).
+ * The following license statement only applies to this file (retro_stat.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -20,23 +20,44 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef __LIBRETRO_SDK_GLSYM_H__
-#define __LIBRETRO_SDK_GLSYM_H__
+#ifndef __RETRO_STAT_H
+#define __RETRO_STAT_H
 
-#include "rglgen.h"
+#include <stdint.h>
+#include <stddef.h>
 
-#ifndef HAVE_PSGL
-#if defined(HAVE_OPENGLES2)
-#include "glsym_es2.h"
-#elif defined(HAVE_OPENGLES3)
-#include "glsym_es3.h"
-#else
-#ifdef HAVE_LIBNX
-#include "switch/nx_glsym.h"
-#endif
-#include "glsym_gl.h"
-#endif
-#endif
+#include <retro_common_api.h>
+
+#include <boolean.h>
+
+RETRO_BEGIN_DECLS
+
+/**
+ * path_is_directory:
+ * @path               : path
+ *
+ * Checks if path is a directory.
+ *
+ * Returns: true (1) if path is a directory, otherwise false (0).
+ */
+bool path_is_directory(const char *path);
+
+bool path_is_character_special(const char *path);
+
+bool path_is_valid(const char *path);
+
+int32_t path_get_size(const char *path);
+
+/**
+ * path_mkdir_norecurse:
+ * @dir                : directory
+ *
+ * Create directory on filesystem.
+ *
+ * Returns: true (1) if directory could be created, otherwise false (0).
+ **/
+bool mkdir_norecurse(const char *dir);
+
+RETRO_END_DECLS
 
 #endif
-
