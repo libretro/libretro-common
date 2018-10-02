@@ -1069,7 +1069,12 @@ enum retro_mod
                                            /* struct retro_midi_interface ** --
                                             * Returns a MIDI interface that can be used for raw data I/O.
                                             */
-#define RETRO_ENVIRONMENT_SET_ACTIVE_PORT_COUNT (49 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+#define RETRO_ENVIRONMENT_GET_FASTFORWARDING (49 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+                                            /* bool * --
+                                            * Boolean value that indicates whether or not the frontend is in
+                                            * fastforwarding mode.
+                                            */
+#define RETRO_ENVIRONMENT_SET_ACTIVE_PORT_COUNT (50 | RETRO_ENVIRONMENT_EXPERIMENTAL)
                                            /* uint32_t * --
                                             * Provides a count to the front-end stating how many controller ports are 
                                             * actively being monitored by the core. This may be fewer than the highest
