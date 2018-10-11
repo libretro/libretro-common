@@ -92,6 +92,8 @@ int rferror(RFILE* stream);
 
 int rfeof(RFILE* stream);
 
+int rfscanf(RFILE * stream, const char * format, ...);
+
 RETRO_END_DECLS
 
 #endif
