@@ -528,7 +528,6 @@ enum retro_mod
                                             */
 #define RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY 9
                                            /* 
-                                            * RETURNS  ----------------------
                                             * const char **: the "system" directory of the frontend.
                                             *
                                             * This directory should be used to store static core-specific data such
@@ -802,7 +801,6 @@ enum retro_mod
                                             */
 #define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY 31
                                            /* 
-                                            * RETURNS  ----------------------
                                             * const char **: the "save" directory of the frontend.
                                             *
                                             * The SAVE directory should be used to store SRAM, memory cards, high scores,
