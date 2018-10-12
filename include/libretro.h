@@ -825,7 +825,6 @@ enum retro_mod
                                             * check the SAVE directory once, by convention during retro_load_game().
                                             *
                                             */
-                                            */
 #define RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO 32
                                            /* const struct retro_system_av_info * --
                                             * Sets a new av_info structure. This can only be called from
