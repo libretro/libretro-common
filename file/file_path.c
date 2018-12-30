@@ -79,6 +79,11 @@
 #include <pspkernel.h>
 #endif
 
+#if defined(PS2)
+#include <fileXio_rpc.h>
+#include <fileXio.h>
+#endif
+
 #if defined(__CELLOS_LV2__)
 #include <cell/cell_fs.h>
 #endif
@@ -89,6 +94,12 @@
 
 #if (defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)) || defined(__QNX__) || defined(PSP)
 #include <unistd.h> /* stat() is defined here */
+#endif
+
+#if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
+#ifdef __WINRT__
+#include <uwp/uwp_func.h>
+#endif
 #endif
 
 /* Assume W-functions do not work below Win2K and Xbox platforms */
@@ -122,7 +133,19 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
       return false;
    }
    free(tmp);
+#elif defined(PS2)
+   iox_stat_t buf;
+   char *tmp  = strdup(path);
+   size_t len = strlen(tmp);
+   if (tmp[len-1] == '/')
+      tmp[len-1]='\0';
 
+   if (fileXioGetStat(tmp, &buf) < 0)
+   {
+      free(tmp);
+      return false;
+   }
+   free(tmp);
 #elif defined(__CELLOS_LV2__)
     CellFsStat buf;
     if (cellFsStat(path, &buf) < 0)
@@ -167,13 +190,18 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
 #endif
 
    if (size)
+#if defined(PS2)
+      *size = (int32_t)buf.size;
+#else
       *size = (int32_t)buf.st_size;
-
+#endif
    switch (mode)
    {
       case IS_DIRECTORY:
 #if defined(VITA) || defined(PSP)
          return FIO_S_ISDIR(buf.st_mode);
+#elif defined(PS2)
+         return FIO_S_ISDIR(buf.mode);
 #elif defined(__CELLOS_LV2__)
          return ((buf.st_mode & S_IFMT) == S_IFDIR);
 #elif defined(_WIN32)
@@ -182,7 +210,7 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
          return S_ISDIR(buf.st_mode);
 #endif
       case IS_CHARACTER_SPECIAL:
-#if defined(VITA) || defined(PSP) || defined(__CELLOS_LV2__) || defined(_WIN32)
+#if defined(VITA) || defined(PSP) || defined(PS2) || defined(__CELLOS_LV2__) || defined(_WIN32)
          return false;
 #else
          return S_ISCHR(buf.st_mode);
@@ -230,7 +258,7 @@ static bool path_mkdir_error(int ret)
 {
 #if defined(VITA)
    return (ret == SCE_ERROR_ERRNO_EEXIST);
-#elif defined(PSP) || defined(_3DS) || defined(WIIU) || defined(SWITCH)
+#elif defined(PSP) || defined(PS2) || defined(_3DS) || defined(WIIU) || defined(SWITCH)
    return (ret == -1);
 #else
    return (ret < 0 && errno == EEXIST);
@@ -299,6 +327,8 @@ bool path_mkdir(const char *dir)
       int ret = mkdir(dir, 0755);
 #elif defined(VITA) || defined(PSP)
       int ret = sceIoMkdir(dir, 0777);
+#elif defined(PS2)
+      int ret =fileXioMkdir(dir, 0777);
 #elif defined(__QNX__)
       int ret = mkdir(dir, 0777);
 #else
@@ -981,45 +1011,49 @@ void fill_pathname_expand_special(char *out_path,
       const char *in_path, size_t size)
 {
 #if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
-   if (*in_path == '~')
+   if (in_path[0] == '~')
    {
-      const char *home = getenv("HOME");
-      if (home)
+      char *home_dir = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
+
+      home_dir[0] = '\0';
+
+      fill_pathname_home_dir(home_dir,
+         PATH_MAX_LENGTH * sizeof(char));
+
+      if (*home_dir)
       {
-         size_t src_size = strlcpy(out_path, home, size);
+         size_t src_size = strlcpy(out_path, home_dir, size);
          retro_assert(src_size < size);
 
          out_path  += src_size;
          size      -= src_size;
+
          in_path++;
       }
+
+      free(home_dir);
    }
-   else if ((in_path[0] == ':') &&
-         (
-         (in_path[1] == '/')
-#ifdef _WIN32
-         || (in_path[1] == '\\')
-#endif
-         )
-            )
+   else if (in_path[0] == ':')
    {
-      size_t src_size;
       char *application_dir = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
 
       application_dir[0]    = '\0';
 
-      fill_pathname_application_path(application_dir,
+      fill_pathname_application_dir(application_dir,
             PATH_MAX_LENGTH * sizeof(char));
-      path_basedir_wrapper(application_dir);
 
-      src_size   = strlcpy(out_path, application_dir, size);
-      retro_assert(src_size < size);
+      if (*application_dir)
+      {
+         size_t src_size   = strlcpy(out_path, application_dir, size);
+         retro_assert(src_size < size);
+
+         out_path  += src_size;
+         size      -= src_size;
+
+         in_path++;
+      }
 
       free(application_dir);
-
-      out_path  += src_size;
-      size      -= src_size;
-      in_path   += 2;
    }
 #endif
 
@@ -1034,7 +1068,7 @@ void fill_pathname_abbreviate_special(char *out_path,
    const char *candidates[3];
    const char *notations[3];
    char *application_dir     = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
-   const char *home          = getenv("HOME");
+   char *home_dir            = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
 
    application_dir[0] = '\0';
 
@@ -1046,16 +1080,17 @@ void fill_pathname_abbreviate_special(char *out_path,
    /* ugly hack - use application_dir pointer
     * before filling it in. C89 reasons */
    candidates[0] = application_dir;
-   candidates[1] = home;
+   candidates[1] = home_dir;
    candidates[2] = NULL;
 
    notations [0] = ":";
    notations [1] = "~";
    notations [2] = NULL;
 
-   fill_pathname_application_path(application_dir,
+   fill_pathname_application_dir(application_dir,
          PATH_MAX_LENGTH * sizeof(char));
-   path_basedir_wrapper(application_dir);
+   fill_pathname_home_dir(home_dir,
+         PATH_MAX_LENGTH * sizeof(char));
 
    for (i = 0; candidates[i]; i++)
    {
@@ -1083,6 +1118,7 @@ void fill_pathname_abbreviate_special(char *out_path,
    }
 
    free(application_dir);
+   free(home_dir);
 #endif
 
    retro_assert(strlcpy(out_path, in_path, size) < size);
@@ -1124,7 +1160,7 @@ void fill_pathname_application_path(char *s, size_t len)
   CFBundleRef bundle = CFBundleGetMainBundle();
 #endif
 #ifdef _WIN32
-   DWORD ret;
+   DWORD ret = 0;
    wchar_t wstr[PATH_MAX_LENGTH] = {0};
 #endif
 #ifdef __HAIKU__
@@ -1136,11 +1172,11 @@ void fill_pathname_application_path(char *s, size_t len)
    if (!len)
       return;
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #ifdef LEGACY_WIN32
-   ret    = GetModuleFileNameA(GetModuleHandle(NULL), s, len);
+   ret    = GetModuleFileNameA(NULL, s, len);
 #else
-   ret    = GetModuleFileNameW(GetModuleHandle(NULL), wstr, ARRAY_SIZE(wstr));
+   ret    = GetModuleFileNameW(NULL, wstr, ARRAY_SIZE(wstr));
 
    if (*wstr)
    {
@@ -1207,6 +1243,29 @@ void fill_pathname_application_path(char *s, size_t len)
          }
       }
    }
+#endif
+}
+
+void fill_pathname_application_dir(char *s, size_t len)
+{
+#ifdef __WINRT__
+   strlcpy(s, uwp_dir_install, len);
+#else
+   fill_pathname_application_path(s, len);
+   path_basedir_wrapper(s);
+#endif
+}
+
+void fill_pathname_home_dir(char *s, size_t len)
+{
+#ifdef __WINRT__
+   strlcpy(s, uwp_dir_data, len);
+#else
+   const char *home = getenv("HOME");
+   if (home)
+      strlcpy(s, home, len);
+   else
+      *s = 0;
 #endif
 }
 #endif

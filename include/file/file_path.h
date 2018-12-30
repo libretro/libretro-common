@@ -442,7 +442,7 @@ void path_basedir_wrapper(char *path);
  *
  * Returns: default slash separator.
  */
-#if defined(_WIN32) || defined(_XBOX)
+#ifdef _WIN32
 #define path_default_slash() "\\"
 #define path_default_slash_c() '\\'
 #else
@@ -462,6 +462,8 @@ void fill_pathname_slash(char *path, size_t size);
 
 #if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
 void fill_pathname_application_path(char *buf, size_t size);
+void fill_pathname_application_dir(char *buf, size_t size);
+void fill_pathname_home_dir(char *buf, size_t size);
 #endif
 
 /**
