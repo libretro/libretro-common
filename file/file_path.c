@@ -75,6 +75,11 @@
 #include <unistd.h>
 #endif
 
+#if defined(ORBIS)
+#include <orbisFile.h>
+#include <sys/fcntl.h>
+#include <sys/dirent.h>
+#endif
 #if defined(PSP)
 #include <pspkernel.h>
 #endif
@@ -120,12 +125,15 @@ enum stat_mode
 
 static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
 {
+#if defined(ORBIS)
+   return false; /* for now */
+#endif
 #if defined(VITA) || defined(PSP)
    SceIoStat buf;
    char *tmp  = strdup(path);
    size_t len = strlen(tmp);
    if (tmp[len-1] == '/')
-      tmp[len-1]='\0';
+      tmp[len-1] = '\0';
 
    if (sceIoGetstat(tmp, &buf) < 0)
    {
@@ -138,7 +146,7 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
    char *tmp  = strdup(path);
    size_t len = strlen(tmp);
    if (tmp[len-1] == '/')
-      tmp[len-1]='\0';
+      tmp[len-1] = '\0';
 
    if (fileXioGetStat(tmp, &buf) < 0)
    {
@@ -151,10 +159,10 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
     if (cellFsStat(path, &buf) < 0)
        return false;
 #elif defined(_WIN32)
-   struct _stat buf;
-   char *path_local;
-   wchar_t *path_wide;
    DWORD file_info;
+   struct _stat buf;
+   char *path_local   = NULL;
+   wchar_t *path_wide = NULL;
 
    if (!path || !*path)
       return false;
@@ -232,7 +240,18 @@ static bool path_stat(const char *path, enum stat_mode mode, int32_t *size)
  */
 bool path_is_directory(const char *path)
 {
+#ifdef ORBIS
+   int dfd;
+   if (!path)
+      return false;
+   dfd = orbisDopen(path);
+   if (dfd < 0)
+      return false;
+   orbisDclose(dfd);
+   return true;
+#else
    return path_stat(path, IS_DIRECTORY, NULL);
+#endif
 }
 
 bool path_is_character_special(const char *path)
@@ -258,7 +277,7 @@ static bool path_mkdir_error(int ret)
 {
 #if defined(VITA)
    return (ret == SCE_ERROR_ERRNO_EEXIST);
-#elif defined(PSP) || defined(PS2) || defined(_3DS) || defined(WIIU) || defined(SWITCH)
+#elif defined(PSP) || defined(PS2) || defined(_3DS) || defined(WIIU) || defined(SWITCH) || defined(ORBIS)
    return (ret == -1);
 #else
    return (ret < 0 && errno == EEXIST);
@@ -329,6 +348,8 @@ bool path_mkdir(const char *dir)
       int ret = sceIoMkdir(dir, 0777);
 #elif defined(PS2)
       int ret =fileXioMkdir(dir, 0777);
+#elif defined(ORBIS)
+      int ret =orbisMkdir(dir, 0755);
 #elif defined(__QNX__)
       int ret = mkdir(dir, 0777);
 #else
@@ -936,7 +957,6 @@ void fill_pathname_join_noext(char *out_path,
    path_remove_extension(out_path);
 }
 
-
 /**
  * fill_pathname_join_delim:
  * @out_path           : output path
@@ -961,7 +981,8 @@ void fill_pathname_join_delim(char *out_path, const char *dir,
    out_path[copied]   = delim;
    out_path[copied+1] = '\0';
 
-   strlcat(out_path, path, size);
+   if (path)
+      strlcat(out_path, path, size);
 }
 
 void fill_pathname_join_delim_concat(char *out_path, const char *dir,
@@ -1028,7 +1049,16 @@ void fill_pathname_expand_special(char *out_path,
          out_path  += src_size;
          size      -= src_size;
 
-         in_path++;
+         if (!path_char_is_slash(out_path[-1]))
+         {
+            src_size = strlcpy(out_path, path_default_slash(), size);
+            retro_assert(src_size < size);
+
+            out_path += src_size;
+            size -= src_size;
+         }
+
+         in_path += 2;
       }
 
       free(home_dir);
@@ -1050,7 +1080,16 @@ void fill_pathname_expand_special(char *out_path,
          out_path  += src_size;
          size      -= src_size;
 
-         in_path++;
+         if (!path_char_is_slash(out_path[-1]))
+         {
+            src_size = strlcpy(out_path, path_default_slash(), size);
+            retro_assert(src_size < size);
+
+            out_path += src_size;
+            size -= src_size;
+         }
+
+         in_path += 2;
       }
 
       free(application_dir);
