@@ -3132,9 +3132,9 @@ static Codepoint JSON_Writer_GetCodepointEscapeCharacter(JSON_Writer writer, Cod
 
       case '"':
          return '"';
-      /* Don't escape forward slashes */
-      /*case '/':
-         return '/';*/
+
+      case '/':
+         return '/';
 
       case '\\':
          return '\\';
