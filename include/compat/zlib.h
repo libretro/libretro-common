@@ -1661,6 +1661,13 @@ uint32_t adler32 (uint32_t adler, const uint8_t *buf, size_t len);
 
 #ifndef Z_SOLO
 
+struct gzFile_s
+{
+   unsigned have;
+   unsigned char *next;
+   z_off64_t pos;
+};
+
 /* gzgetc() macro and its supporting function and exposed data structure.  Note
  * that the real internal state is much larger than the exposed structure.
  * This abbreviated structure exposes just enough for the gzgetc() macro.  The
