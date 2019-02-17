@@ -247,7 +247,7 @@ extern char z_errmsg[10][21]; /* indexed by 2-zlib_error */
 #endif /* ZUTIL_H */
 
 #else
-#include <zutil.h>
+#include <compat/zutil.h>
 #endif
 
 #endif
