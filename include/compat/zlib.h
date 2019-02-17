@@ -1765,7 +1765,7 @@ const uint32_t * get_crc_table(void);
 #endif /* ZLIB_H */
 
 #else
-#include <zlib.h>
+#include <compat/zlib.h>
 #endif
 
 #endif
