@@ -62,7 +62,7 @@ static task_queue_t tasks_finished = {NULL, NULL};
 static struct retro_task_impl *impl_current = NULL;
 static bool task_threaded_enable            = false;
 
-static uint32_t task_count = 0;
+static uint32_t task_count                  = 0;
 
 static void task_queue_msg_push(retro_task_t *task,
       unsigned prio, unsigned duration,
@@ -823,14 +823,14 @@ char* task_get_title(retro_task_t *task)
    return title;
 }
 
-static uint32_t task_get_next_ident()
+static uint32_t task_get_next_ident(void)
 {
    return task_count++;
 }
 
-retro_task_t *task_init()
+retro_task_t *task_init(void)
 {
-   retro_task_t *task = (retro_task_t*)calloc(1, sizeof(*task));
+   retro_task_t *task      = (retro_task_t*)calloc(1, sizeof(*task));
 
    task->ident             = task_get_next_ident();
    task->frontend_userdata = NULL;
