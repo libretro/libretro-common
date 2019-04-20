@@ -52,6 +52,7 @@
 #  endif
 #  if defined(PS2)
 #    include <fileXio_rpc.h>
+#    include <fileXio_cdvd.h>
 #  endif
 #  include <sys/types.h>
 #  include <sys/stat.h>
@@ -222,8 +223,8 @@ int64_t retro_vfs_file_seek_internal(libretro_vfs_implementation_file *stream, i
 #elif defined(__CELLOS_LV2__) || defined(_MSC_VER) && _MSC_VER <= 1310
       return fseek(stream->fp, (long)offset, whence);
 #elif defined(PS2)
-      int64_t ret = fioLseek(fileno(stream->fp), (off_t)offset, whence);
-      /* fioLseek could return positive numbers */
+      int64_t ret = fileXioLseek(fileno(stream->fp), (off_t)offset, whence);
+      /* fileXioLseek could return positive numbers */
       if (ret > 0) {
          ret = 0;
       }
@@ -821,11 +822,7 @@ int retro_vfs_stat_impl(const char *path, int32_t *size)
    if (tmp[len-1] == '/')
       tmp[len-1] = '\0';
 
-   if (fileXioGetStat(tmp, &buf) < 0)
-   {
-      free(tmp);
-      return 0;
-   }
+   fileXioGetStat(tmp, &buf);
    free(tmp);
 #elif defined(__CELLOS_LV2__)
     CellFsStat buf;
@@ -880,7 +877,14 @@ int retro_vfs_stat_impl(const char *path, int32_t *size)
 #if defined(VITA) || defined(PSP)
    is_dir = FIO_S_ISDIR(buf.st_mode);
 #elif defined(PS2)
-   is_dir = FIO_S_ISDIR(buf.mode);
+   if (!buf.mode) {
+      // if fileXioGetStat fails
+      int dir_ret = fileXioDopen(path);
+      is_dir =  dir_ret > 0;
+      fileXioDclose(dir_ret);
+   } else {
+      is_dir = FIO_S_ISDIR(buf.mode);
+   }
 #elif defined(__CELLOS_LV2__)
    is_dir = ((buf.st_mode & S_IFMT) == S_IFDIR);
 #elif defined(_WIN32)
@@ -1042,7 +1046,7 @@ libretro_vfs_implementation_dir *retro_vfs_opendir_impl(const char *name, bool i
 #elif defined(VITA) || defined(PSP)
    rdir->directory = sceIoDopen(name);
 #elif defined(PS2)
-   rdir->directory = fileXioDopen(name);
+   rdir->directory = ps2fileXioDopen(name);
 #elif defined(_3DS)
    rdir->directory = !string_is_empty(name) ? opendir(name) : NULL;
    rdir->entry     = NULL;
@@ -1085,7 +1089,7 @@ bool retro_vfs_readdir_impl(libretro_vfs_implementation_dir *rdir)
    return (sceIoDread(rdir->directory, &rdir->entry) > 0);
 #elif defined(PS2)
    iox_dirent_t record;
-   int ret = fileXioDread(rdir->directory, &record);
+   int ret = ps2fileXioDread(rdir->directory, &record);
    rdir->entry = record;
    return ( ret > 0);
 #elif defined(__CELLOS_LV2__)
@@ -1183,7 +1187,7 @@ int retro_vfs_closedir_impl(libretro_vfs_implementation_dir *rdir)
 #elif defined(VITA) || defined(PSP)
    sceIoDclose(rdir->directory);
 #elif defined(PS2)
-   fileXioDclose(rdir->directory);
+   ps2fileXioDclose(rdir->directory);
 #elif defined(__CELLOS_LV2__)
    rdir->error = cellFsClosedir(rdir->directory);
 #elif defined(ORBIS)
