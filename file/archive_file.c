@@ -644,7 +644,7 @@ bool file_archive_perform_mode(const char *path, const char *valid_exts,
    {
       case ARCHIVE_MODE_UNCOMPRESSED:
          if (!filestream_write_file(path, cdata, size))
-            goto error;
+            return false;
          break;
 
       case ARCHIVE_MODE_COMPRESSED:
@@ -658,11 +658,11 @@ bool file_archive_perform_mode(const char *path, const char *valid_exts,
             handle.backend       = file_archive_get_file_backend(userdata->archive_path);
 
             if (!handle.backend)
-               goto error;
+               return false;
 
             if (!handle.backend->stream_decompress_data_to_file_init(&handle,
                      cdata, csize, size))
-               goto error;
+               return false;
 
             do
             {
@@ -673,17 +673,14 @@ bool file_archive_perform_mode(const char *path, const char *valid_exts,
             if (!file_archive_decompress_data_to_file(&handle,
                      ret, path, valid_exts,
                      cdata, csize, size, crc32))
-               goto error;
+               return false;
          }
          break;
       default:
-         goto error;
+         return false;
    }
 
    return true;
-
-error:
-   return false;
 }
 
 /**
@@ -736,9 +733,9 @@ int file_archive_compressed_read(
       const char * path, void **buf,
       const char* optional_filename, int64_t *length)
 {
-   const struct file_archive_file_backend *backend = NULL;
-   int ret                            = 0;
-   struct string_list *str_list       = file_archive_filename_split(path);
+   const struct 
+      file_archive_file_backend *backend = NULL;
+   struct string_list *str_list          = NULL;
 
    /* Safety check.
     * If optional_filename and optional_filename
@@ -746,13 +743,13 @@ int file_archive_compressed_read(
     * hoping that optional_filename is the
     * same as requested.
     */
-   if (optional_filename && filestream_exists(optional_filename))
+   if (optional_filename && path_is_valid(optional_filename))
    {
       *length = 0;
-      string_list_free(str_list);
       return 1;
    }
 
+   str_list       = file_archive_filename_split(path);
    /* We assure that there is something after the '#' symbol.
     *
     * This error condition happens for example, when
@@ -760,23 +757,22 @@ int file_archive_compressed_read(
     * path = /path/to/file.7z#
     */
    if (str_list->size <= 1)
-      goto error;
+   {
+      /* could not extract string and substring. */
+      string_list_free(str_list);
+      *length = 0;
+      return 0;
+   }
 
    backend = file_archive_get_file_backend(str_list->elems[0].data);
-
    *length = backend->compressed_file_read(str_list->elems[0].data,
          str_list->elems[1].data, buf, optional_filename);
 
+   string_list_free(str_list);
+
    if (*length != -1)
-      ret = 1;
+      return 1;
 
-   string_list_free(str_list);
-   return ret;
-
-error:
-   /* could not extract string and substring. */
-   string_list_free(str_list);
-   *length = 0;
    return 0;
 }
 
@@ -841,16 +837,10 @@ const struct file_archive_file_backend* file_archive_get_file_backend(const char
 uint32_t file_archive_get_file_crc32(const char *path)
 {
    file_archive_transfer_t state;
-   const struct file_archive_file_backend *backend = file_archive_get_file_backend(path);
    struct archive_extract_userdata userdata        = {{0}};
    bool returnerr                                  = false;
-   bool contains_compressed                        = false;
    const char *archive_path                        = NULL;
-
-   if (!backend)
-      return 0;
-
-   contains_compressed = path_contains_compressed_file(path);
+   bool contains_compressed = path_contains_compressed_file(path);
 
    if (contains_compressed)
    {
