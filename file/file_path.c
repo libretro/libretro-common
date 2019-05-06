@@ -205,6 +205,10 @@ bool path_mkdir(const char *dir)
    /* Use heap. Real chance of stack 
     * overflow if we recurse too hard. */
    basedir            = strdup(dir);
+
+   if (!basedir)
+	   return false;
+
    path_parent_dir(basedir);
 
    if (!*basedir || !strcmp(basedir, dir))
@@ -435,7 +439,7 @@ void fill_pathname_slash(char *path, size_t size)
       join_str[0] = '\0';
 
       strlcpy(join_str, last_slash, sizeof(join_str));
-      strlcat(path, join_str, size);
+      string_concat(path, join_str);
    }
 }
 
@@ -654,7 +658,12 @@ void path_basedir(char *path)
  **/
 void path_parent_dir(char *path)
 {
-   size_t len = strlen(path);
+   size_t len = 0;
+
+   if (!path)
+      return;
+   
+   len = strlen(path);
 
    if (len && path_char_is_slash(path[len - 1]))
    {

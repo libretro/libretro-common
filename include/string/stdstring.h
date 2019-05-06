@@ -45,6 +45,14 @@ static INLINE bool string_is_equal(const char *a, const char *b)
    return (a && b) ? !strcmp(a, b) : false;
 }
 
+static INLINE char *string_concat(char *dst, char *src)
+{
+   while (*dst)
+      dst++;
+   while ((*(dst)++ = *(src)++));
+   return --dst;
+}
+
 #define STRLEN_CONST(x)                   ((sizeof((x))-1))
 
 #define string_is_not_equal(a, b)         !string_is_equal((a), (b))
@@ -125,8 +133,9 @@ char *string_trim_whitespace_right(char *const s);
 /* Remove leading and trailing whitespaces */
 char *string_trim_whitespace(char *const s);
 
+/* max_lines == 0 means no limit */
 char *word_wrap(char *buffer, const char *string,
-      int line_width, bool unicode);
+      int line_width, bool unicode, unsigned max_lines);
 
 RETRO_END_DECLS
 
