@@ -78,11 +78,6 @@
 #include <unistd.h>
 #endif
 
-#if defined(ORBIS)
-#include <orbisFile.h>
-#include <sys/fcntl.h>
-#include <sys/dirent.h>
-#endif
 #if defined(PSP)
 #include <pspkernel.h>
 #endif
@@ -137,9 +132,14 @@ void path_vfs_init(const struct retro_vfs_interface_info* vfs_info)
    path_mkdir_cb          = vfs_iface->mkdir;
 }
 
-#define path_stat(path, size) ((path_stat_cb != NULL) ? path_stat_cb((path), (size)) : retro_vfs_stat_impl((path), (size)))
+#define path_stat_internal(path, size) ((path_stat_cb != NULL) ? path_stat_cb((path), (size)) : retro_vfs_stat_impl((path), (size)))
 
 #define path_mkdir_norecurse(dir) ((path_mkdir_cb != NULL) ? path_mkdir_cb((dir)) : retro_vfs_mkdir_impl((dir)))
+
+int path_stat(const char *path)
+{
+   return path_stat_internal(path, NULL);
+}
 
 /**
  * path_is_directory:
@@ -151,35 +151,23 @@ void path_vfs_init(const struct retro_vfs_interface_info* vfs_info)
  */
 bool path_is_directory(const char *path)
 {
-#ifdef ORBIS
-   /* TODO: This should be moved to the VFS module */
-   int dfd;
-   if (!path)
-      return false;
-   dfd = orbisDopen(path);
-   if (dfd < 0)
-      return false;
-   orbisDclose(dfd);
-   return true;
-#else
-   return (path_stat(path, NULL) & RETRO_VFS_STAT_IS_DIRECTORY) != 0;
-#endif
+   return (path_stat_internal(path, NULL) & RETRO_VFS_STAT_IS_DIRECTORY) != 0;
 }
 
 bool path_is_character_special(const char *path)
 {
-   return (path_stat(path, NULL) & RETRO_VFS_STAT_IS_CHARACTER_SPECIAL) != 0;
+   return (path_stat_internal(path, NULL) & RETRO_VFS_STAT_IS_CHARACTER_SPECIAL) != 0;
 }
 
 bool path_is_valid(const char *path)
 {
-   return (path_stat(path, NULL) & RETRO_VFS_STAT_IS_VALID) != 0;
+   return (path_stat_internal(path, NULL) & RETRO_VFS_STAT_IS_VALID) != 0;
 }
 
 int32_t path_get_size(const char *path)
 {
    int32_t filesize = 0;
-   if (path_stat(path, &filesize) != 0)
+   if (path_stat_internal(path, &filesize) != 0)
       return filesize;
 
    return -1;

@@ -41,9 +41,19 @@ void string_list_free(struct string_list *list)
    if (!list)
       return;
 
-   for (i = 0; i < list->size; i++)
-      free(list->elems[i].data);
-   free(list->elems);
+   if (list->elems)
+   {
+      for (i = 0; i < list->size; i++)
+      {
+         if (list->elems[i].data)
+            free(list->elems[i].data);
+         list->elems[i].data = NULL;
+      }
+
+      free(list->elems);
+   }
+
+   list->elems = NULL; 
    free(list);
 }
 
