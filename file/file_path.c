@@ -205,6 +205,20 @@ bool path_mkdir(const char *dir)
       return false;
    }
 
+#if defined(GEKKO)
+   {
+      size_t len = strlen(basedir);
+
+      /* path_parent_dir() keeps the trailing slash.
+       * On Wii, mkdir() fails if the path has a
+       * trailing slash...
+       * We must therefore remove it. */
+      if (len > 0)
+         if (basedir[len - 1] == '/')
+            basedir[len - 1] = '\0';
+   }
+#endif
+
    if (path_is_directory(basedir))
       norecurse = true;
    else
@@ -388,17 +402,14 @@ void fill_pathname_noext(char *out_path, const char *in_path,
 
 char *find_last_slash(const char *str)
 {
-#ifdef _WIN32
    const char *slash     = strrchr(str, '/');
+#ifdef _WIN32
    const char *backslash = strrchr(str, '\\');
 
-   if (backslash && ((slash && backslash > slash) || !slash))
+   if (!slash || (backslash > slash))
       return (char*)backslash;
-
-   return (char*)slash;
-#else
-   return (char*)strrchr(str, '/');
 #endif
+   return (char*)slash;
 }
 
 /**
@@ -536,11 +547,18 @@ bool fill_pathname_parent_dir_name(char *out_dir,
    char *temp   = strdup(in_dir);
    char *last   = find_last_slash(temp);
 
-   *last        = '\0';
+   if (last && last[1] == 0)
+   {
+      *last     = '\0';
+      last      = find_last_slash(temp);
+   }
+
+   if (last)
+      *last     = '\0';
 
    in_dir       = find_last_slash(temp);
 
-   success      = in_dir && in_dir + 1;
+   success      = in_dir && in_dir[1];
 
    if (success)
       strlcpy(out_dir, in_dir + 1, size);
@@ -774,7 +792,8 @@ void path_resolve_realpath(char *buf, size_t size)
  *
  * E.g. path /a/b/e/f.cg with base /a/b/c/d/ turns into ../../e/f.cg
  **/
-void path_relative_to(char *out, const char *path, const char *base, size_t size)
+void path_relative_to(char *out,
+      const char *path, const char *base, size_t size)
 {
    unsigned i;
    const char *trimmed_path, *trimmed_base;
@@ -1167,7 +1186,7 @@ void fill_pathname_application_path(char *s, size_t len)
 #elif defined(__APPLE__)
    if (bundle)
    {
-      CFURLRef bundle_url = CFBundleCopyBundleURL(bundle);
+      CFURLRef bundle_url     = CFBundleCopyBundleURL(bundle);
       CFStringRef bundle_path = CFURLCopyPath(bundle_url);
       CFStringGetCString(bundle_path, s, len, kCFStringEncodingUTF8);
       CFRelease(bundle_path);
@@ -1188,7 +1207,7 @@ void fill_pathname_application_path(char *s, size_t len)
 #elif defined(__QNX__)
    char *buff = malloc(len);
 
-   if(_cmdname(buff))
+   if (_cmdname(buff))
       strlcpy(s, buff, len);
 
    free(buff);
@@ -1248,7 +1267,7 @@ bool is_path_accessible_using_standard_io(const char *path)
 {
 #ifdef __WINRT__
    bool result;
-   size_t path_sizeof = PATH_MAX_LENGTH * sizeof(char);
+   size_t         path_sizeof = PATH_MAX_LENGTH * sizeof(char);
    char *relative_path_abbrev = (char*)malloc(path_sizeof);
    fill_pathname_abbreviate_special(relative_path_abbrev, path, path_sizeof);
 
