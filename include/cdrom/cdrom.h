@@ -28,17 +28,12 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#include <vfs/vfs.h>
 #include <libretro.h>
 #include <retro_common_api.h>
 #include <retro_inline.h>
 
 #include <boolean.h>
-
-#ifdef VFS_FRONTEND
-typedef struct retro_vfs_file_handle libretro_vfs_implementation_file;
-#else
-typedef struct libretro_vfs_implementation_file libretro_vfs_implementation_file;
-#endif
 
 struct string_list;
 
@@ -64,9 +59,9 @@ typedef struct
    cdrom_track_t track[99];
 } cdrom_toc_t;
 
-void lba_to_msf(unsigned lba, unsigned char *min, unsigned char *sec, unsigned char *frame);
+void cdrom_lba_to_msf(unsigned lba, unsigned char *min, unsigned char *sec, unsigned char *frame);
 
-unsigned msf_to_lba(unsigned char min, unsigned char sec, unsigned char frame);
+unsigned cdrom_msf_to_lba(unsigned char min, unsigned char sec, unsigned char frame);
 
 void increment_msf(unsigned char *min, unsigned char *sec, unsigned char *frame);
 
@@ -78,6 +73,8 @@ int cdrom_write_cue(libretro_vfs_implementation_file *stream, char **out_buf, si
 int cdrom_get_inquiry(const libretro_vfs_implementation_file *stream, char *model, int len, bool *is_cdrom);
 
 int cdrom_read(libretro_vfs_implementation_file *stream, unsigned char min, unsigned char sec, unsigned char frame, void *s, size_t len, size_t skip);
+
+int cdrom_read_lba(libretro_vfs_implementation_file *stream, unsigned lba, void *s, size_t len, size_t skip);
 
 int cdrom_set_read_speed(libretro_vfs_implementation_file *stream, unsigned speed);
 
@@ -105,6 +102,8 @@ void cdrom_get_current_config_multiread(const libretro_vfs_implementation_file *
 void cdrom_get_current_config_random_readable(const libretro_vfs_implementation_file *stream);
 
 int cdrom_get_sense(const libretro_vfs_implementation_file *stream, unsigned char *sense, size_t len);
+
+bool cdrom_set_read_cache(const libretro_vfs_implementation_file *stream, bool enabled);
 
 RETRO_END_DECLS
 
