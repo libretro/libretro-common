@@ -339,8 +339,8 @@ static bool parse_line(config_file_t *conf,
       comment++;
       if (strstr(comment, "include ") == comment)
       {
-         char *line = comment + STRLEN_CONST("include ");
-         char *path = extract_value(line, false);
+         char *include_line = comment + STRLEN_CONST("include ");
+         char *path         = extract_value(include_line, false);
 
          if (!path)
             return false;
@@ -396,17 +396,7 @@ static config_file_t *config_file_new_internal(
       const char *path, unsigned depth, config_file_cb_t *cb)
 {
    RFILE              *file = NULL;
-   struct config_file *conf = (struct config_file*)malloc(sizeof(*conf));
-   if (!conf)
-      return NULL;
-
-   conf->path                     = NULL;
-   conf->entries                  = NULL;
-   conf->tail                     = NULL;
-   conf->last                     = NULL;
-   conf->includes                 = NULL;
-   conf->include_depth            = 0;
-   conf->guaranteed_no_duplicates = false ;
+   struct config_file *conf = config_file_new_alloc();
 
    if (!path || !*path)
       return conf;
@@ -612,6 +602,23 @@ config_file_t *config_file_new_with_callback(
 config_file_t *config_file_new(const char *path)
 {
    return config_file_new_internal(path, 0, NULL);
+}
+
+config_file_t *config_file_new_alloc(void)
+{
+   struct config_file *conf = (struct config_file*)malloc(sizeof(*conf));
+   if (!conf)
+      return NULL;
+
+   conf->path                     = NULL;
+   conf->entries                  = NULL;
+   conf->tail                     = NULL;
+   conf->last                     = NULL;
+   conf->includes                 = NULL;
+   conf->include_depth            = 0;
+   conf->guaranteed_no_duplicates = false ;
+
+   return conf;
 }
 
 static struct config_entry_list *config_get_entry(
