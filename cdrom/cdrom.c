@@ -992,10 +992,10 @@ static int cdrom_read_track_info(libretro_vfs_implementation_file *stream, unsig
 
 #ifdef CDROM_DEBUG
    printf("[CDROM] Track %d Info: ", track);
-   printf("[CDROM] Copy: %d ", (buf[5] & 0x10) > 0);
-   printf("[CDROM] Data Mode: %d ", toc->track[track - 1].mode);
-   printf("[CDROM] LBA Start: %d (%d) ", lba, toc->track[track - 1].lba);
-   printf("[CDROM] Track Size: %d\n", track_size);
+   printf("Copy: %d ", (buf[5] & 0x10) > 0);
+   printf("Data Mode: %d ", toc->track[track - 1].mode);
+   printf("LBA Start: %d (%d) ", lba, toc->track[track - 1].lba);
+   printf("Track Size: %d\n", track_size);
    fflush(stdout);
 #endif
 
@@ -1005,7 +1005,7 @@ static int cdrom_read_track_info(libretro_vfs_implementation_file *stream, unsig
 int cdrom_set_read_speed(libretro_vfs_implementation_file *stream, unsigned speed)
 {
    /* MMC Command: SET CD SPEED */
-   unsigned char cmd[] = {0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+   unsigned char cmd[] = {0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
    cmd[2] = (speed >> 24) & 0xFF;
    cmd[3] = (speed >> 16) & 0xFF;
@@ -1329,6 +1329,7 @@ struct string_list* cdrom_get_available_drives(void)
 #if defined(__linux__) && !defined(ANDROID)
    struct string_list *dir_list = dir_list_new("/dev", NULL, false, false, false, false);
    int i;
+   bool found = false;
 
    if (!dir_list)
       return list;
@@ -1345,8 +1346,14 @@ struct string_list* cdrom_get_available_drives(void)
          libretro_vfs_implementation_file *stream;
          bool is_cdrom = false;
 
+         found = true;
+
          if (!file)
+         {
+            printf("[CDROM] Could not open %s, please check permissions.\n", dir_list->elems[i].data);
+            fflush(stdout);
             continue;
+         }
 
          stream = filestream_get_vfs_handle(file);
          cdrom_get_inquiry(stream, drive_model, sizeof(drive_model), &is_cdrom);
@@ -1366,6 +1373,49 @@ struct string_list* cdrom_get_available_drives(void)
             strlcat(drive_string, "Unknown Drive", sizeof(drive_string));
 
          string_list_append(list, drive_string, attr);
+      }
+   }
+
+   if (!found)
+   {
+      char *buf = NULL;
+      int64_t len = 0;
+
+      if (filestream_read_file("/proc/modules", (void**)&buf, &len))
+      {
+         struct string_list *mods = string_split(buf, "\n");
+         bool found = false;
+
+         if (mods)
+         {
+
+            for (i = 0; i < mods->size; i++)
+            {
+               if (strcasestr(mods->elems[i].data, "sg "))
+               {
+                  found = true;
+                  break;
+               }
+            }
+
+            string_list_free(mods);
+         }
+
+         if (found)
+         {
+            printf("[CDROM] No sg devices found but kernel module is loaded.\n");
+            fflush(stdout);
+         }
+         else
+         {
+            printf("[CDROM] No sg devices found and sg kernel module is not loaded.\n");
+            fflush(stdout);
+         }
+      }
+      else
+      {
+         printf("[CDROM] No sg devices found, could not check if sg kernel module is loaded.\n");
+         fflush(stdout);
       }
    }
 
