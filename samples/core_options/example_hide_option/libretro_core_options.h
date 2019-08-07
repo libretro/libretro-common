@@ -7,6 +7,19 @@
 #include <libretro.h>
 #include <retro_inline.h>
 
+/*
+ ********************************
+ * VERSION: 1.2
+ ********************************
+ *
+ * - 1.2: Use core options v1 interface when
+ *        RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION is >= 1
+ *        (previously required RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION == 1)
+ * - 1.1: Support generation of core options v0 retro_core_option_value
+ *        arrays containing options with a single value
+ * - 1.0: First commit
+*/
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -167,7 +180,7 @@ static INLINE void libretro_set_core_options(retro_environment_t environ_cb)
    if (!environ_cb)
       return;
 
-   if (environ_cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &version) && (version == 1))
+   if (environ_cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &version) && (version >= 1))
    {
       struct retro_core_options_intl core_options_intl;
       unsigned language = 0;
@@ -249,7 +262,7 @@ static INLINE void libretro_set_core_options(retro_environment_t environ_cb)
             }
 
             /* Build values string */
-            if (num_values > 1)
+            if (num_values > 0)
             {
                size_t j;
 
@@ -282,7 +295,7 @@ static INLINE void libretro_set_core_options(retro_environment_t environ_cb)
          variables[option_index].value = values_buf[i];
          option_index++;
       }
-      
+
       /* Set variables */
       environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, variables);
 
