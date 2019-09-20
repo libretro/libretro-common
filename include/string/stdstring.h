@@ -49,59 +49,18 @@ static INLINE bool string_is_equal(const char *a, const char *b)
 
 #define string_is_not_equal(a, b)         !string_is_equal((a), (b))
 
-#define string_add_pair_open(s, size)     strlcat((s), " (", (size))
-#define string_add_pair_close(s, size)    strlcat((s), ")",  (size))
-#define string_add_bracket_open(s, size)  strlcat((s), "{",  (size))
-#define string_add_bracket_close(s, size) strlcat((s), "}",  (size))
-#define string_add_single_quote(s, size)  strlcat((s), "'",  (size))
-#define string_add_quote(s, size)         strlcat((s), "\"",  (size))
-#define string_add_colon(s, size)         strlcat((s), ":",  (size))
-#define string_add_glob_open(s, size)     strlcat((s), "glob('*",  (size))
-#define string_add_glob_close(s, size)    strlcat((s), "*')",  (size))
+#define STRLCPY_CONST(buf, str) \
+   do { size_t i; for (i = 0; i < sizeof(str); i++) (buf)[i] = (str)[i]; } while (0)
 
-#define string_add_backslash_fast(s, size) \
-   (s)[(size)]   = '/'; \
-   (s)[(size)+1] = '\0'
+#define STRLCAT_CONST(buf, strlcpy_ret, str, buf_size) \
+   STRLCPY_CONST((buf) + MIN((strlcpy_ret), (buf_size)-1 - STRLEN_CONST((str))), (str))
 
-#define string_add_colon_fast(s, size) \
-   (s)[(size)]   = ':'; \
-   (s)[(size)+1] = '\0'
-
-#define string_add_star_fast(s, size) \
-   (s)[(size)]   = '*'; \
-   (s)[(size)+1] = '\0'
-
-#define string_add_dot_fast(s, size) \
-   (s)[(size)]   = '.'; \
-   (s)[(size)+1] = '\0'
-
-#define string_add_space_fast(s, size) \
-   (s)[(size)]   = ' '; \
-   (s)[(size)+1] = '\0'
-
-#define string_add_vertical_bar_fast(s, size) \
-   (s)[(size)]   = '|'; \
-   (s)[(size)+1] = '\0'
-
-#define string_add_pair_open_fast(s, size) \
-   (s)[(size)]   = '('; \
-   (s)[(size)+1] = '\0'
-
-#define string_add_pair_close_fast(s, size) \
-   (s)[(size)]   = ')'; \
-   (s)[(size)+1] = '\0'
+#define STRLCAT_CONST_INCR(buf, strlcpy_ret, str, buf_size) \
+   STRLCAT_CONST(buf, strlcpy_ret, str, buf_size); \
+   (strlcpy_ret) += STRLEN_CONST((str))
 
 #define string_is_not_equal_fast(a, b, size) (memcmp(a, b, size) != 0)
 #define string_is_equal_fast(a, b, size)     (memcmp(a, b, size) == 0)
-
-static INLINE void string_add_between_pairs(char *s, const char *str,
-      size_t size)
-{
-   size_t copied; 
-   string_add_pair_open(s, size);
-   copied = strlcat(s, str,  size);
-   string_add_pair_close_fast(s, copied);
-}
 
 static INLINE bool string_is_equal_case_insensitive(const char *a,
       const char *b)
