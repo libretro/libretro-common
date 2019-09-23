@@ -893,7 +893,7 @@ end:
 size_t path_relative_to(char *out,
       const char *path, const char *base, size_t size)
 {
-   size_t i, written = 0;
+   size_t i;
    const char *trimmed_path, *trimmed_base;
 
 #ifdef _WIN32
@@ -913,15 +913,8 @@ size_t path_relative_to(char *out,
    /* Each segment of base turns into ".." */
    out[0] = '\0';
    for (i = 0; trimmed_base[i]; i++)
-   {
       if (trimmed_base[i] == path_default_slash_c())
-      {
-         out[written++] = '.';
-         out[written++] = '.';
-         out[written++] = path_default_slash_c();
-         out[written++] = '\0';
-      }
-   }
+         strlcat(out, ".." path_default_slash(), size);
 
    return strlcat(out, trimmed_path, size);
 }
@@ -1300,9 +1293,8 @@ void fill_pathname_application_path(char *s, size_t len)
          char resolved_bundle_dir_buf[PATH_MAX_LENGTH] = {0};
          if (realpath(s, resolved_bundle_dir_buf))
          {
-            size_t buf_pos = strlcpy(s, resolved_bundle_dir_buf, len - 1);
-            s[buf_pos]     = '/';
-            s[buf_pos+1]   = '\0';
+            strlcpy(s, resolved_bundle_dir_buf, len - 1);
+            strlcat(s, "/", len);
          }
       }
 #endif
