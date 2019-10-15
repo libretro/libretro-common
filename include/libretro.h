@@ -1248,6 +1248,22 @@ enum retro_mod
                                             * default when calling SET_VARIABLES/SET_CORE_OPTIONS.
                                             */
 
+#define RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER 56
+                                           /* unsigned * --
+                                            *
+                                            * Allows an implementation to ask frontend preferred hardware
+                                            * context to use. Core should use this information to deal
+                                            * with what specific context to request with SET_HW_RENDER.
+                                            * When RETRO_HW_CONTEXT_NONE is returned, core should assume
+                                            * frontend has no preference for a specific hardware context,
+                                            * infact it does not mean frontend has no hardware context
+                                            * support at all. If the frontend has no hardware context
+                                            * capability, RETRO_HW_CONTEXT_NONE is returned too and
+                                            * susbsequent calls to SET_HW_RENDER will fail accordingly.
+                                            *
+                                            * 'data' points to an unsigned variable
+                                            */
+											
 /* VFS functionality */
 
 /* File paths:
