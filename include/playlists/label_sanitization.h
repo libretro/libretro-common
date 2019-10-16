@@ -1,7 +1,7 @@
-/* Copyright (C) 2010-2018 The RetroArch team
+/* Copyright  (C) 2010-2019 The RetroArch team
  *
  * ---------------------------------------------------------------------------------------
- * The following license statement only applies to this libretro SDK code part (glsym).
+ * The following license statement only applies to this file (file_path.h).
  * ---------------------------------------------------------------------------------------
  *
  * Permission is hereby granted, free of charge,
@@ -19,35 +19,19 @@
  * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+#include <stddef.h>
+#include <boolean.h>
 
-#ifndef RGLGEN_HEADERS_H__
-#define RGLGEN_HEADERS_H__
+void label_sanitize(char *label, bool (*left)(char*), bool (*right)(char*));
 
-#ifdef HAVE_EGL
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#endif
+void label_remove_parens(char *label);
 
-#include "rglgen_private_headers.h"
+void label_remove_brackets(char *label);
 
-#ifndef GL_MAP_WRITE_BIT
-#define GL_MAP_WRITE_BIT 0x0002
-#endif
+void label_remove_parens_and_brackets(char *label);
 
-#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
-#define GL_MAP_INVALIDATE_BUFFER_BIT 0x0008
-#endif
+void label_keep_region(char *label);
 
-#ifndef GL_RED_INTEGER
-#define GL_RED_INTEGER 0x8D94
-#endif
+void label_keep_disc(char *label);
 
-#ifndef GL_BGRA_EXT
-#define GL_BGRA_EXT GL_BGRA
-#endif
-
-#ifndef GL_LUMINANCE_ALPHA
-#define GL_LUMINANCE_ALPHA 0x190A
-#endif
-
-#endif
+void label_keep_region_and_disc(char *label);
