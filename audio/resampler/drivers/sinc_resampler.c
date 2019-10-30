@@ -698,7 +698,7 @@ static void *resampler_sinc_new(const struct resampler_config *config,
    }
    else if (mask & RESAMPLER_SIMD_NEON && re->window_type != SINC_WINDOW_KAISER)
    {
-#if defined(WANT_NEON)
+#if defined(WANT_NEON) && !defined(DONT_WANT_ARM_OPTIMIZATIONS)
       sinc_resampler.process = resampler_sinc_process_neon;
 #endif
    }
