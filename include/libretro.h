@@ -2524,7 +2524,7 @@ struct retro_core_option_display
 /* Maximum number of values permitted for a core option
  * NOTE: This may be increased on a core-by-core basis
  * if required (doing so has no effect on the frontend) */
-#define RETRO_NUM_CORE_OPTION_VALUES_MAX 128
+#define RETRO_NUM_CORE_OPTION_VALUES_MAX 192
 
 struct retro_core_option_value
 {
