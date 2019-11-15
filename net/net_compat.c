@@ -178,9 +178,13 @@ int getaddrinfo_retro(const char *node, const char *service,
    (void)in_addr;
    (void)info;
 
+#ifdef HAVE_LIBNX
+   if (!hints->ai_family || hints->ai_family == AF_UNSPEC)
+#else
    if (!hints->ai_family)
+#endif
    {
-#if defined(_WIN32) || defined(HAVE_SOCKET_LEGACY) || defined(WIIU)
+#if defined(_WIN32) || defined(HAVE_SOCKET_LEGACY) || defined(WIIU) || defined(HAVE_LIBNX)
       hints->ai_family    = AF_INET;
 #else
       hints->ai_family    = AF_UNSPEC;
@@ -250,6 +254,10 @@ error:
       free(info);
    return -1;
 #else
+#if defined(HAVE_LIBNX)
+   if (!service)
+      return getaddrinfo(node, "1234", hints, res);
+#endif
    return getaddrinfo(node, service, hints, res);
 #endif
 }
