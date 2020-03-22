@@ -107,6 +107,15 @@
 #  error "Bug in LSB_FIRST/MSB_FIRST definition"
 #endif
 
+#ifdef MSB_FIRST
+#  define RETRO_IS_BIG_ENDIAN 1
+#  define RETRO_IS_LITTLE_ENDIAN 0
+#else
+#  define RETRO_IS_BIG_ENDIAN 0
+#  define RETRO_IS_LITTLE_ENDIAN 1
+#endif
+
+
 /**
  * is_little_endian:
  *
@@ -115,11 +124,7 @@
  * Returns: greater than 0 if little-endian,
  * otherwise big-endian.
  **/
-#if defined(MSB_FIRST)
-#define is_little_endian() (0)
-#elif defined(LSB_FIRST)
-#define is_little_endian() (1)
-#endif
+#define is_little_endian() RETRO_IS_LITTLE_ENDIAN
 
 /**
  * swap_if_big64:
