@@ -65,6 +65,48 @@
 	 | (((uint64_t)(val) & 0xff00000000000000ULL) >> 56))
 #endif
 
+
+#if defined (LSB_FIRST) || defined (MSB_FIRST)
+#warning Defining MSB_FIRST and LSB_FIRST in compile options is deprecated
+#undef LSB_FIRST
+#undef MSB_FIRST
+#endif
+
+#ifdef _MSC_VER
+#include <winsock2.h>
+#include <sys/param.h>
+#endif
+
+#if defined (BYTE_ORDER) && defined (BIG_ENDIAN) && defined (LITTLE_ENDIAN)
+#if BYTE_ORDER == BIG_ENDIAN
+#define MSB_FIRST 1
+#elif BYTE_ORDER == LITTLE_ENDIAN
+#define LSB_FIRST 1
+#else
+#error "Invalid endianness macros"
+#endif
+#elif defined (__BYTE_ORDER__) && defined (__ORDER_BIG_ENDIAN__) && defined (__ORDER_LITTLE_ENDIAN__)
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define MSB_FIRST 1
+#elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define LSB_FIRST 1
+#else
+#error "Invalid endianness macros"
+#endif
+#elif defined (__i386__) || defined(__x86_64__)
+#define LSB_FIRST 1
+#else
+#error "Unknown platform"
+#endif
+
+#if defined(MSB_FIRST) && defined(LSB_FIRST)
+#error "Bug in LSB_FIRST/MSB_FIRST definition"
+#endif
+
+#if !defined(MSB_FIRST) && !defined(LSB_FIRST)
+#error "Bug in LSB_FIRST/MSB_FIRST definition"
+#endif
+
 /**
  * is_little_endian:
  *
@@ -75,20 +117,8 @@
  **/
 #if defined(MSB_FIRST)
 #define is_little_endian() (0)
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define is_little_endian() (1)
-#else
-static INLINE uint8_t is_little_endian(void)
-{
-   union
-   {
-      uint16_t x;
-      uint8_t y[2];
-   } u;
-
-   u.x = 1;
-   return u.y[0];
-}
 #endif
 
 /**
@@ -103,15 +133,8 @@ static INLINE uint8_t is_little_endian(void)
 
 #if defined(MSB_FIRST)
 #define swap_if_big64(val) (SWAP64(val))
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define swap_if_big64(val) (val)
-#else
-static INLINE uint64_t swap_if_big64(uint64_t val)
-{
-   if (is_little_endian())
-      return val;
-   return SWAP64(val);
-}
 #endif
 
 /**
@@ -126,15 +149,8 @@ static INLINE uint64_t swap_if_big64(uint64_t val)
 
 #if defined(MSB_FIRST)
 #define swap_if_big32(val) (SWAP32(val))
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define swap_if_big32(val) (val)
-#else
-static INLINE uint32_t swap_if_big32(uint32_t val)
-{
-   if (is_little_endian())
-      return val;
-   return SWAP32(val);
-}
 #endif
 
 /**
@@ -149,15 +165,8 @@ static INLINE uint32_t swap_if_big32(uint32_t val)
 
 #if defined(MSB_FIRST)
 #define swap_if_little64(val) (val)
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define swap_if_little64(val) (SWAP64(val))
-#else
-static INLINE uint64_t swap_if_little64(uint64_t val)
-{
-   if (is_little_endian())
-      return SWAP64(val);
-   return val;
-}
 #endif
 
 /**
@@ -172,15 +181,8 @@ static INLINE uint64_t swap_if_little64(uint64_t val)
 
 #if defined(MSB_FIRST)
 #define swap_if_little32(val) (val)
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define swap_if_little32(val) (SWAP32(val))
-#else
-static INLINE uint32_t swap_if_little32(uint32_t val)
-{
-   if (is_little_endian())
-      return SWAP32(val);
-   return val;
-}
 #endif
 
 /**
@@ -195,15 +197,8 @@ static INLINE uint32_t swap_if_little32(uint32_t val)
 
 #if defined(MSB_FIRST)
 #define swap_if_big16(val) (SWAP16(val))
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define swap_if_big16(val) (val)
-#else
-static INLINE uint16_t swap_if_big16(uint16_t val)
-{
-   if (is_little_endian())
-      return val;
-   return SWAP16(val);
-}
 #endif
 
 /**
@@ -218,15 +213,8 @@ static INLINE uint16_t swap_if_big16(uint16_t val)
 
 #if defined(MSB_FIRST)
 #define swap_if_little16(val) (val)
-#elif defined(__x86_64) || defined(__i386) || defined(_M_IX86) || defined(_M_X64)
+#elif defined(LSB_FIRST)
 #define swap_if_little16(val) (SWAP16(val))
-#else
-static INLINE uint16_t swap_if_little16(uint16_t val)
-{
-   if (is_little_endian())
-      return SWAP16(val);
-   return val;
-}
 #endif
 
 /**
