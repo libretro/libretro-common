@@ -67,44 +67,44 @@
 
 
 #if defined (LSB_FIRST) || defined (MSB_FIRST)
-#warning Defining MSB_FIRST and LSB_FIRST in compile options is deprecated
-#undef LSB_FIRST
-#undef MSB_FIRST
+#  warning Defining MSB_FIRST and LSB_FIRST in compile options is deprecated
+#  undef LSB_FIRST
+#  undef MSB_FIRST
 #endif
 
 #ifdef _MSC_VER
-#include <winsock2.h>
-#include <sys/param.h>
+#  include <winsock2.h>
+#  include <sys/param.h>
 #endif
 
 #if defined (BYTE_ORDER) && defined (BIG_ENDIAN) && defined (LITTLE_ENDIAN)
-#if BYTE_ORDER == BIG_ENDIAN
-#define MSB_FIRST 1
-#elif BYTE_ORDER == LITTLE_ENDIAN
-#define LSB_FIRST 1
-#else
-#error "Invalid endianness macros"
-#endif
+#  if BYTE_ORDER == BIG_ENDIAN
+#    define MSB_FIRST 1
+#  elif BYTE_ORDER == LITTLE_ENDIAN
+#    define LSB_FIRST 1
+#  else
+#    error "Invalid endianness macros"
+#  endif
 #elif defined (__BYTE_ORDER__) && defined (__ORDER_BIG_ENDIAN__) && defined (__ORDER_LITTLE_ENDIAN__)
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-#define MSB_FIRST 1
-#elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-#define LSB_FIRST 1
-#else
-#error "Invalid endianness macros"
-#endif
+#  if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#    define MSB_FIRST 1
+#  elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#    define LSB_FIRST 1
+#  else
+#    error "Invalid endianness macros"
+#  endif
 #elif defined (__i386__) || defined(__x86_64__)
-#define LSB_FIRST 1
+#  define LSB_FIRST 1
 #else
-#error "Unknown platform"
+#  error "Unknown platform"
 #endif
 
 #if defined(MSB_FIRST) && defined(LSB_FIRST)
-#error "Bug in LSB_FIRST/MSB_FIRST definition"
+#  error "Bug in LSB_FIRST/MSB_FIRST definition"
 #endif
 
 #if !defined(MSB_FIRST) && !defined(LSB_FIRST)
-#error "Bug in LSB_FIRST/MSB_FIRST definition"
+#  error "Bug in LSB_FIRST/MSB_FIRST definition"
 #endif
 
 /**
