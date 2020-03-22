@@ -136,9 +136,9 @@
  * otherwise returns same value.
  **/
 
-#if defined(MSB_FIRST)
+#if RETRO_IS_BIG_ENDIAN
 #define swap_if_big64(val) (SWAP64(val))
-#elif defined(LSB_FIRST)
+#elif RETRO_IS_LITTLE_ENDIAN
 #define swap_if_big64(val) (val)
 #endif
 
@@ -152,9 +152,9 @@
  * otherwise returns same value.
  **/
 
-#if defined(MSB_FIRST)
+#if RETRO_IS_BIG_ENDIAN
 #define swap_if_big32(val) (SWAP32(val))
-#elif defined(LSB_FIRST)
+#elif RETRO_IS_LITTLE_ENDIAN
 #define swap_if_big32(val) (val)
 #endif
 
@@ -168,9 +168,9 @@
  * otherwise returns same value.
  **/
 
-#if defined(MSB_FIRST)
+#if RETRO_IS_BIG_ENDIAN
 #define swap_if_little64(val) (val)
-#elif defined(LSB_FIRST)
+#elif RETRO_IS_LITTLE_ENDIAN
 #define swap_if_little64(val) (SWAP64(val))
 #endif
 
@@ -184,9 +184,9 @@
  * otherwise returns same value.
  **/
 
-#if defined(MSB_FIRST)
+#if RETRO_IS_BIG_ENDIAN
 #define swap_if_little32(val) (val)
-#elif defined(LSB_FIRST)
+#elif RETRO_IS_LITTLE_ENDIAN
 #define swap_if_little32(val) (SWAP32(val))
 #endif
 
@@ -200,9 +200,9 @@
  * otherwise returns same value.
  **/
 
-#if defined(MSB_FIRST)
+#if RETRO_IS_BIG_ENDIAN
 #define swap_if_big16(val) (SWAP16(val))
-#elif defined(LSB_FIRST)
+#elif RETRO_IS_LITTLE_ENDIAN
 #define swap_if_big16(val) (val)
 #endif
 
@@ -216,9 +216,9 @@
  * otherwise returns same value.
  **/
 
-#if defined(MSB_FIRST)
+#if RETRO_IS_BIG_ENDIAN
 #define swap_if_little16(val) (val)
-#elif defined(LSB_FIRST)
+#elif RETRO_IS_LITTLE_ENDIAN
 #define swap_if_little16(val) (SWAP16(val))
 #endif
 
@@ -247,5 +247,318 @@ static INLINE uint32_t load32be(const uint32_t *addr)
 {
    return swap_if_little32(*addr);
 }
+
+/**
+ * retro_cpu_to_le16:
+ * @val        : unsigned 16-bit value
+ *
+ * Convert unsigned 16-bit value from system to little-endian.
+ *
+ * Returns: Little-endian represantation of val.
+ **/
+
+#define retro_cpu_to_le16(val) swap_if_big16(val)
+
+/**
+ * retro_cpu_to_le32:
+ * @val        : unsigned 32-bit value
+ *
+ * Convert unsigned 32-bit value from system to little-endian.
+ *
+ * Returns: Little-endian represantation of val.
+ **/
+
+#define retro_cpu_to_le32(val) swap_if_big32(val)
+
+/**
+ * retro_cpu_to_le64:
+ * @val        : unsigned 64-bit value
+ *
+ * Convert unsigned 64-bit value from system to little-endian.
+ *
+ * Returns: Little-endian represantation of val.
+ **/
+
+#define retro_cpu_to_le64(val) swap_if_big64(val)
+
+/**
+ * retro_le_to_cpu16:
+ * @val        : unsigned 16-bit value
+ *
+ * Convert unsigned 16-bit value from little-endian to native.
+ *
+ * Returns: Native represantation of little-endian val.
+ **/
+
+#define retro_le_to_cpu16(val) swap_if_big16(val)
+
+/**
+ * retro_le_to_cpu32:
+ * @val        : unsigned 32-bit value
+ *
+ * Convert unsigned 32-bit value from little-endian to native.
+ *
+ * Returns: Native represantation of little-endian val.
+ **/
+
+#define retro_le_to_cpu32(val) swap_if_big32(val)
+
+/**
+ * retro_le_to_cpu16:
+ * @val        : unsigned 64-bit value
+ *
+ * Convert unsigned 64-bit value from little-endian to native.
+ *
+ * Returns: Native represantation of little-endian val.
+ **/
+
+#define retro_le_to_cpu64(val) swap_if_big64(val)
+
+/**
+ * retro_cpu_to_be16:
+ * @val        : unsigned 16-bit value
+ *
+ * Convert unsigned 16-bit value from system to big-endian.
+ *
+ * Returns: Big-endian represantation of val.
+ **/
+
+#define retro_cpu_to_be16(val) swap_if_little16(val)
+
+/**
+ * retro_cpu_to_be32:
+ * @val        : unsigned 32-bit value
+ *
+ * Convert unsigned 32-bit value from system to big-endian.
+ *
+ * Returns: Big-endian represantation of val.
+ **/
+
+#define retro_cpu_to_be32(val) swap_if_little32(val)
+
+/**
+ * retro_cpu_to_be64:
+ * @val        : unsigned 64-bit value
+ *
+ * Convert unsigned 64-bit value from system to big-endian.
+ *
+ * Returns: Big-endian represantation of val.
+ **/
+
+#define retro_cpu_to_be64(val) swap_if_little64(val)
+
+/**
+ * retro_be_to_cpu16:
+ * @val        : unsigned 16-bit value
+ *
+ * Convert unsigned 16-bit value from big-endian to native.
+ *
+ * Returns: Native represantation of big-endian val.
+ **/
+
+#define retro_be_to_cpu16(val) swap_if_little16(val)
+
+/**
+ * retro_be_to_cpu32:
+ * @val        : unsigned 32-bit value
+ *
+ * Convert unsigned 32-bit value from big-endian to native.
+ *
+ * Returns: Native represantation of big-endian val.
+ **/
+
+#define retro_be_to_cpu32(val) swap_if_little32(val)
+
+/**
+ * retro_be_to_cpu64:
+ * @val        : unsigned 64-bit value
+ *
+ * Convert unsigned 64-bit value from big-endian to native.
+ *
+ * Returns: Native represantation of big-endian val.
+ **/
+
+#define retro_be_to_cpu64(val) swap_if_little64(val)
+
+#pragma pack(push, 1)
+struct retro_unaligned_uint16_s
+{
+  uint16_t val;
+};
+struct retro_unaligned_uint32_s
+{
+  uint32_t val;
+};
+struct retro_unaligned_uint64_s
+{
+  uint64_t val;
+};
+#pragma pack(pop)
+
+typedef struct retro_unaligned_uint16_s retro_unaligned_uint16_t;
+typedef struct retro_unaligned_uint32_s retro_unaligned_uint32_t;
+typedef struct retro_unaligned_uint64_s retro_unaligned_uint64_t;
+
+/* L-value references to unaligned pointers.  */
+#define retro_unaligned16(p) (((retro_unaligned_uint16_t *)p)->val)
+#define retro_unaligned32(p) (((retro_unaligned_uint32_t *)p)->val)
+#define retro_unaligned64(p) (((retro_unaligned_uint64_t *)p)->val)
+
+/**
+ * retro_get_unaligned_16be:
+ * @addr        : pointer to unsigned 16-bit value
+ *
+ * Convert unsigned unaligned 16-bit value from big-endian to native.
+ *
+ * Returns: Native represantation of big-endian val.
+ **/
+
+static INLINE uint16_t retro_get_unaligned_16be(void *addr) {
+  return retro_be_to_cpu16(retro_unaligned16(addr));
+}
+
+/**
+ * retro_get_unaligned_32be:
+ * @addr        : pointer to unsigned 32-bit value
+ *
+ * Convert unsigned unaligned 32-bit value from big-endian to native.
+ *
+ * Returns: Native represantation of big-endian val.
+ **/
+
+static INLINE uint32_t retro_get_unaligned_32be(void *addr) {
+  return retro_be_to_cpu32(retro_unaligned32(addr));
+}
+
+/**
+ * retro_get_unaligned_64be:
+ * @addr        : pointer to unsigned 64-bit value
+ *
+ * Convert unsigned unaligned 64-bit value from big-endian to native.
+ *
+ * Returns: Native represantation of big-endian val.
+ **/
+
+static INLINE uint64_t retro_get_unaligned_64be(void *addr) {
+  return retro_be_to_cpu64(retro_unaligned64(addr));
+}
+
+/**
+ * retro_get_unaligned_16le:
+ * @addr        : pointer to unsigned 16-bit value
+ *
+ * Convert unsigned unaligned 16-bit value from little-endian to native.
+ *
+ * Returns: Native represantation of little-endian val.
+ **/
+
+static INLINE uint16_t retro_get_unaligned_16le(void *addr) {
+  return retro_le_to_cpu16(retro_unaligned16(addr));
+}
+
+/**
+ * retro_get_unaligned_32le:
+ * @addr        : pointer to unsigned 32-bit value
+ *
+ * Convert unsigned unaligned 32-bit value from little-endian to native.
+ *
+ * Returns: Native represantation of little-endian val.
+ **/
+
+static INLINE uint32_t retro_get_unaligned_32le(void *addr) {
+  return retro_le_to_cpu32(retro_unaligned32(addr));
+}
+
+/**
+ * retro_get_unaligned_64le:
+ * @addr        : pointer to unsigned 64-bit value
+ *
+ * Convert unsigned unaligned 64-bit value from little-endian to native.
+ *
+ * Returns: Native represantation of little-endian val.
+ **/
+
+static INLINE uint64_t retro_get_unaligned_64le(void *addr) {
+  return retro_le_to_cpu64(retro_unaligned64(addr));
+}
+
+/**
+ * retro_set_unaligned_16le:
+ * @addr        : pointer to unsigned 16-bit value
+ * @val         : value to store
+ *
+ * Convert native value to unsigned unaligned 16-bit little-endian value
+ *
+ **/
+
+static INLINE void retro_set_unaligned_16le(void *addr, uint16_t v) {
+  retro_unaligned16(addr) = retro_cpu_to_le16(v);
+}
+
+/**
+ * retro_set_unaligned_32le:
+ * @addr        : pointer to unsigned 32-bit value
+ * @val         : value to store
+ *
+ * Convert native value to unsigned unaligned 32-bit little-endian value
+ *
+ **/
+
+static INLINE void retro_set_unaligned_32le(void *addr, uint32_t v) {
+  retro_unaligned32(addr) = retro_cpu_to_le32(v);
+}
+
+/**
+ * retro_set_unaligned_32le:
+ * @addr        : pointer to unsigned 32-bit value
+ * @val         : value to store
+ *
+ * Convert native value to unsigned unaligned 32-bit little-endian value
+ *
+ **/
+
+static INLINE void retro_set_unaligned_64le(void *addr, uint64_t v) {
+  retro_unaligned64(addr) = retro_cpu_to_le64(v);
+}
+
+/**
+ * retro_set_unaligned_16be:
+ * @addr        : pointer to unsigned 16-bit value
+ * @val         : value to store
+ *
+ * Convert native value to unsigned unaligned 16-bit big-endian value
+ *
+ **/
+
+static INLINE void retro_set_unaligned_16be(void *addr, uint16_t v) {
+  retro_unaligned16(addr) = retro_cpu_to_be16(v);
+}
+
+/**
+ * retro_set_unaligned_32be:
+ * @addr        : pointer to unsigned 32-bit value
+ * @val         : value to store
+ *
+ * Convert native value to unsigned unaligned 32-bit big-endian value
+ *
+ **/
+
+static INLINE void retro_set_unaligned_32be(void *addr, uint32_t v) {
+  retro_unaligned32(addr) = retro_cpu_to_be32(v);
+}
+
+/**
+ * retro_set_unaligned_32be:
+ * @addr        : pointer to unsigned 32-bit value
+ * @val         : value to store
+ *
+ * Convert native value to unsigned unaligned 32-bit big-endian value
+ *
+ **/
+
+static INLINE void retro_set_unaligned_64be(void *addr, uint64_t v) {
+  retro_unaligned64(addr) = retro_cpu_to_be64(v);
+}
+
 
 #endif
