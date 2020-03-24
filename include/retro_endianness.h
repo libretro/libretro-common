@@ -380,19 +380,23 @@ static INLINE uint32_t load32be(const uint32_t *addr)
 
 #define retro_be_to_cpu64(val) swap_if_little64(val)
 
+#ifndef _MSVC
+#define MAY_ALIAS  __attribute__((__may_alias__))
+#endif
+
 #pragma pack(push, 1)
 struct retro_unaligned_uint16_s
 {
   uint16_t val;
-};
+} MAY_ALIAS;
 struct retro_unaligned_uint32_s
 {
   uint32_t val;
-};
+} MAY_ALIAS;
 struct retro_unaligned_uint64_s
 {
   uint64_t val;
-};
+} MAY_ALIAS;
 #pragma pack(pop)
 
 typedef struct retro_unaligned_uint16_s retro_unaligned_uint16_t;
