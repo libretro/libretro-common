@@ -380,7 +380,7 @@ static INLINE uint32_t load32be(const uint32_t *addr)
 
 #define retro_be_to_cpu64(val) swap_if_little64(val)
 
-#ifndef _MSVC
+#ifdef  __GNUC__
 /* This attribute means that the same memory may be refferred through
    pointers to different size of the object (aliasing). E.g. that u8 *
    and u32 * may actually be pointing to the same object.  */
