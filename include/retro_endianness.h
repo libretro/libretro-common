@@ -110,9 +110,13 @@
 #ifdef MSB_FIRST
 #  define RETRO_IS_BIG_ENDIAN 1
 #  define RETRO_IS_LITTLE_ENDIAN 0
+/* For compatibility */
+#  define WORDS_BIGENDIAN 1
 #else
 #  define RETRO_IS_BIG_ENDIAN 0
 #  define RETRO_IS_LITTLE_ENDIAN 1
+/* For compatibility */
+#  undef WORDS_BIGENDIAN
 #endif
 
 
