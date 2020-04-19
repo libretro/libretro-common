@@ -68,7 +68,7 @@
 #  endif
 #endif
 
-#if defined (__CELLOS_LV2__) && !defined(__PSL1GHT__)
+#if defined (__CELLOS_LV2__)  && !defined(__PSL1GHT__)
 #include <cell/cell_fs.h>
 #define O_RDONLY CELL_FS_O_RDONLY
 #define O_WRONLY CELL_FS_O_WRONLY
@@ -151,7 +151,7 @@
 #include <fileXio.h>
 #endif
 
-#if defined (__CELLOS_LV2__) && !defined(__PSL1GHT__)
+#if defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)
 #include <cell/cell_fs.h>
 #endif
 
@@ -1257,7 +1257,7 @@ const char *retro_vfs_dirent_get_name_impl(libretro_vfs_implementation_dir *rdir
    }
 #endif
    return (char*)rdir->entry.cFileName;
-#elif defined(VITA) || defined(PSP) || (defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)) || defined(ORBIS)
+#elif defined(VITA) || defined(PSP) || defined(__CELLOS_LV2__) && !defined(__PSL1GHT__) || defined(ORBIS)
    return rdir->entry.d_name;
 #elif defined(PS2)
    return rdir->entry.name;
