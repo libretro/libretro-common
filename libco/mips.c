@@ -19,9 +19,6 @@
 extern "C" {
 #endif
 
-static thread_local uint64_t co_active_buffer[64];
-static thread_local cothread_t co_active_handle;
-
 #if __mips >= 3
 /* If we have 64-bit registers.  */
 #define STORE_REG "sd"
@@ -32,12 +29,22 @@ static thread_local cothread_t co_active_handle;
 #define STORE_REG "sw"
 #define LOAD_REG "lw"
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-#define REG_TRANSFORM(x) (((uint64_t)(x)) << 64)
+#define REG_TRANSFORM(x) (((uint64_t)(x)) << 32)
 #else
 #define REG_TRANSFORM(x) (x)
 #endif
 #endif
 #define HAVE_FP 1
+#ifdef __psp__
+#define HAVE_VFP 1
+#else
+#define HAVE_VFP 0
+#endif
+
+#define CONTEXT_SIZE 0x300
+
+static thread_local uint64_t co_active_buffer[CONTEXT_SIZE / 8] __attribute__((__aligned__((16))));
+static thread_local cothread_t co_active_handle;
 
 __asm__ (
       ".align 4\n"
@@ -70,6 +77,40 @@ __asm__ (
       " swc1 $f29, 0x84($a1)\n"
       " swc1 $f30, 0x88($a1)\n"
 #endif
+#if HAVE_VFP
+      " sv.q	c000, 0x90($a1), wt\n"
+      " sv.q	c010, 0xa0($a1), wt\n"
+      " sv.q	c020, 0xb0($a1), wt\n"
+      " sv.q	c030, 0xc0($a1), wt\n"
+      " sv.q	c100, 0xd0($a1), wt\n"
+      " sv.q	c110, 0xe0($a1), wt\n"
+      " sv.q	c120, 0xf0($a1), wt\n"
+      " sv.q	c130, 0x100($a1), wt\n"
+      " sv.q	c200, 0x110($a1), wt\n"
+      " sv.q	c210, 0x120($a1), wt\n"
+      " sv.q	c220, 0x130($a1), wt\n"
+      " sv.q	c230, 0x140($a1), wt\n"
+      " sv.q	c300, 0x150($a1), wt\n"
+      " sv.q	c310, 0x160($a1), wt\n"
+      " sv.q	c320, 0x170($a1), wt\n"
+      " sv.q	c330, 0x180($a1), wt\n"
+      " sv.q	c400, 0x190($a1), wt\n"
+      " sv.q	c410, 0x1a0($a1), wt\n"
+      " sv.q	c420, 0x1b0($a1), wt\n"
+      " sv.q	c430, 0x1c0($a1), wt\n"
+      " sv.q	c500, 0x1d0($a1), wt\n"
+      " sv.q	c510, 0x1e0($a1), wt\n"
+      " sv.q	c520, 0x1f0($a1), wt\n"
+      " sv.q	c530, 0x200($a1), wt\n"
+      " sv.q	c600, 0x210($a1), wt\n"
+      " sv.q	c610, 0x220($a1), wt\n"
+      " sv.q	c620, 0x230($a1), wt\n"
+      " sv.q	c630, 0x240($a1), wt\n"
+      " sv.q	c700, 0x250($a1), wt\n"
+      " sv.q	c710, 0x260($a1), wt\n"
+      " sv.q	c720, 0x270($a1), wt\n"
+      " sv.q	c730, 0x280($a1), wt\n"
+#endif
       LOAD_REG " $s0, 0($a0)\n"
       LOAD_REG " $s1, 8($a0)\n"
       LOAD_REG " $s2, 0x10($a0)\n"
@@ -95,6 +136,40 @@ __asm__ (
       " lwc1 $f29, 0x84($a0)\n"
       " lwc1 $f30, 0x88($a0)\n"
 #endif
+#if HAVE_VFP
+      " lv.q	c000, 0x90($a0)\n"
+      " lv.q	c010, 0xa0($a0)\n"
+      " lv.q	c020, 0xb0($a0)\n"
+      " lv.q	c030, 0xc0($a0)\n"
+      " lv.q	c100, 0xd0($a0)\n"
+      " lv.q	c110, 0xe0($a0)\n"
+      " lv.q	c120, 0xf0($a0)\n"
+      " lv.q	c130, 0x100($a0)\n"
+      " lv.q	c200, 0x110($a0)\n"
+      " lv.q	c210, 0x120($a0)\n"
+      " lv.q	c220, 0x130($a0)\n"
+      " lv.q	c230, 0x140($a0)\n"
+      " lv.q	c300, 0x150($a0)\n"
+      " lv.q	c310, 0x160($a0)\n"
+      " lv.q	c320, 0x170($a0)\n"
+      " lv.q	c330, 0x180($a0)\n"
+      " lv.q	c400, 0x190($a0)\n"
+      " lv.q	c410, 0x1a0($a0)\n"
+      " lv.q	c420, 0x1b0($a0)\n"
+      " lv.q	c430, 0x1c0($a0)\n"
+      " lv.q	c500, 0x1d0($a0)\n"
+      " lv.q	c510, 0x1e0($a0)\n"
+      " lv.q	c520, 0x1f0($a0)\n"
+      " lv.q	c530, 0x200($a0)\n"
+      " lv.q	c600, 0x210($a0)\n"
+      " lv.q	c610, 0x220($a0)\n"
+      " lv.q	c620, 0x230($a0)\n"
+      " lv.q	c630, 0x240($a0)\n"
+      " lv.q	c700, 0x250($a0)\n"
+      " lv.q	c710, 0x260($a0)\n"
+      " lv.q	c720, 0x270($a0)\n"
+      " lv.q	c730, 0x280($a0)\n"
+#endif
       " jr $ra\n"
       "  nop\n"
       ".align 4\n"
@@ -113,24 +188,24 @@ void store_gp(uint64_t *s);
 
 cothread_t co_create(unsigned int size, void (*entrypoint)(void))
 {
-   size = (size + 1023) & ~1023;
+   size = (size + CONTEXT_SIZE + 1023) & ~1023;
    cothread_t handle = 0;
 #if defined(__APPLE__) || HAVE_POSIX_MEMALIGN >= 1
-   if (posix_memalign(&handle, 1024, size + 512) < 0)
+   if (posix_memalign(&handle, 1024, size) < 0)
       return 0;
 #else
-   handle = memalign(1024, size + 512);
+   handle = memalign(1024, size);
 #endif
 
    if (!handle)
       return handle;
 
    uint64_t *ptr = (uint64_t*)handle;
-   memset(ptr, 0, 512);
+   memset(ptr, 0, CONTEXT_SIZE);
    /* Non-volatiles.  */
    /* ptr[0],..., ptr[7] -> s0,..., s7 */
    store_gp(&ptr[8]); /* gp */
-   ptr[9] = REG_TRANSFORM(((uintptr_t)ptr + size + 512 - 8)); /* sp  */
+   ptr[9] = REG_TRANSFORM(((uintptr_t)ptr + size - 8)); /* sp  */
    /* ptr[10] is fp */
    ptr[11] = REG_TRANSFORM((uintptr_t)entrypoint); /* ra */
    return handle;
