@@ -1,6 +1,7 @@
 /*
   libco.mips (2020-04-20)
-  author: Google
+  author: phcoder
+  copyright: Google
   license: MIT
 */
 
