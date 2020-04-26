@@ -23,17 +23,25 @@ extern "C" {
 /* If we have 64-bit registers.  */
 #define STORE_REG "sd"
 #define LOAD_REG "ld"
-#define REG_TRANSFORM(x) (x)
+#define _GPR_OFF(x) (x * 8)
+#define _VFPOFF0 (12 * 8 + 12 * 4)
+typedef uint64_t gpr_t;
 #else
 /* 32-bit only variant.  */
 #define STORE_REG "sw"
 #define LOAD_REG "lw"
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-#define REG_TRANSFORM(x) (((uint64_t)(x)) << 32)
-#else
-#define REG_TRANSFORM(x) (x)
+#define _GPR_OFF(x) (x * 4)
+typedef uint32_t gpr_t;
 #endif
-#endif
+#define _STR(x) #x
+#define STR(x) _STR(x)
+#define GPR_OFF(x) STR(_GPR_OFF(x))
+/* Argument to GPR_OFF must be divisible by 4 and be >= number of saved GPR registers.  */
+#define _FPR_OFF(x) ((x * 4) + _GPR_OFF(12))
+#define FPR_OFF(x) STR(_FPR_OFF(x))
+/* Argument to FPR_OFF must be divisible by 4 and be >= number of saved FPR registers.  */
+#define _VFP_OFF(x) ((x * 16) + _FPR_OFF(12))
+#define VFP_OFF(x) STR(_VFP_OFF(x))
 #define HAVE_FP 1
 #ifdef __psp__
 #define HAVE_VFP 1
@@ -52,123 +60,123 @@ __asm__ (
       ".globl _co_switch_mips\n"
       "co_switch_mips:\n"
       "_co_switch_mips:\n"
-      STORE_REG " $s0, 0($a1)\n"
-      STORE_REG " $s1, 8($a1)\n"
-      STORE_REG " $s2, 0x10($a1)\n"
-      STORE_REG " $s3, 0x18($a1)\n"
-      STORE_REG " $s4, 0x20($a1)\n"
-      STORE_REG " $s5, 0x28($a1)\n"
-      STORE_REG " $s6, 0x30($a1)\n"
-      STORE_REG " $s7, 0x38($a1)\n"
-      STORE_REG " $gp, 0x40($a1)\n"
-      STORE_REG " $sp, 0x48($a1)\n"
-      STORE_REG " $fp, 0x50($a1)\n"
-      STORE_REG " $ra, 0x58($a1)\n"
+      STORE_REG " $s0, " GPR_OFF(0) "($a1)\n"
+      STORE_REG " $s1, " GPR_OFF(1) "($a1)\n"
+      STORE_REG " $s2, " GPR_OFF(2) "($a1)\n"
+      STORE_REG " $s3, " GPR_OFF(3) "($a1)\n"
+      STORE_REG " $s4, " GPR_OFF(4) "($a1)\n"
+      STORE_REG " $s5, " GPR_OFF(5) "($a1)\n"
+      STORE_REG " $s6, " GPR_OFF(6) "($a1)\n"
+      STORE_REG " $s7, " GPR_OFF(7) "($a1)\n"
+      STORE_REG " $gp, " GPR_OFF(8) "($a1)\n"
+      STORE_REG " $sp, " GPR_OFF(9) "($a1)\n"
+      STORE_REG " $fp, " GPR_OFF(10) "($a1)\n"
+      STORE_REG " $ra, " GPR_OFF(11) "($a1)\n"
 #if HAVE_FP
-      " swc1 $f20, 0x60($a1)\n"
-      " swc1 $f21, 0x64($a1)\n"
-      " swc1 $f22, 0x68($a1)\n"
-      " swc1 $f23, 0x6c($a1)\n"
-      " swc1 $f24, 0x70($a1)\n"
-      " swc1 $f25, 0x74($a1)\n"
-      " swc1 $f26, 0x78($a1)\n"
-      " swc1 $f27, 0x7c($a1)\n"
-      " swc1 $f28, 0x80($a1)\n"
-      " swc1 $f29, 0x84($a1)\n"
-      " swc1 $f30, 0x88($a1)\n"
+      " swc1 $f20, " FPR_OFF(0) "($a1)\n"
+      " swc1 $f21, " FPR_OFF(1) "($a1)\n"
+      " swc1 $f22, " FPR_OFF(2) "($a1)\n"
+      " swc1 $f23, " FPR_OFF(3) "($a1)\n"
+      " swc1 $f24, " FPR_OFF(4) "($a1)\n"
+      " swc1 $f25, " FPR_OFF(5) "($a1)\n"
+      " swc1 $f26, " FPR_OFF(6) "($a1)\n"
+      " swc1 $f27, " FPR_OFF(7) "($a1)\n"
+      " swc1 $f28, " FPR_OFF(8) "($a1)\n"
+      " swc1 $f29, " FPR_OFF(9) "($a1)\n"
+      " swc1 $f30, " FPR_OFF(10) "($a1)\n"
 #endif
 #if HAVE_VFP
-      " sv.q	c000, 0x90($a1), wt\n"
-      " sv.q	c010, 0xa0($a1), wt\n"
-      " sv.q	c020, 0xb0($a1), wt\n"
-      " sv.q	c030, 0xc0($a1), wt\n"
-      " sv.q	c100, 0xd0($a1), wt\n"
-      " sv.q	c110, 0xe0($a1), wt\n"
-      " sv.q	c120, 0xf0($a1), wt\n"
-      " sv.q	c130, 0x100($a1), wt\n"
-      " sv.q	c200, 0x110($a1), wt\n"
-      " sv.q	c210, 0x120($a1), wt\n"
-      " sv.q	c220, 0x130($a1), wt\n"
-      " sv.q	c230, 0x140($a1), wt\n"
-      " sv.q	c300, 0x150($a1), wt\n"
-      " sv.q	c310, 0x160($a1), wt\n"
-      " sv.q	c320, 0x170($a1), wt\n"
-      " sv.q	c330, 0x180($a1), wt\n"
-      " sv.q	c400, 0x190($a1), wt\n"
-      " sv.q	c410, 0x1a0($a1), wt\n"
-      " sv.q	c420, 0x1b0($a1), wt\n"
-      " sv.q	c430, 0x1c0($a1), wt\n"
-      " sv.q	c500, 0x1d0($a1), wt\n"
-      " sv.q	c510, 0x1e0($a1), wt\n"
-      " sv.q	c520, 0x1f0($a1), wt\n"
-      " sv.q	c530, 0x200($a1), wt\n"
-      " sv.q	c600, 0x210($a1), wt\n"
-      " sv.q	c610, 0x220($a1), wt\n"
-      " sv.q	c620, 0x230($a1), wt\n"
-      " sv.q	c630, 0x240($a1), wt\n"
-      " sv.q	c700, 0x250($a1), wt\n"
-      " sv.q	c710, 0x260($a1), wt\n"
-      " sv.q	c720, 0x270($a1), wt\n"
-      " sv.q	c730, 0x280($a1), wt\n"
+      " sv.q	c000, " VFP_OFF(0) "($a1), wt\n"
+      " sv.q	c010, " VFP_OFF(1) "($a1), wt\n"
+      " sv.q	c020, " VFP_OFF(2) "($a1), wt\n"
+      " sv.q	c030, " VFP_OFF(3) "($a1), wt\n"
+      " sv.q	c100, " VFP_OFF(4) "($a1), wt\n"
+      " sv.q	c110, " VFP_OFF(5) "($a1), wt\n"
+      " sv.q	c120, " VFP_OFF(6) "($a1), wt\n"
+      " sv.q	c130, " VFP_OFF(7) "($a1), wt\n"
+      " sv.q	c200, " VFP_OFF(8) "($a1), wt\n"
+      " sv.q	c210, " VFP_OFF(9) "($a1), wt\n"
+      " sv.q	c220, " VFP_OFF(10) "($a1), wt\n"
+      " sv.q	c230, " VFP_OFF(11) "($a1), wt\n"
+      " sv.q	c300, " VFP_OFF(12) "($a1), wt\n"
+      " sv.q	c310, " VFP_OFF(13) "($a1), wt\n"
+      " sv.q	c320, " VFP_OFF(14) "($a1), wt\n"
+      " sv.q	c330, " VFP_OFF(15) "($a1), wt\n"
+      " sv.q	c400, " VFP_OFF(16) "($a1), wt\n"
+      " sv.q	c410, " VFP_OFF(17) "($a1), wt\n"
+      " sv.q	c420, " VFP_OFF(18) "($a1), wt\n"
+      " sv.q	c430, " VFP_OFF(19) "($a1), wt\n"
+      " sv.q	c500, " VFP_OFF(20) "($a1), wt\n"
+      " sv.q	c510, " VFP_OFF(21) "($a1), wt\n"
+      " sv.q	c520, " VFP_OFF(22) "($a1), wt\n"
+      " sv.q	c530, " VFP_OFF(23) "($a1), wt\n"
+      " sv.q	c600, " VFP_OFF(24) "($a1), wt\n"
+      " sv.q	c610, " VFP_OFF(25) "($a1), wt\n"
+      " sv.q	c620, " VFP_OFF(26) "($a1), wt\n"
+      " sv.q	c630, " VFP_OFF(27) "($a1), wt\n"
+      " sv.q	c700, " VFP_OFF(28) "($a1), wt\n"
+      " sv.q	c710, " VFP_OFF(29) "($a1), wt\n"
+      " sv.q	c720, " VFP_OFF(30) "($a1), wt\n"
+      " sv.q	c730, " VFP_OFF(31) "($a1), wt\n"
 #endif
-      LOAD_REG " $s0, 0($a0)\n"
-      LOAD_REG " $s1, 8($a0)\n"
-      LOAD_REG " $s2, 0x10($a0)\n"
-      LOAD_REG " $s3, 0x18($a0)\n"
-      LOAD_REG " $s4, 0x20($a0)\n"
-      LOAD_REG " $s5, 0x28($a0)\n"
-      LOAD_REG " $s6, 0x30($a0)\n"
-      LOAD_REG " $s7, 0x38($a0)\n"
-      LOAD_REG " $gp, 0x40($a0)\n"
-      LOAD_REG " $sp, 0x48($a0)\n"
-      LOAD_REG " $fp, 0x50($a0)\n"
-      LOAD_REG " $ra, 0x58($a0)\n"
+      LOAD_REG " $s0, " GPR_OFF(0) "($a0)\n"
+      LOAD_REG " $s1, " GPR_OFF(1) "($a0)\n"
+      LOAD_REG " $s2, " GPR_OFF(2) "($a0)\n"
+      LOAD_REG " $s3, " GPR_OFF(3) "($a0)\n"
+      LOAD_REG " $s4, " GPR_OFF(4) "($a0)\n"
+      LOAD_REG " $s5, " GPR_OFF(5) "($a0)\n"
+      LOAD_REG " $s6, " GPR_OFF(6) "($a0)\n"
+      LOAD_REG " $s7, " GPR_OFF(7) "($a0)\n"
+      LOAD_REG " $gp, " GPR_OFF(8) "($a0)\n"
+      LOAD_REG " $sp, " GPR_OFF(9) "($a0)\n"
+      LOAD_REG " $fp, " GPR_OFF(10) "($a0)\n"
+      LOAD_REG " $ra, " GPR_OFF(11) "($a0)\n"
 #if HAVE_FP
-      " lwc1 $f20, 0x60($a0)\n"
-      " lwc1 $f21, 0x64($a0)\n"
-      " lwc1 $f22, 0x68($a0)\n"
-      " lwc1 $f23, 0x6c($a0)\n"
-      " lwc1 $f24, 0x70($a0)\n"
-      " lwc1 $f25, 0x74($a0)\n"
-      " lwc1 $f26, 0x78($a0)\n"
-      " lwc1 $f27, 0x7c($a0)\n"
-      " lwc1 $f28, 0x80($a0)\n"
-      " lwc1 $f29, 0x84($a0)\n"
-      " lwc1 $f30, 0x88($a0)\n"
+      " lwc1 $f20, " FPR_OFF(0) "($a0)\n"
+      " lwc1 $f21, " FPR_OFF(1) "($a0)\n"
+      " lwc1 $f22, " FPR_OFF(2) "($a0)\n"
+      " lwc1 $f23, " FPR_OFF(3) "($a0)\n"
+      " lwc1 $f24, " FPR_OFF(4) "($a0)\n"
+      " lwc1 $f25, " FPR_OFF(5) "($a0)\n"
+      " lwc1 $f26, " FPR_OFF(6) "($a0)\n"
+      " lwc1 $f27, " FPR_OFF(7) "($a0)\n"
+      " lwc1 $f28, " FPR_OFF(8) "($a0)\n"
+      " lwc1 $f29, " FPR_OFF(9) "($a0)\n"
+      " lwc1 $f30, " FPR_OFF(10) "($a0)\n"
 #endif
 #if HAVE_VFP
-      " lv.q	c000, 0x90($a0)\n"
-      " lv.q	c010, 0xa0($a0)\n"
-      " lv.q	c020, 0xb0($a0)\n"
-      " lv.q	c030, 0xc0($a0)\n"
-      " lv.q	c100, 0xd0($a0)\n"
-      " lv.q	c110, 0xe0($a0)\n"
-      " lv.q	c120, 0xf0($a0)\n"
-      " lv.q	c130, 0x100($a0)\n"
-      " lv.q	c200, 0x110($a0)\n"
-      " lv.q	c210, 0x120($a0)\n"
-      " lv.q	c220, 0x130($a0)\n"
-      " lv.q	c230, 0x140($a0)\n"
-      " lv.q	c300, 0x150($a0)\n"
-      " lv.q	c310, 0x160($a0)\n"
-      " lv.q	c320, 0x170($a0)\n"
-      " lv.q	c330, 0x180($a0)\n"
-      " lv.q	c400, 0x190($a0)\n"
-      " lv.q	c410, 0x1a0($a0)\n"
-      " lv.q	c420, 0x1b0($a0)\n"
-      " lv.q	c430, 0x1c0($a0)\n"
-      " lv.q	c500, 0x1d0($a0)\n"
-      " lv.q	c510, 0x1e0($a0)\n"
-      " lv.q	c520, 0x1f0($a0)\n"
-      " lv.q	c530, 0x200($a0)\n"
-      " lv.q	c600, 0x210($a0)\n"
-      " lv.q	c610, 0x220($a0)\n"
-      " lv.q	c620, 0x230($a0)\n"
-      " lv.q	c630, 0x240($a0)\n"
-      " lv.q	c700, 0x250($a0)\n"
-      " lv.q	c710, 0x260($a0)\n"
-      " lv.q	c720, 0x270($a0)\n"
-      " lv.q	c730, 0x280($a0)\n"
+      " lv.q	c000, " VFP_OFF(0) "($a0)\n"
+      " lv.q	c010, " VFP_OFF(1) "($a0)\n"
+      " lv.q	c020, " VFP_OFF(2) "($a0)\n"
+      " lv.q	c030, " VFP_OFF(3) "($a0)\n"
+      " lv.q	c100, " VFP_OFF(4) "($a0)\n"
+      " lv.q	c110, " VFP_OFF(5) "($a0)\n"
+      " lv.q	c120, " VFP_OFF(6) "($a0)\n"
+      " lv.q	c130, " VFP_OFF(7) "($a0)\n"
+      " lv.q	c200, " VFP_OFF(8) "($a0)\n"
+      " lv.q	c210, " VFP_OFF(9) "($a0)\n"
+      " lv.q	c220, " VFP_OFF(10) "($a0)\n"
+      " lv.q	c230, " VFP_OFF(11) "($a0)\n"
+      " lv.q	c300, " VFP_OFF(12) "($a0)\n"
+      " lv.q	c310, " VFP_OFF(13) "($a0)\n"
+      " lv.q	c320, " VFP_OFF(14) "($a0)\n"
+      " lv.q	c330, " VFP_OFF(15) "($a0)\n"
+      " lv.q	c400, " VFP_OFF(16) "($a0)\n"
+      " lv.q	c410, " VFP_OFF(17) "($a0)\n"
+      " lv.q	c420, " VFP_OFF(18) "($a0)\n"
+      " lv.q	c430, " VFP_OFF(19) "($a0)\n"
+      " lv.q	c500, " VFP_OFF(20) "($a0)\n"
+      " lv.q	c510, " VFP_OFF(21) "($a0)\n"
+      " lv.q	c520, " VFP_OFF(22) "($a0)\n"
+      " lv.q	c530, " VFP_OFF(23) "($a0)\n"
+      " lv.q	c600, " VFP_OFF(24) "($a0)\n"
+      " lv.q	c610, " VFP_OFF(25) "($a0)\n"
+      " lv.q	c620, " VFP_OFF(26) "($a0)\n"
+      " lv.q	c630, " VFP_OFF(27) "($a0)\n"
+      " lv.q	c700, " VFP_OFF(28) "($a0)\n"
+      " lv.q	c710, " VFP_OFF(29) "($a0)\n"
+      " lv.q	c720, " VFP_OFF(30) "($a0)\n"
+      " lv.q	c730, " VFP_OFF(31) "($a0)\n"
 #endif
       " jr $ra\n"
       "  nop\n"
@@ -184,7 +192,7 @@ __asm__ (
 
 /* ASM */
 void co_switch_mips(cothread_t handle, cothread_t current);
-void store_gp(uint64_t *s);
+void store_gp(gpr_t *s);
 
 cothread_t co_create(unsigned int size, void (*entrypoint)(void))
 {
@@ -200,14 +208,14 @@ cothread_t co_create(unsigned int size, void (*entrypoint)(void))
    if (!handle)
       return handle;
 
-   uint64_t *ptr = (uint64_t*)handle;
+   gpr_t *ptr = (gpr_t*)handle;
    memset(ptr, 0, CONTEXT_SIZE);
    /* Non-volatiles.  */
    /* ptr[0],..., ptr[7] -> s0,..., s7 */
    store_gp(&ptr[8]); /* gp */
-   ptr[9] = REG_TRANSFORM(((uintptr_t)ptr + size - 8)); /* sp  */
+   ptr[9] = (uintptr_t)ptr + size - 8; /* sp  */
    /* ptr[10] is fp */
-   ptr[11] = REG_TRANSFORM((uintptr_t)entrypoint); /* ra */
+   ptr[11] = (uintptr_t)entrypoint; /* ra */
    return handle;
 }
 
