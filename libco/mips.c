@@ -214,7 +214,7 @@ cothread_t co_create(unsigned int size, void (*entrypoint)(void))
    /* Non-volatiles.  */
    /* ptr[0],..., ptr[7] -> s0,..., s7 */
    store_gp(&ptr[8]); /* gp */
-   ptr[9] = (uintptr_t)ptr + size - 8; /* sp  */
+   ptr[9] = (uintptr_t)ptr + size - 16; /* sp  */
    /* ptr[10] is fp */
    ptr[11] = (uintptr_t)entrypoint; /* ra */
    return handle;
