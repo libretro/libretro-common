@@ -199,6 +199,8 @@ retro_perf_tick_t cpu_features_get_perf_counter(void)
    time_ticks = OSGetSystemTime();
 #elif defined(HAVE_LIBNX)
    time_ticks = armGetSystemTick();
+#elif defined(EMSCRIPTEN)
+   time_ticks = emscripten_get_now() * 1000;
 #endif
 
    return time_ticks;
