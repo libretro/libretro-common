@@ -340,6 +340,7 @@ int64_t retro_vfs_file_read_cdrom(libretro_vfs_implementation_file *stream,
 
    if (string_is_equal_noncase(ext, "cue"))
    {
+      if ((int64_t)len > (int64_t)stream->cdrom.cue_len - stream->cdrom.byte_pos) len = stream->cdrom.cue_len - stream->cdrom.byte_pos - 1;
       if ((int64_t)len < (int64_t)stream->cdrom.cue_len - stream->cdrom.byte_pos)
       {
 #ifdef CDROM_DEBUG
