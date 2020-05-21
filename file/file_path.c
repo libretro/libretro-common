@@ -79,11 +79,6 @@
 #include <pspkernel.h>
 #endif
 
-#if defined(PS2)
-#include <fileXio_rpc.h>
-#include <fileXio.h>
-#endif
-
 #if defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)
 #include <cell/cell_fs.h>
 #endif
@@ -92,7 +87,7 @@
 #define FIO_S_ISDIR SCE_S_ISDIR
 #endif
 
-#if (defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)) || defined(__QNX__) || defined(PSP) || defined(PS2)
+#if (defined(__CELLOS_LV2__) && !defined(__PSL1GHT__)) || defined(__QNX__) || defined(PSP)
 #include <unistd.h> /* stat() is defined here */
 #endif
 
@@ -626,19 +621,29 @@ const char *path_basename(const char *path)
  **/
 bool path_is_absolute(const char *path)
 {
+#if defined(__wiiu__) || defined(VITA)
+   const char *seperator = NULL;
+#endif
+
+   if (string_is_empty(path))
+      return false;
+
    if (path[0] == '/')
       return true;
-#ifdef _WIN32
-   /* Many roads lead to Rome ... */
-   if ((    strstr(path, "\\\\") == path)
-         || strstr(path, ":/")
-         || strstr(path, ":\\")
-         || strstr(path, ":\\\\"))
+
+#if defined(_WIN32)
+   /* Many roads lead to Rome...
+    * Note: Drive letter can only be 1 character long */
+   if (string_starts_with(path,     "\\\\") ||
+       string_starts_with(path + 1, ":/")   ||
+       string_starts_with(path + 1, ":\\"))
       return true;
 #elif defined(__wiiu__) || defined(VITA)
-   if (strstr(path, ":/"))
+   seperator = strchr(path, ':');
+   if (seperator && (seperator[1] == '/'))
       return true;
 #endif
+
    return false;
 }
 
