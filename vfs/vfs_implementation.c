@@ -604,8 +604,10 @@ int64_t retro_vfs_file_tell_impl(libretro_vfs_implementation_file *stream)
       /* VC2005 and up have a special 64-bit ftell */
 #ifdef ATLEAST_VC2005
       return _ftelli64(stream->fp);
-#else
+#elif defined(__CELLOS_LV2__) || defined(_MSC_VER) && _MSC_VER <= 1310
       return ftell(stream->fp);
+#else
+      return ftello(stream->fp);
 #endif
 #endif
    }
