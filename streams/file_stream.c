@@ -111,7 +111,11 @@ bool filestream_exists(const char *path)
    if (!dummy)
       return false;
 
-   filestream_close(dummy);
+   if (filestream_close(dummy) != 0)
+      if (dummy)
+         free(dummy);
+
+   dummy = NULL;
    return true;
 }
 
@@ -528,7 +532,9 @@ int64_t filestream_read_file(const char *path, void **buf, int64_t *len)
    if (ret < 0)
       goto error;
 
-   filestream_close(file);
+   if (filestream_close(file) != 0)
+      if (file)
+         free(file);
 
    *buf    = content_buf;
 
@@ -543,7 +549,8 @@ int64_t filestream_read_file(const char *path, void **buf, int64_t *len)
 
 error:
    if (file)
-      filestream_close(file);
+      if (filestream_close(file) != 0)
+         free(file);
    if (content_buf)
       free(content_buf);
    if (len)
@@ -572,7 +579,9 @@ bool filestream_write_file(const char *path, const void *data, int64_t size)
       return false;
 
    ret = filestream_write(file, data, size);
-   filestream_close(file);
+   if (filestream_close(file) != 0)
+      if (file)
+         free(file);
 
    if (ret != size)
       return false;
