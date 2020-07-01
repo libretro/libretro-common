@@ -71,7 +71,7 @@ static void ssl_debug(void *ctx, int level,
 {
    ((void) level);
 
-   mbedtls_fprintf((FILE*)ctx, "%s:%04d: %s", file, line, str);
+   fprintf((FILE*)ctx, "%s:%04d: %s", file, line, str);
    fflush((FILE*)ctx);
 }
 
@@ -81,7 +81,9 @@ void* ssl_socket_init(int fd, const char *domain)
 
    state->domain = domain;
 
+#if defined(MBEDTLS_DEBUG_C)
    mbedtls_debug_set_threshold(DEBUG_LEVEL);
+#endif
 
    mbedtls_net_init(&state->net_ctx);
    mbedtls_ssl_init(&state->ctx);
