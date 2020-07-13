@@ -403,7 +403,7 @@ void fill_pathname_basedir(char *out_dir,
 {
    if (out_dir != in_path)
       strlcpy(out_dir, in_path, size);
-   path_basedir(out_dir);
+   path_basedir_size(out_dir, size);
 }
 
 void fill_pathname_basedir_noext(char *out_dir,
@@ -544,6 +544,32 @@ void path_basedir(char *path)
    char *last = NULL;
 
    if (strlen(path) < 2)
+      return;
+
+   last = find_last_slash(path);
+
+   if (last)
+      last[1] = '\0';
+   else
+      snprintf(path, 3, "." PATH_DEFAULT_SLASH());
+}
+
+/**
+ * path_basedir_size:
+ * @path               : path
+ * @size               : size of path
+ *
+ * Extracts base directory by mutating path.
+ * Keeps trailing '/'.
+ *
+ * Specialized function that avoids the implicit
+ * strlen call
+ **/
+void path_basedir_size(char *path, size_t size)
+{
+   char *last = NULL;
+
+   if (size < 2)
       return;
 
    last = find_last_slash(path);
@@ -1267,14 +1293,14 @@ void fill_pathname_application_dir(char *s, size_t len)
 void fill_pathname_home_dir(char *s, size_t len)
 {
 #ifdef __WINRT__
-   strlcpy(s, uwp_dir_data, len);
+   const char *home = uwp_dir_data;
 #else
    const char *home = getenv("HOME");
+#endif
    if (home)
       strlcpy(s, home, len);
    else
       *s = 0;
-#endif
 }
 #endif
 
