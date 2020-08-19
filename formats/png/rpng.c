@@ -231,75 +231,59 @@ end:
 static void png_reverse_filter_copy_line_rgb(uint32_t *data,
       const uint8_t *decoded, unsigned width, unsigned bpp)
 {
-   unsigned i;
+   uint32_t *data_ptr = NULL;
 
    bpp /= 8;
 
-   for (i = 0; i < width; i++)
+   for (data_ptr = &data[0]; data_ptr < data + width; data_ptr++)
    {
-      uint32_t r, g, b;
-
-      r        = *decoded;
-      decoded += bpp;
-      g        = *decoded;
-      decoded += bpp;
-      b        = *decoded;
-      decoded += bpp;
-      data[i]  = (0xffu << 24) | (r << 16) | (g << 8) | (b << 0);
+      uint32_t r  = *(decoded);
+      uint32_t g  = *(decoded + bpp);
+      uint32_t b  = *(decoded + bpp + bpp);
+      decoded    += (3 * bpp);
+      *data_ptr   = (0xffu << 24) | (r << 16) | (g << 8) | (b << 0);
    }
 }
 
 static void png_reverse_filter_copy_line_rgba(uint32_t *data,
       const uint8_t *decoded, unsigned width, unsigned bpp)
 {
-   unsigned i;
+   uint32_t *data_ptr = NULL;
 
    bpp /= 8;
 
-   for (i = 0; i < width; i++)
+   for (data_ptr = &data[0]; data_ptr < data + width; data_ptr++)
    {
-      uint32_t r, g, b, a;
-      r        = *decoded;
-      decoded += bpp;
-      g        = *decoded;
-      decoded += bpp;
-      b        = *decoded;
-      decoded += bpp;
-      a        = *decoded;
-      decoded += bpp;
-      data[i]  = (a << 24) | (r << 16) | (g << 8) | (b << 0);
+      uint32_t r        = *(decoded);
+      uint32_t g        = *(decoded + bpp);
+      uint32_t b        = *(decoded + bpp + bpp);
+      uint32_t a        = *(decoded + bpp + bpp + bpp);
+      decoded          += (4 * bpp);
+      *data_ptr         = (a << 24) | (r << 16) | (g << 8) | (b << 0);
    }
 }
 
 static void png_reverse_filter_copy_line_bw(uint32_t *data,
       const uint8_t *decoded, unsigned width, unsigned depth)
 {
-   unsigned i, bit;
-   static const unsigned mul_table[] = { 0, 0xff, 0x55, 0, 0x11, 0, 0, 0, 0x01 };
-   unsigned mul, mask;
+   unsigned i;
+   static const unsigned 
+      mul_table[]     = { 0, 0xff, 0x55, 0, 0x11, 0, 0, 0, 0x01 };
+   unsigned mul       = mul_table[depth];
+   unsigned mask      = (1 << depth) - 1;
+   unsigned bit       = 0;
+   uint32_t *data_ptr = NULL;
 
-   if (depth == 16)
-   {
-      for (i = 0; i < width; i++)
-      {
-         uint32_t val = decoded[i << 1];
-         data[i]      = (val * 0x010101) | (0xffu << 24);
-      }
-      return;
-   }
-
-   mul  = mul_table[depth];
-   mask = (1 << depth) - 1;
-   bit  = 0;
-
-   for (i = 0; i < width; i++, bit += depth)
+   for (   i = 0, data_ptr = &data[0]
+         ; i < width
+         ; i++, data_ptr++, bit += depth)
    {
       unsigned byte = bit >> 3;
       unsigned val  = decoded[byte] >> (8 - depth - (bit & 7));
 
       val          &= mask;
       val          *= mul;
-      data[i]       = (val * 0x010101) | (0xffu << 24);
+      *data_ptr     = (val * 0x010101) | (0xffu << 24);
    }
 }
 
@@ -307,20 +291,16 @@ static void png_reverse_filter_copy_line_gray_alpha(uint32_t *data,
       const uint8_t *decoded, unsigned width,
       unsigned bpp)
 {
-   unsigned i;
+   uint32_t *data_ptr = NULL;
 
    bpp /= 8;
 
-   for (i = 0; i < width; i++)
+   for (data_ptr = &data[0]; data_ptr < data + width; data_ptr++)
    {
-      uint32_t gray, alpha;
-
-      gray     = *decoded;
-      decoded += bpp;
-      alpha    = *decoded;
-      decoded += bpp;
-
-      data[i]  = (gray * 0x010101) | (alpha << 24);
+      uint32_t gray     = *(decoded);
+      uint32_t alpha    = *(decoded + bpp);
+      decoded          += (2 * bpp);
+      *data_ptr         = (gray * 0x010101) | (alpha << 24);
    }
 }
 
@@ -480,10 +460,13 @@ static void png_reverse_filter_adam7_deinterlace_pass(uint32_t *data,
    for (y = 0; y < pass_height;
          y++, data += ihdr->width * pass->stride_y, input += pass_width)
    {
-      uint32_t *out = data;
+      uint32_t *out             = data;
+      const uint32_t *input_ptr = NULL;
 
-      for (x = 0; x < pass_width; x++, out += pass->stride_x)
-         *out = input[x];
+      for (   input_ptr = &input[0]
+            ; input_ptr < input + pass_width
+            ; input_ptr++, out += pass->stride_x)
+         *out = *input_ptr;
    }
 }
 
@@ -626,7 +609,23 @@ static int png_reverse_filter_copy_line(uint32_t *data, const struct png_ihdr *i
    switch (ihdr->color_type)
    {
       case PNG_IHDR_COLOR_GRAY:
-         png_reverse_filter_copy_line_bw(data, pngp->decoded_scanline, ihdr->width, ihdr->depth);
+         if (ihdr->depth == 16)
+         {
+            unsigned i;
+            const uint8_t *decoded = pngp->decoded_scanline;
+            unsigned width         = ihdr->width;
+            uint32_t *data_ptr     = NULL;
+
+            for (   i = 0, data_ptr = &data[0]
+                  ; i < width
+                  ; data_ptr++, i++)
+            {
+               uint32_t val = decoded[i << 1];
+               *data_ptr    = (val * 0x010101) | (0xffu << 24);
+            }
+         }
+         else
+            png_reverse_filter_copy_line_bw(data, pngp->decoded_scanline, ihdr->width, ihdr->depth);
          break;
       case PNG_IHDR_COLOR_RGB:
          png_reverse_filter_copy_line_rgb(data, pngp->decoded_scanline, ihdr->width, ihdr->depth);
@@ -833,14 +832,17 @@ false_end:
 static bool png_read_plte(uint8_t *buf,
       uint32_t *buffer, unsigned entries)
 {
-   unsigned i;
+   uint8_t *buf_ptr     = NULL;
+   uint32_t *buffer_ptr = NULL;
 
-   for (i = 0; i < entries; i++)
+   for (   buf_ptr = &buf[0], buffer_ptr = &buffer[0]
+         ; buffer_ptr < buffer + entries
+         ; buf_ptr += 3, buffer_ptr++)
    {
-      uint32_t r = buf[3 * i + 0];
-      uint32_t g = buf[3 * i + 1];
-      uint32_t b = buf[3 * i + 2];
-      buffer[i] = (r << 16) | (g << 8) | (b << 0) | (0xffu << 24);
+      uint32_t r  = *(buf_ptr);
+      uint32_t g  = *(buf_ptr + 1);
+      uint32_t b  = *(buf_ptr + 2);
+      *buffer_ptr = (r << 16) | (g << 8) | (b << 0) | (0xffu << 24);
    }
 
    return true;
@@ -956,16 +958,15 @@ static bool read_chunk_header(uint8_t *buf, uint8_t *buf_end,
 {
    unsigned i;
    uint8_t dword[4];
+   uint8_t *dword_ptr = NULL;
+   uint8_t *buf_ptr   = NULL;
 
-   dword[0] = '\0';
+   dword[0]           = '\0';
 
-   /* Check whether reading the header will overflow
-    * the data buffer */
-   if (buf_end - buf < 8)
-      return false;
-
-   for (i = 0; i < 4; i++)
-      dword[i] = buf[i];
+   for (   dword_ptr = &dword[0], buf_ptr = &buf[0]
+         ; dword_ptr < dword + 4
+         ; dword_ptr++, buf_ptr++)
+      *dword_ptr = *buf_ptr;
 
    chunk->size = dword_be(dword);
 
@@ -1019,6 +1020,10 @@ bool rpng_iterate_image(rpng_t *rpng)
    if (buf > rpng->buff_end)
       return false;
 
+   /* Check whether reading the header will overflow
+    * the data buffer */
+   if (rpng->buff_end - buf < 8)
+      return false;
    if (!read_chunk_header(buf, rpng->buff_end, &chunk))
       return false;
 
