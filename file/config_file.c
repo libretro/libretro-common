@@ -462,10 +462,10 @@ static bool config_file_parse_line(config_file_t *conf,
    /* Check whether entire line is a comment */
    if (comment)
    {
+      config_file_t sub_conf;
       char real_path[PATH_MAX_LENGTH];
       char *path               = NULL;
       char *include_line       = NULL;
-      config_file_t *sub_conf  = NULL;
 
       /* Starting a line with an 'include' directive
        * appends a sub-config file
@@ -501,12 +501,22 @@ static bool config_file_parse_line(config_file_t *conf,
       config_file_add_sub_conf(conf, path,
             real_path, sizeof(real_path), cb);
 
-      sub_conf = config_file_new_alloc();
+      config_file_initialize(&sub_conf);
 
-      if (config_file_load_internal(sub_conf, real_path,
-               conf->include_depth + 1, cb) == 0)
-         config_file_add_child_list(conf, sub_conf); /* Pilfer internal list. */
-      config_file_free(sub_conf);
+      switch (config_file_load_internal(&sub_conf, real_path,
+               conf->include_depth + 1, cb))
+      {
+         case 0:
+            /* Pilfer internal list. */
+            config_file_add_child_list(conf, &sub_conf);
+            /* fall-through to deinitialize */
+         case -1:
+            config_file_deinitialize(&sub_conf);
+            break;
+         case 1:
+         default:
+            break;
+      }
 
       free(path);
       return true;
@@ -560,12 +570,66 @@ static bool config_file_parse_line(config_file_t *conf,
    return true;
 }
 
-void config_file_free(config_file_t *conf)
+static int config_file_from_string_internal(
+      struct config_file *conf,
+      char *from_string,
+      const char *path)
+{
+   char *lines                    = from_string;
+   char *save_ptr                 = NULL;
+   char *line                     = NULL;
+
+   if (!string_is_empty(path))
+      conf->path                  = strdup(path);
+   if (string_is_empty(lines))
+      return 0;
+
+   /* Get first line of config file */
+   line = strtok_r(lines, "\n", &save_ptr);
+
+   while (line)
+   {
+      struct config_entry_list *list = (struct config_entry_list*)
+            malloc(sizeof(*list));
+
+      if (!list)
+         return -1;
+
+      list->readonly  = false;
+      list->key       = NULL;
+      list->value     = NULL;
+      list->next      = NULL;
+
+      /* Parse current line */
+      if (
+              !string_is_empty(line)
+            && config_file_parse_line(conf, list, line, NULL))
+      {
+         if (conf->entries)
+            conf->tail->next = list;
+         else
+            conf->entries    = list;
+
+         conf->tail          = list;
+      }
+
+      if (list != conf->tail)
+         free(list);
+
+      /* Get next line of config file */
+      line = strtok_r(NULL, "\n", &save_ptr);
+   }
+   
+   return 0;
+}
+
+
+bool config_file_deinitialize(config_file_t *conf)
 {
    struct config_include_list *inc_tmp = NULL;
    struct config_entry_list *tmp       = NULL;
    if (!conf)
-      return;
+      return false;
 
    tmp = conf->entries;
    while (tmp)
@@ -600,6 +664,13 @@ void config_file_free(config_file_t *conf)
 
    if (conf->path)
       free(conf->path);
+   return true;
+}
+
+void config_file_free(config_file_t *conf)
+{
+   if (!config_file_deinitialize(conf))
+      return;
    free(conf);
 }
 
@@ -623,58 +694,15 @@ bool config_append_file(config_file_t *conf, const char *path)
 config_file_t *config_file_new_from_string(char *from_string,
       const char *path)
 {
-   char *lines                    = from_string;
-   char *save_ptr                 = NULL;
-   char *line                     = NULL;
    struct config_file *conf      = config_file_new_alloc();
 
    if (!conf)
       return NULL;
-
-   if (!string_is_empty(path))
-      conf->path                  = strdup(path);
-   if (string_is_empty(lines))
-      return conf;
-
-   /* Get first line of config file */
-   line = strtok_r(lines, "\n", &save_ptr);
-
-   while (line)
+   if (config_file_from_string_internal(conf, from_string, path) == -1)
    {
-      struct config_entry_list *list = (struct config_entry_list*)
-            malloc(sizeof(*list));
-
-      if (!list)
-      {
-         config_file_free(conf);
-         return NULL;
-      }
-
-      list->readonly  = false;
-      list->key       = NULL;
-      list->value     = NULL;
-      list->next      = NULL;
-
-      /* Parse current line */
-      if (
-              !string_is_empty(line)
-            && config_file_parse_line(conf, list, line, NULL))
-      {
-         if (conf->entries)
-            conf->tail->next = list;
-         else
-            conf->entries    = list;
-
-         conf->tail          = list;
-      }
-
-      if (list != conf->tail)
-         free(list);
-
-      /* Get next line of config file */
-      line = strtok_r(NULL, "\n", &save_ptr);
+      config_file_free(conf);
+      return NULL;
    }
-
    return conf;
 }
 
@@ -693,10 +721,12 @@ config_file_t *config_file_new_from_path_to_string(const char *path)
           * modified by config_file_new_from_string() */
          if (length >= 0)
             conf = config_file_new_from_string((char*)ret_buf, path);
+
          if ((void*)ret_buf)
             free((void*)ret_buf);
       }
    }
+
    return conf;
 }
 
@@ -741,11 +771,10 @@ config_file_t *config_file_new(const char *path)
    return conf;
 }
 
-config_file_t *config_file_new_alloc(void)
+void config_file_initialize(struct config_file *conf)
 {
-   struct config_file *conf = (struct config_file*)malloc(sizeof(*conf));
    if (!conf)
-      return NULL;
+      return;
 
    conf->path                     = NULL;
    conf->entries                  = NULL;
@@ -755,7 +784,14 @@ config_file_t *config_file_new_alloc(void)
    conf->include_depth            = 0;
    conf->guaranteed_no_duplicates = false;
    conf->modified                 = false;
+}
 
+config_file_t *config_file_new_alloc(void)
+{
+   struct config_file *conf = (struct config_file*)malloc(sizeof(*conf));
+   if (!conf)
+      return NULL;
+   config_file_initialize(conf);
    return conf;
 }
 
@@ -1085,9 +1121,7 @@ void config_set_path(config_file_t *conf, const char *entry, const char *val)
 
 void config_set_double(config_file_t *conf, const char *key, double val)
 {
-   char buf[128];
-
-   buf[0] = '\0';
+   char buf[320];
 #ifdef __cplusplus
    snprintf(buf, sizeof(buf), "%f", (float)val);
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__>=199901L
@@ -1100,45 +1134,35 @@ void config_set_double(config_file_t *conf, const char *key, double val)
 
 void config_set_float(config_file_t *conf, const char *key, float val)
 {
-   char buf[128];
-
-   buf[0] = '\0';
+   char buf[64];
    snprintf(buf, sizeof(buf), "%f", val);
    config_set_string(conf, key, buf);
 }
 
 void config_set_int(config_file_t *conf, const char *key, int val)
 {
-   char buf[128];
-
-   buf[0] = '\0';
+   char buf[16];
    snprintf(buf, sizeof(buf), "%d", val);
    config_set_string(conf, key, buf);
 }
 
 void config_set_uint(config_file_t *conf, const char *key, unsigned int val)
 {
-   char buf[128];
-
-   buf[0] = '\0';
+   char buf[16];
    snprintf(buf, sizeof(buf), "%u", val);
    config_set_string(conf, key, buf);
 }
 
 void config_set_hex(config_file_t *conf, const char *key, unsigned val)
 {
-   char buf[128];
-
-   buf[0] = '\0';
+   char buf[16];
    snprintf(buf, sizeof(buf), "%x", val);
    config_set_string(conf, key, buf);
 }
 
 void config_set_uint64(config_file_t *conf, const char *key, uint64_t val)
 {
-   char buf[128];
-
-   buf[0] = '\0';
+   char buf[32];
    snprintf(buf, sizeof(buf), "%" PRIu64, val);
    config_set_string(conf, key, buf);
 }
@@ -1146,8 +1170,6 @@ void config_set_uint64(config_file_t *conf, const char *key, uint64_t val)
 void config_set_char(config_file_t *conf, const char *key, char val)
 {
    char buf[2];
-
-   buf[0] = '\0';
    snprintf(buf, sizeof(buf), "%c", val);
    config_set_string(conf, key, buf);
 }
@@ -1307,10 +1329,11 @@ bool config_get_entry_list_next(struct config_file_entry *entry)
 
 bool config_file_exists(const char *path)
 {
-   config_file_t *config = config_file_new(path);
-   if (!config)
+   config_file_t conf;
+   config_file_initialize(&conf);
+   if (config_file_load_internal(&conf, path, 0, NULL) == 1)
       return false;
 
-   config_file_free(config);
+   config_file_deinitialize(&conf);
    return true;
 }
