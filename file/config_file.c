@@ -56,10 +56,11 @@ struct config_include_list
    struct config_include_list *next;
 };
 
-static config_file_t *config_file_new_internal(
-      const char *path, unsigned depth, config_file_cb_t *cb);
+/* Forward declaration */
+static bool config_file_parse_line(config_file_t *conf,
+      struct config_entry_list *list, char *line, config_file_cb_t *cb);
 
-static int config_sort_compare_func(struct config_entry_list *a,
+static int config_file_sort_compare_func(struct config_entry_list *a,
       struct config_entry_list *b)
 {
    if (a && b)
@@ -78,7 +79,7 @@ static int config_sort_compare_func(struct config_entry_list *a,
 }
 
 /* https://stackoverflow.com/questions/7685/merge-sort-a-linked-list */
-static struct config_entry_list* merge_sort_linked_list(
+static struct config_entry_list* config_file_merge_sort_linked_list(
          struct config_entry_list *list, int (*compare)(
          struct config_entry_list *one,struct config_entry_list *two))
 {
@@ -108,8 +109,8 @@ static struct config_entry_list* merge_sort_linked_list(
    last->next  = 0;
 
    /* Recurse on the two smaller lists: */
-   list        = merge_sort_linked_list(list, compare);
-   right       = merge_sort_linked_list(right, compare);
+   list        = config_file_merge_sort_linked_list(list, compare);
+   right       = config_file_merge_sort_linked_list(right, compare);
 
    /* Merge: */
    while (list || right)
@@ -162,7 +163,7 @@ static struct config_entry_list* merge_sort_linked_list(
  *   comment text is a suffix of the input string and
  *   has no programmatic value. In this case, the comment
  *   is removed from the end of 'str' and NULL is returned */
-static char *strip_comment(char *str)
+static char *config_file_strip_comment(char *str)
 {
    /* Search for a comment (#) character */
    char *comment = strchr(str, '#');
@@ -211,7 +212,7 @@ static char *strip_comment(char *str)
    return NULL;
 }
 
-static char *extract_value(char *line, bool is_value)
+static char *config_file_extract_value(char *line, bool is_value)
 {
    size_t idx  = 0;
    char *value = NULL;
@@ -277,7 +278,7 @@ static char *extract_value(char *line, bool is_value)
 }
 
 /* Move semantics? */
-static void add_child_list(config_file_t *parent, config_file_t *child)
+static void config_file_add_child_list(config_file_t *parent, config_file_t *child)
 {
    struct config_entry_list *list = child->entries;
    if (parent->entries)
@@ -321,10 +322,36 @@ static void add_child_list(config_file_t *parent, config_file_t *child)
       parent->tail = NULL;
 }
 
-static void add_sub_conf(config_file_t *conf, char *path, config_file_cb_t *cb)
+static void config_file_get_realpath(char *s, size_t len,
+      char *path, const char *config_path)
 {
-   char real_path[PATH_MAX_LENGTH];
-   config_file_t         *sub_conf  = NULL;
+#ifdef _WIN32
+   if (!string_is_empty(config_path))
+      fill_pathname_resolve_relative(s, config_path,
+            path, len);
+#else
+#ifndef __CELLOS_LV2__
+   if (*path == '~')
+   {
+      const char *home = getenv("HOME");
+      if (home)
+      {
+         strlcpy(s, home,     len);
+         strlcat(s, path + 1, len);
+      }
+      else
+         strlcpy(s, path + 1, len);
+   }
+   else
+#endif
+      if (!string_is_empty(config_path))
+         fill_pathname_resolve_relative(s, config_path, path, len);
+#endif
+}
+
+static void config_file_add_sub_conf(config_file_t *conf, char *path,
+      char *real_path, size_t len, config_file_cb_t *cb)
+{
    struct config_include_list *head = conf->includes;
    struct config_include_list *node = (struct config_include_list*)
       malloc(sizeof(*node));
@@ -346,38 +373,83 @@ static void add_sub_conf(config_file_t *conf, char *path, config_file_cb_t *cb)
          conf->includes = node;
    }
 
-   real_path[0]         = '\0';
-
-#ifdef _WIN32
-   if (!string_is_empty(conf->path))
-      fill_pathname_resolve_relative(real_path, conf->path,
-            path, sizeof(real_path));
-#else
-#ifndef __CELLOS_LV2__
-   if (*path == '~')
-   {
-      const char *home = getenv("HOME");
-      strlcpy(real_path, home ? home : "", sizeof(real_path));
-      strlcat(real_path, path + 1, sizeof(real_path));
-   }
-   else
-#endif
-      if (!string_is_empty(conf->path))
-         fill_pathname_resolve_relative(real_path, conf->path,
-               path, sizeof(real_path));
-#endif
-
-   sub_conf = (config_file_t*)
-      config_file_new_internal(real_path, conf->include_depth + 1, cb);
-   if (!sub_conf)
-      return;
-
-   /* Pilfer internal list. */
-   add_child_list(conf, sub_conf);
-   config_file_free(sub_conf);
+   config_file_get_realpath(real_path, len, path,
+         conf->path);
 }
 
-static bool parse_line(config_file_t *conf,
+static int config_file_load_internal(
+      struct config_file *conf,
+      const char *path, unsigned depth, config_file_cb_t *cb)
+{
+   RFILE         *file = NULL;
+   char      *new_path = strdup(path);
+   if (!new_path)
+      return 1;
+
+   conf->path          = new_path;
+   conf->include_depth = depth;
+   file                = filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE);
+
+   if (!file)
+   {
+      free(conf->path);
+      return 1;
+   }
+
+   while (!filestream_eof(file))
+   {
+      char *line                     = NULL;
+      struct config_entry_list *list = (struct config_entry_list*)
+         malloc(sizeof(*list));
+
+      if (!list)
+      {
+         filestream_close(file);
+         return -1;
+      }
+
+      list->readonly  = false;
+      list->key       = NULL;
+      list->value     = NULL;
+      list->next      = NULL;
+
+      line            = filestream_getline(file);
+
+      if (!line)
+      {
+         free(list);
+         continue;
+      }
+
+      if ( 
+              !string_is_empty(line) 
+            && config_file_parse_line(conf, list, line, cb))
+      {
+         if (conf->entries)
+            conf->tail->next = list;
+         else
+            conf->entries    = list;
+
+         conf->tail = list;
+
+         if (cb && list->key && list->value)
+            cb->config_file_new_entry_cb(list->key, list->value) ;
+      }
+
+      free(line);
+
+      if (list != conf->tail)
+         free(list);
+   }
+
+   filestream_close(file);
+
+   return 0;
+}
+
+static bool config_file_parse_line(config_file_t *conf,
       struct config_entry_list *list, char *line, config_file_cb_t *cb)
 {
    size_t cur_size       = 32;
@@ -385,13 +457,15 @@ static bool parse_line(config_file_t *conf,
    char *key             = NULL;
    char *key_tmp         = NULL;
    /* Remove any comment text */
-   char *comment         = strip_comment(line);
+   char *comment         = config_file_strip_comment(line);
 
    /* Check whether entire line is a comment */
    if (comment)
    {
-      char *path         = NULL;
-      char *include_line = NULL;
+      char real_path[PATH_MAX_LENGTH];
+      char *path               = NULL;
+      char *include_line       = NULL;
+      config_file_t *sub_conf  = NULL;
 
       /* Starting a line with an 'include' directive
        * appends a sub-config file
@@ -405,7 +479,7 @@ static bool parse_line(config_file_t *conf,
       if (string_is_empty(include_line))
          return false;
 
-      path = extract_value(include_line, false);
+      path = config_file_extract_value(include_line, false);
 
       if (!path)
          return false;
@@ -423,7 +497,17 @@ static bool parse_line(config_file_t *conf,
          return false;
       }
 
-      add_sub_conf(conf, path, cb);
+      real_path[0]         = '\0';
+      config_file_add_sub_conf(conf, path,
+            real_path, sizeof(real_path), cb);
+
+      sub_conf = config_file_new_alloc();
+
+      if (config_file_load_internal(sub_conf, real_path,
+               conf->include_depth + 1, cb) == 0)
+         config_file_add_child_list(conf, sub_conf); /* Pilfer internal list. */
+      config_file_free(sub_conf);
+
       free(path);
       return true;
    }
@@ -463,7 +547,7 @@ static bool parse_line(config_file_t *conf,
 
    /* Add key and value entries to list */
    list->key     = key;
-   list->value   = extract_value(line, true);
+   list->value   = config_file_extract_value(line, true);
 
    /* An entry without a value is invalid */
    if (!list->value)
@@ -474,86 +558,6 @@ static bool parse_line(config_file_t *conf,
    }
 
    return true;
-}
-
-static config_file_t *config_file_new_internal(
-      const char *path, unsigned depth, config_file_cb_t *cb)
-{
-   RFILE              *file = NULL;
-   struct config_file *conf = config_file_new_alloc();
-
-   if (!path || !*path)
-      return conf;
-   conf->path          = strdup(path);
-   if (!conf->path)
-      goto error;
-
-   conf->include_depth = depth;
-   file                = filestream_open(path,
-         RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
-
-   if (!file)
-   {
-      free(conf->path);
-      goto error;
-   }
-
-   while (!filestream_eof(file))
-   {
-      char *line                     = NULL;
-      struct config_entry_list *list = (struct config_entry_list*)
-         malloc(sizeof(*list));
-
-      if (!list)
-      {
-         config_file_free(conf);
-         filestream_close(file);
-         return NULL;
-      }
-
-      list->readonly  = false;
-      list->key       = NULL;
-      list->value     = NULL;
-      list->next      = NULL;
-
-      line            = filestream_getline(file);
-
-      if (!line)
-      {
-         free(list);
-         continue;
-      }
-
-      if ( 
-              !string_is_empty(line) 
-            && parse_line(conf, list, line, cb))
-      {
-         if (conf->entries)
-            conf->tail->next = list;
-         else
-            conf->entries    = list;
-
-         conf->tail = list;
-
-         if (cb && list->key && list->value)
-            cb->config_file_new_entry_cb(list->key, list->value) ;
-      }
-
-      free(line);
-
-      if (list != conf->tail)
-         free(list);
-   }
-
-   filestream_close(file);
-
-   return conf;
-
-error:
-   free(conf);
-
-   return NULL;
 }
 
 void config_file_free(config_file_t *conf)
@@ -619,26 +623,16 @@ bool config_append_file(config_file_t *conf, const char *path)
 config_file_t *config_file_new_from_string(char *from_string,
       const char *path)
 {
-   char *lines              = from_string;
-   char *save_ptr           = NULL;
-   char *line               = NULL;
-   struct config_file *conf = (struct config_file*)malloc(sizeof(*conf));
+   char *lines                    = from_string;
+   char *save_ptr                 = NULL;
+   char *line                     = NULL;
+   struct config_file *conf      = config_file_new_alloc();
 
    if (!conf)
       return NULL;
 
-   conf->path                     = NULL;
-   conf->entries                  = NULL;
-   conf->tail                     = NULL;
-   conf->last                     = NULL;
-   conf->includes                 = NULL;
-   conf->include_depth            = 0;
-   conf->guaranteed_no_duplicates = false;
-   conf->modified                 = false;
-
    if (!string_is_empty(path))
       conf->path                  = strdup(path);
-
    if (string_is_empty(lines))
       return conf;
 
@@ -664,7 +658,7 @@ config_file_t *config_file_new_from_string(char *from_string,
       /* Parse current line */
       if (
               !string_is_empty(line)
-            && parse_line(conf, list, line, NULL))
+            && config_file_parse_line(conf, list, line, NULL))
       {
          if (conf->entries)
             conf->tail->next = list;
@@ -709,12 +703,42 @@ config_file_t *config_file_new_from_path_to_string(const char *path)
 config_file_t *config_file_new_with_callback(
       const char *path, config_file_cb_t *cb)
 {
-   return config_file_new_internal(path, 0, cb);
+   int ret                  = 0;
+   struct config_file *conf = config_file_new_alloc();
+   if (!path || !*path)
+      return conf;
+   ret = config_file_load_internal(conf, path, 0, cb);
+   if (ret == -1)
+   {
+      config_file_free(conf);
+      return NULL;
+   }
+   else if (ret == 1)
+   {
+      free(conf);
+      return NULL;
+   }
+   return conf;
 }
 
 config_file_t *config_file_new(const char *path)
 {
-   return config_file_new_internal(path, 0, NULL);
+   int ret                  = 0;
+   struct config_file *conf = config_file_new_alloc();
+   if (!path || !*path)
+      return conf;
+   ret = config_file_load_internal(conf, path, 0, NULL);
+   if (ret == -1)
+   {
+      config_file_free(conf);
+      return NULL;
+   }
+   else if (ret == 1)
+   {
+      free(conf);
+      return NULL;
+   }
+   return conf;
 }
 
 config_file_t *config_file_new_alloc(void)
@@ -965,34 +989,40 @@ void config_set_string(config_file_t *conf, const char *key, const char *val)
    if (!conf || !key || !val)
       return;
 
-   last  = (conf->guaranteed_no_duplicates && conf->last) ?
-         conf->last : conf->entries;
-   entry = conf->guaranteed_no_duplicates ?
-         NULL : config_get_entry(conf, key, &last);
+   last                            = conf->entries;
 
-   if (entry)
+   if (conf->guaranteed_no_duplicates)
    {
-      /* An entry corresponding to 'key' already exists
-       * > Check if it's read only */
-      if (entry->readonly)
-         return;
-
-      /* Check whether value is currently set */
-      if (entry->value)
+      if (conf->last)
+         last                      = conf->last;
+   }
+   else
+   {
+      entry                        = config_get_entry(conf, key, &last);
+      if (entry)
       {
-         /* Do nothing if value is unchanged */
-         if (string_is_equal(entry->value, val))
+         /* An entry corresponding to 'key' already exists
+          * > Check if it's read only */
+         if (entry->readonly)
             return;
 
-         /* Value is to be updated
-          * > Free existing */
-         free(entry->value);
-      }
+         /* Check whether value is currently set */
+         if (entry->value)
+         {
+            /* Do nothing if value is unchanged */
+            if (string_is_equal(entry->value, val))
+               return;
 
-      /* Update value */
-      entry->value   = strdup(val);
-      conf->modified = true;
-      return;
+            /* Value is to be updated
+             * > Free existing */
+            free(entry->value);
+         }
+
+         /* Update value */
+         entry->value   = strdup(val);
+         conf->modified = true;
+         return;
+      }
    }
 
    /* Entry corresponding to 'key' does not exist
@@ -1187,8 +1217,9 @@ void config_file_dump_orbis(config_file_t *conf, int fd)
       includes = includes->next;
    }
 
-   list          = merge_sort_linked_list((struct config_entry_list*)
-         conf->entries, config_sort_compare_func);
+   list          = config_file_merge_sort_linked_list(
+         (struct config_entry_list*)conf->entries,
+         config_file_sort_compare_func);
    conf->entries = list;
 
    while (list)
@@ -1217,8 +1248,9 @@ void config_file_dump(config_file_t *conf, FILE *file, bool sort)
    }
 
    if (sort)
-      list = merge_sort_linked_list((struct config_entry_list*)
-            conf->entries, config_sort_compare_func);
+      list = config_file_merge_sort_linked_list(
+            (struct config_entry_list*)conf->entries,
+            config_file_sort_compare_func);
    else
       list = (struct config_entry_list*)conf->entries;
 
