@@ -209,13 +209,13 @@ bool path_mkdir(const char *dir)
        * We also remove the slash from dir
        * so the directory is created properly.
        * This is necessary when a path containing a
-       * trailing slash is passed to path_mkdir() */
+       * trailing slash is passed to path_mkdir(). */
       if (len > 0)
          if (basedir[len - 1] == '/')
             basedir[len - 1] = '\0';
       if (len2 > 0)
-         if (dir[len - 1] == '/')
-            dir[len - 1] = '\0';
+         if (dir[len2 - 1] == '/')
+            dir[len2 - 1] = '\0';
    }
 #endif
 
