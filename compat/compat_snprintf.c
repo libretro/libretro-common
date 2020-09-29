@@ -62,7 +62,7 @@ int c99_vsnprintf_retro__(char *outBuf, size_t size, const char *format, va_list
    if (count == -1)
        count = _vscprintf(format, ap);
 
-   if (count == size)
+   if (count == size && size)
    {
       /* there was no room for a NULL, so truncate the last character */
       outBuf[size - 1] = '\0';
