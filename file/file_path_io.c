@@ -230,12 +230,8 @@ bool path_mkdir(char *dir)
 
       /* Don't treat this as an error. */
       if (ret == -2 && path_is_directory(dir))
-      {
-         free(dir);
          return true;
-      }
 
-      free(dir);
       return (ret == 0);
    }
 
