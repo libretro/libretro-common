@@ -223,10 +223,6 @@ bool path_mkdir(char *dir)
 
    if (norecurse)
    {
-      newdir = strdup(dir);
-      if (!newdir)
-        return false;
-
       /* No trailing slash - implemented for WiiU */
       no_slash(dir);
 
