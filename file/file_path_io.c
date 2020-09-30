@@ -209,6 +209,8 @@ bool path_mkdir(const char *dir)
       if (len > 0)
          if (basedir[len - 1] == '/')
             basedir[len - 1] = '\0';
+
+      free(len);
    }
 #endif
 
@@ -230,12 +232,14 @@ bool path_mkdir(const char *dir)
 
 #if defined(GEKKO)
    {
-      /* Trim trailing slash for Wii */
+      /* Trim trailing slash for WiiU */
       size_t len2 = strlen(makedir);
 
       if (len2 > 0)
          if (makedir[len2 - 1] == '/')
             makedir[len2 - 1] = '\0';
+
+      free(len2);
    }
 #endif
 
