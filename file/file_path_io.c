@@ -178,6 +178,7 @@ bool path_mkdir(const char *dir)
    bool         sret  = false;
    bool norecurse     = false;
    char     *basedir  = NULL;
+   char     *makedir  = NULL;
 
    if (!(dir && *dir))
       return false;
@@ -225,10 +226,23 @@ bool path_mkdir(const char *dir)
 
    if (norecurse)
    {
-      int ret = path_mkdir_cb(dir);
+      makedir = strdup(dir);
+
+#if defined(GEKKO)
+   {
+      /* Trim trailing slash for Wii */
+      size_t len2 = strlen(makedir);
+
+      if (len2 > 0)
+         if (makedir[len2 - 1] == '/')
+            makedir[len2 - 1] = '\0';
+   }
+#endif
+
+      int ret = path_mkdir_cb(makedir);
 
       /* Don't treat this as an error. */
-      if (ret == -2 && path_is_directory(dir))
+      if (ret == -2 && path_is_directory(makedir))
          return true;
 
       return (ret == 0);
