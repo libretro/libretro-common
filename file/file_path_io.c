@@ -206,6 +206,7 @@ bool path_mkdir(char *dir)
       free(basedir);
       return false;
    }
+
    /* No trailing slash - implemented for WiiU */
    no_slash(basedir);
 
