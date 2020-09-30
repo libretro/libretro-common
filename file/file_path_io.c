@@ -227,6 +227,8 @@ bool path_mkdir(const char *dir)
    if (norecurse)
    {
       newdir = strdup(dir);
+      if (!newdir)
+        return false;
 
 #if defined(GEKKO)
    {
