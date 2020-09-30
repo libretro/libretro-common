@@ -165,6 +165,16 @@ int32_t path_get_size(const char *path)
    return -1;
 }
 
+static void no_slash (char* temp)
+{
+  int i;
+
+  for(i=0; temp[i] != '\0'; ++i);
+
+  if(temp[i-1] == '/')
+    temp[i-1] = '\0';
+}
+
 /**
  * path_mkdir:
  * @dir                : directory
@@ -173,12 +183,11 @@ int32_t path_get_size(const char *path)
  *
  * Returns: true (1) if directory could be created, otherwise false (0).
  **/
-bool path_mkdir(const char *dir)
+bool path_mkdir(char *dir)
 {
    bool         sret  = false;
    bool norecurse     = false;
    char     *basedir  = NULL;
-   char     *newdir   = NULL;
 
    if (!(dir && *dir))
       return false;
@@ -197,20 +206,8 @@ bool path_mkdir(const char *dir)
       free(basedir);
       return false;
    }
-
-#if defined(GEKKO)
-   {
-      size_t len = strlen(basedir);
-
-      /* path_parent_dir() keeps the trailing slash.
-       * On Wii, mkdir() fails if the path has a
-       * trailing slash...
-       * We must therefore remove it. */
-      if (len > 0)
-         if (basedir[len - 1] == '/')
-            basedir[len - 1] = '\0';
-   }
-#endif
+   /* No trailing slash - implemented for WiiU */
+   no_slash(basedir);
 
    if (path_is_directory(basedir))
       norecurse = true;
@@ -230,27 +227,19 @@ bool path_mkdir(const char *dir)
       if (!newdir)
         return false;
 
-#if defined(GEKKO)
-   {
-      /* Trim trailing slash for WiiU */
-      size_t len2 = strlen(newdir);
+      /* No trailing slash - implemented for WiiU */
+      no_slash(dir);
 
-      if (len2 > 0)
-         if (newdir[len2 - 1] == '/')
-            newdir[len2 - 1] = '\0';
-   }
-#endif
-
-      int ret = path_mkdir_cb(newdir);
+      int ret = path_mkdir_cb(dir);
 
       /* Don't treat this as an error. */
-      if (ret == -2 && path_is_directory(newdir))
+      if (ret == -2 && path_is_directory(dir))
       {
-         free(newdir);
+         free(dir);
          return true;
       }
 
-      free(newdir);
+      free(dir);
       return (ret == 0);
    }
 
