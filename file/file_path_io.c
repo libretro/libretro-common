@@ -252,6 +252,5 @@ bool path_mkdir(const char *dir)
       return (ret == 0);
    }
 
-   free(newdir);
    return sret;
 }
