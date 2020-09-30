@@ -207,8 +207,9 @@ bool path_mkdir(char *dir)
       return false;
    }
 
-   /* No trailing slash - implemented for WiiU */
+#if defined(GEKKO)
    no_slash(basedir);
+#endif
 
    if (path_is_directory(basedir))
       norecurse = true;
@@ -224,8 +225,9 @@ bool path_mkdir(char *dir)
 
    if (norecurse)
    {
-      /* No trailing slash - implemented for WiiU */
+#if defined(GEKKO)
       no_slash(dir);
+#endif
 
       int ret = path_mkdir_cb(dir);
 
