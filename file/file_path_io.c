@@ -209,8 +209,6 @@ bool path_mkdir(const char *dir)
       if (len > 0)
          if (basedir[len - 1] == '/')
             basedir[len - 1] = '\0';
-
-      free(len);
    }
 #endif
 
@@ -238,8 +236,6 @@ bool path_mkdir(const char *dir)
       if (len2 > 0)
          if (newdir[len2 - 1] == '/')
             newdir[len2 - 1] = '\0';
-
-      free(len2);
    }
 #endif
 
@@ -247,10 +243,15 @@ bool path_mkdir(const char *dir)
 
       /* Don't treat this as an error. */
       if (ret == -2 && path_is_directory(newdir))
+      {
+         free(newdir);
          return true;
+      }
 
+      free(newdir);
       return (ret == 0);
    }
 
+   free(newdir);
    return sret;
 }
