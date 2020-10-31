@@ -186,7 +186,15 @@ typedef struct rjsonwriter rjsonwriter_t;
 /* Create a new writer instance to various targets */
 rjsonwriter_t *rjsonwriter_open_stream(struct intfstream_internal *stream);
 rjsonwriter_t *rjsonwriter_open_rfile(struct RFILE *rfile);
+rjsonwriter_t *rjsonwriter_open_memory();
 rjsonwriter_t *rjsonwriter_open_user(rjsonwriter_io_t io, void *user_data);
+
+/* When opened with rjsonwriter_open_memory, will return the generated JSON.
+ * Result is always null-terminated. Passed len can be NULL if not needed,
+ * otherwise returned len will be string length without null-terminator.
+ * Returns NULL if writing ran out of memory or not opened from memory.
+ * Returned buffer is only valid until writer is modified or freed. */
+char* rjsonwriter_get_memory_buffer(rjsonwriter_t *writer, int* len);
 
 /* Free rjsonwriter handle and return result of final rjsonwriter_flush call */
 bool rjsonwriter_free(rjsonwriter_t *writer);
@@ -214,6 +222,7 @@ void rjsonwriter_rawf(rjsonwriter_t *writer, const char *fmt, ...);
  * Special and control characters are automatically escaped.
  * If NULL is passed an empty string will be written (not JSON null). */
 void rjsonwriter_add_string(rjsonwriter_t *writer, const char *value);
+void rjsonwriter_add_string_len(rjsonwriter_t *writer, const char *value, int len);
 
 /* Add a signed or unsigned integer or a double number */
 static INLINE void rjsonwriter_add_int(rjsonwriter_t *writer, int value)
@@ -242,6 +251,9 @@ static INLINE void rjsonwriter_add_colon(rjsonwriter_t *writer)
 
 static INLINE void rjsonwriter_add_comma(rjsonwriter_t *writer)
       { rjsonwriter_raw(writer, ",", 1); }
+
+static INLINE void rjsonwriter_add_bool(rjsonwriter_t *writer, bool value)
+      { rjsonwriter_raw(writer, (value ? "true" : "false"), (value ? 4 : 5)); }
 
 /* Functions to add whitespace characters */
 /* These do nothing with the option RJSONWRITER_OPTION_SKIP_WHITESPACE */
