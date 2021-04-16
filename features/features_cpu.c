@@ -322,6 +322,7 @@ static uint64_t xgetbv_x86(uint32_t idx)
 #endif
 
 #if defined(__ARM_NEON__)
+#if defined(__arm__)
 static void arm_enable_runfast_mode(void)
 {
    /* RunFast mode. Enables flush-to-zero and some
@@ -338,6 +339,7 @@ static void arm_enable_runfast_mode(void)
          : "r"(x), "r"(y)
         );
 }
+#endif
 #endif
 
 #if defined(__linux__) && !defined(CPU_X86)
@@ -749,7 +751,7 @@ uint64_t cpu_features_get(void)
    if (check_arm_cpu_feature("neon"))
    {
       cpu |= RETRO_SIMD_NEON;
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) && defined(__arm__)
       arm_enable_runfast_mode();
 #endif
    }
@@ -765,7 +767,9 @@ uint64_t cpu_features_get(void)
       cpu |= RETRO_SIMD_ASIMD;
 #ifdef __ARM_NEON__
       cpu |= RETRO_SIMD_NEON;
+#if defined(__arm__)
       arm_enable_runfast_mode();
+#endif
 #endif
    }
 
@@ -784,7 +788,9 @@ uint64_t cpu_features_get(void)
 
 #elif defined(__ARM_NEON__)
    cpu |= RETRO_SIMD_NEON;
+#if defined(__arm__)
    arm_enable_runfast_mode();
+#endif
 #elif defined(__ALTIVEC__)
    cpu |= RETRO_SIMD_VMX;
 #elif defined(XBOX360)
