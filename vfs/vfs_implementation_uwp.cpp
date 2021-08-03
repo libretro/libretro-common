@@ -839,23 +839,22 @@ int retro_vfs_stat_impl(const char *path, int32_t *size)
    free(path_wide);
 
    /* Try Win32 first, this should work in AppData */
-   GetFileAttributesExFromAppW(path_str->Data(), GetFileExInfoStandard, &attribdata);
-   file_info = attribdata.dwFileAttributes;
-   if (file_info != INVALID_FILE_ATTRIBUTES)
+   if (GetFileAttributesExFromAppW(path_str->Data(), GetFileExInfoStandard, &attribdata))
    {
-      HANDLE file_handle = CreateFile2FromAppW(path_str->Data(), GENERIC_READ, FILE_SHARE_READ, OPEN_ALWAYS, NULL);
-      if (file_handle != INVALID_HANDLE_VALUE)
-      {
-         LARGE_INTEGER sz;
-         if (GetFileSizeEx(file_handle, &sz))
-         {
-            if (size)
-               *size = sz.QuadPart;
-         }  
-         CloseHandle(file_handle);
-      }
-      //*size = attribdata.nFileSizeLow;
-      return (file_info & FILE_ATTRIBUTE_DIRECTORY) ? RETRO_VFS_STAT_IS_VALID | RETRO_VFS_STAT_IS_DIRECTORY : RETRO_VFS_STAT_IS_VALID;
+       file_info = attribdata.dwFileAttributes;
+       if (file_info != INVALID_FILE_ATTRIBUTES)
+       {
+           if (!(file_info & FILE_ATTRIBUTE_DIRECTORY))
+           {
+               LARGE_INTEGER sz;
+               if (size)
+               {
+                   sz.HighPart = attribdata.nFileSizeHigh;
+                   sz.LowPart = attribdata.nFileSizeLow;
+               }
+           }
+           return (file_info & FILE_ATTRIBUTE_DIRECTORY) ? RETRO_VFS_STAT_IS_VALID | RETRO_VFS_STAT_IS_DIRECTORY : RETRO_VFS_STAT_IS_VALID;
+       }
    }
 
    if (GetLastError() == ERROR_FILE_NOT_FOUND)
