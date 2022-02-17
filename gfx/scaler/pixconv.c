@@ -29,7 +29,7 @@
 
 #include <gfx/scaler/pixconv.h>
 
-#if _MSC_VER && _MSC_VER <= 1800
+#if defined(_MSC_VER) && _MSC_VER <= 1800
 #define SCALER_NO_SIMD
 #endif
 
