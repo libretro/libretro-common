@@ -193,11 +193,11 @@ typedef struct
 #elif defined(PS2)
 #  define PRI_SIZET "u"
 #else
-#  if (SIZE_MAX == 0xFFFF || __SIZE_MAX__ == 0xFFFF)
+#  if (SIZE_MAX == 0xFFFF)
 #    define PRI_SIZET "hu"
-#  elif (SIZE_MAX == 0xFFFFFFFF || __SIZE_MAX__ == 0xFFFFFFFF)
+#  elif (SIZE_MAX == 0xFFFFFFFF)
 #    define PRI_SIZET "u"
-#  elif (SIZE_MAX == 0xFFFFFFFFFFFFFFFF || __SIZE_MAX__ == 0xFFFFFFFFFFFFFFFF)
+#  elif (SIZE_MAX == 0xFFFFFFFFFFFFFFFF)
 #    define PRI_SIZET "lu"
 #  else
 #    error PRI_SIZET: unknown SIZE_MAX
