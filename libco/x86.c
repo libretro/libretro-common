@@ -41,7 +41,11 @@ static unsigned char co_swap_function[] = {
   0xff, 0xe0,         /* jmp eax            */
 };
 
-#ifdef _WIN32
+#if defined(__DJGPP__)
+static void co_init(void)
+{
+}
+#elif defined(_WIN32)
 #include <windows.h>
 
 static void co_init(void)
