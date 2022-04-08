@@ -998,6 +998,9 @@ static void audio_mixer_mix_ogg(float* buffer, size_t num_frames,
    unsigned temp_samples            = 0;
    float* pcm                       = NULL;
 
+   if (!voice->types.ogg.stream)
+      return;
+
    if (voice->types.ogg.position == voice->types.ogg.samples)
    {
 again:
