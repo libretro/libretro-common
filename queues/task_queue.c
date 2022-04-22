@@ -424,6 +424,8 @@ static void retro_task_threaded_wait(retro_task_condition_fn_t cond, void* data)
       wait = (tasks_running.front && !tasks_running.front->when);
       slock_unlock(running_lock);
    } while (wait && (!cond || cond(data)));
+   
+   retro_task_threaded_gather();
 }
 
 static void retro_task_threaded_reset(void)
