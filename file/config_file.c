@@ -201,24 +201,8 @@ static char *config_file_strip_comment(char *str)
    return NULL;
 }
 
-static char *config_file_extract_value(char *line, bool is_value)
+static char *config_file_extract_value(char *line)
 {
-   size_t idx  = 0;
-   char *value = NULL;
-
-   if (is_value)
-   {
-      while (ISSPACE((int)*line))
-         line++;
-
-      /* If we don't have an equal sign here,
-       * we've got an invalid string. */
-      if (*line != '=')
-         return NULL;
-
-      line++;
-   }
-
    while (ISSPACE((int)*line))
       line++;
 
@@ -233,35 +217,38 @@ static char *config_file_extract_value(char *line, bool is_value)
     * literal */
    if (*line == '"')
    {
+      size_t idx  = 0;
+      char *value = NULL;
       /* Skip to next character */
       line++;
 
       /* If this a ("), then value string is empty */
-      if (*line == '"')
-         return strdup("");
+      if (*line != '"')
+      {
+         /* Find the next (") character */
+         while (line[idx] && (line[idx] != '\"'))
+            idx++;
 
-      /* Find the next (") character */
-      while (line[idx] && (line[idx] != '\"'))
-         idx++;
-
-      line[idx] = '\0';
-      value     = line;
+         line[idx] = '\0';
+         if ((value = line) && *value)
+            return strdup(value);
+      }
    }
    /* This is not a string literal - just read
     * until the next space is found
     * > Note: Skip this if line is empty */
    else if (*line != '\0')
    {
+      size_t idx  = 0;
+      char *value = NULL;
       /* Find next space character */
       while (line[idx] && isgraph((int)line[idx]))
          idx++;
 
       line[idx] = '\0';
-      value     = line;
+      if ((value = line) && *value)
+         return strdup(value);
    }
-
-   if (value && *value)
-      return strdup(value);
 
    return strdup("");
 }
@@ -433,11 +420,10 @@ static int config_file_load_internal(
 
    conf->path          = new_path;
    conf->include_depth = depth;
-   file                = filestream_open(path,
-         RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
 
-   if (!file)
+   if (!(file = filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_READ,
+         RETRO_VFS_FILE_ACCESS_HINT_NONE)))
    {
       free(conf->path);
       return 1;
@@ -520,18 +506,13 @@ static bool config_file_parse_line(config_file_t *conf,
    /* Check whether entire line is a comment */
    if (comment)
    {
-      config_file_t sub_conf;
-      bool include_found       = false;
-      bool reference_found     = false;
-      char real_path[PATH_MAX_LENGTH];
       char *path               = NULL;
-      char *include_line       = NULL;
-      char *reference_line     = NULL;
-
-      include_found = string_starts_with_size(comment, "include ",
-                                          STRLEN_CONST("include "));
-      reference_found = string_starts_with_size(comment, "reference ",
-                                          STRLEN_CONST("reference "));
+      bool include_found       = string_starts_with_size(comment,
+            "include ",
+            STRLEN_CONST("include "));
+      bool reference_found     = string_starts_with_size(comment,
+            "reference ",
+            STRLEN_CONST("reference "));
 
       /* All comments except those starting with the include or 
        * reference directive are ignored */
@@ -542,14 +523,14 @@ static bool config_file_parse_line(config_file_t *conf,
        * appends a sub-config file */
       if (include_found)
       {
-         include_line = comment + STRLEN_CONST("include ");
+         config_file_t sub_conf;
+         char real_path[PATH_MAX_LENGTH];
+         char *include_line = comment + STRLEN_CONST("include ");
 
          if (string_is_empty(include_line))
             return false;
 
-         path = config_file_extract_value(include_line, false);
-
-         if (!path)
+         if (!(path = config_file_extract_value(include_line)))
             return false;
 
          if (     string_is_empty(path)
@@ -585,14 +566,12 @@ static bool config_file_parse_line(config_file_t *conf,
        * sets the reference path */
       if (reference_found)
       {
-         reference_line = comment + STRLEN_CONST("reference ");
+         char *reference_line = comment + STRLEN_CONST("reference ");
 
          if (string_is_empty(reference_line))
             return false;
 
-         path = config_file_extract_value(reference_line, false);
-
-         if (!path)
+         if (!(path = config_file_extract_value(reference_line)))
             return false;
 
          config_file_add_reference(conf, path);
@@ -610,8 +589,7 @@ static bool config_file_parse_line(config_file_t *conf,
       line++;
 
    /* Allocate storage for key */
-   key = (char*)malloc(cur_size + 1);
-   if (!key)
+   if (!(key = (char*)malloc(cur_size + 1)))
       return false;
 
    /* Copy line contents into key until we
@@ -623,15 +601,13 @@ static bool config_file_parse_line(config_file_t *conf,
       if (idx == cur_size)
       {
          cur_size *= 2;
-         key_tmp   = (char*)realloc(key, cur_size + 1);
-
-         if (!key_tmp)
+         if (!(key_tmp   = (char*)realloc(key, cur_size + 1)))
          {
             free(key);
             return false;
          }
 
-         key = key_tmp;
+         key     = key_tmp;
       }
 
       key[idx++] = *line++;
@@ -640,17 +616,30 @@ static bool config_file_parse_line(config_file_t *conf,
 
    /* Add key and value entries to list */
    list->key     = key;
-   list->value   = config_file_extract_value(line, true);
 
    /* An entry without a value is invalid */
-   if (!list->value)
+   while (ISSPACE((int)*line))
+      line++;
+
+   /* If we don't have an equal sign here,
+    * we've got an invalid string. */
+   if (*line != '=')
    {
-      list->key = NULL;
-      free(key);
-      return false;
+      list->value = NULL;
+      goto error;
    }
 
+   line++;
+
+   if (!(list->value   = config_file_extract_value(line)))
+      goto error;
+
    return true;
+
+error:
+   list->key   = NULL;
+   free(key);
+   return false;
 }
 
 static int config_file_from_string_internal(
@@ -768,9 +757,8 @@ bool config_file_deinitialize(config_file_t *conf)
 
 void config_file_free(config_file_t *conf)
 {
-   if (!config_file_deinitialize(conf))
-      return;
-   free(conf);
+   if (config_file_deinitialize(conf))
+      free(conf);
 }
 
 bool config_append_file(config_file_t *conf, const char *path)
@@ -812,27 +800,24 @@ config_file_t *config_file_new_from_string(char *from_string,
       const char *path)
 {
    struct config_file *conf      = config_file_new_alloc();
-
-   if (!conf)
-      return NULL;
-   if (config_file_from_string_internal(conf, from_string, path) == -1)
-   {
+   if (     conf 
+         && config_file_from_string_internal(
+            conf, from_string, path) != -1)
+      return conf;
+   if (conf)
       config_file_free(conf);
-      return NULL;
-   }
-   return conf;
+   return NULL;
 }
 
 config_file_t *config_file_new_from_path_to_string(const char *path)
 {
-   int64_t length                = 0;
-   uint8_t *ret_buf              = NULL;
-   config_file_t *conf           = NULL;
-
    if (path_is_valid(path))
    {
+	   uint8_t *ret_buf                 = NULL;
+      int64_t length                   = 0;
       if (filestream_read_file(path, (void**)&ret_buf, &length))
       {
+         config_file_t *conf           = NULL;
          /* Note: 'ret_buf' is not used outside this
           * function - we do not care that it will be
           * modified by config_file_new_from_string() */
@@ -841,10 +826,12 @@ config_file_t *config_file_new_from_path_to_string(const char *path)
 
          if ((void*)ret_buf)
             free((void*)ret_buf);
+
+         return conf;
       }
    }
 
-   return conf;
+   return NULL;
 }
 
 config_file_t *config_file_new_with_callback(
@@ -854,8 +841,7 @@ config_file_t *config_file_new_with_callback(
    struct config_file *conf = config_file_new_alloc();
    if (!path || !*path)
       return conf;
-   ret = config_file_load_internal(conf, path, 0, cb);
-   if (ret == -1)
+   if ((ret = config_file_load_internal(conf, path, 0, cb)) == -1)
    {
       config_file_free(conf);
       return NULL;
@@ -874,8 +860,7 @@ config_file_t *config_file_new(const char *path)
    struct config_file *conf = config_file_new_alloc();
    if (!path || !*path)
       return conf;
-   ret = config_file_load_internal(conf, path, 0, NULL);
-   if (ret == -1)
+   if ((ret = config_file_load_internal(conf, path, 0, NULL)) == -1)
    {
       config_file_free(conf);
       return NULL;
@@ -918,16 +903,14 @@ static struct config_entry_list *config_get_entry_internal(
       const config_file_t *conf,
       const char *key, struct config_entry_list **prev)
 {
-   struct config_entry_list *entry    = NULL;
-   struct config_entry_list *previous = prev ? *prev : NULL;
-
-   entry = RHMAP_GET_STR(conf->entries_map, key);
+   struct config_entry_list *entry = RHMAP_GET_STR(conf->entries_map, key);
 
    if (entry)
       return entry;
 
    if (prev)
    {
+      struct config_entry_list *previous = *prev;
       for (entry = conf->entries; entry; entry = entry->next)
          previous = entry;
 
@@ -1090,9 +1073,9 @@ bool config_get_string(config_file_t *conf, const char *key, char **str)
 
 bool config_get_config_path(config_file_t *conf, char *s, size_t len)
 {
-   if (!conf)
-      return false;
-   return strlcpy(s, conf->path, len);
+   if (conf)
+      return strlcpy(s, conf->path, len);
+   return false;
 }
 
 bool config_get_array(config_file_t *conf, const char *key,
@@ -1226,9 +1209,8 @@ void config_unset(config_file_t *conf, const char *key)
       return;
 
    last  = conf->entries;
-   entry = config_get_entry_internal(conf, key, &last);
 
-   if (!entry)
+   if (!(entry = config_get_entry_internal(conf, key, &last)))
       return;
 
    (void)RHMAP_DEL_STR(conf->entries_map, entry->key);
@@ -1332,7 +1314,7 @@ bool config_file_write(config_file_t *conf, const char *path, bool sort)
       if (!file)
          return false;
 
-      buf = calloc(1, 0x4000);
+      buf        = calloc(1, 0x4000);
       setvbuf(file, (char*)buf, _IOFBF, 0x4000);
 
       config_file_dump(conf, file, sort);
