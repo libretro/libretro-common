@@ -269,23 +269,6 @@ void fill_str_dated_filename(char *out_filename,
       const char *in_str, const char *ext, size_t size);
 
 /**
- * fill_pathname_noext:
- * @out_path           : output path
- * @in_path            : input  path
- * @replace            : what to replace
- * @size               : buffer size of output path
- *
- * Appends a filename extension 'replace' to 'in_path', and outputs
- * result in 'out_path'.
- *
- * Assumes in_path has no extension. If an extension is still
- * present in 'in_path', it will be ignored.
- *
- */
-size_t fill_pathname_noext(char *out_path, const char *in_path,
-      const char *replace, size_t size);
-
-/**
  * find_last_slash:
  * @str : input path
  *
@@ -325,13 +308,6 @@ size_t fill_pathname_dir(char *in_dir, const char *in_basename,
  **/
 size_t fill_pathname_base(char *out_path, const char *in_path, size_t size);
 
-void fill_pathname_base_noext(char *out_dir,
-      const char *in_path, size_t size);
-
-size_t fill_pathname_base_ext(char *out,
-      const char *in_path, const char *ext,
-      size_t size);
-
 /**
  * fill_pathname_basedir:
  * @out_dir            : output directory
@@ -343,9 +319,6 @@ size_t fill_pathname_base_ext(char *out,
  * @out_path will get path "./".
  **/
 void fill_pathname_basedir(char *out_path, const char *in_path, size_t size);
-
-void fill_pathname_basedir_noext(char *out_dir,
-      const char *in_path, size_t size);
 
 /**
  * fill_pathname_parent_dir_name:
@@ -407,19 +380,6 @@ size_t fill_pathname_join_special_ext(char *out_path,
       const char *last, const char *ext,
       size_t size);
 
-size_t fill_pathname_join_concat_noext(char *out_path,
-      const char *dir, const char *path,
-      const char *concat,
-      size_t size);
-
-size_t fill_pathname_join_concat(char *out_path,
-      const char *dir, const char *path,
-      const char *concat,
-      size_t size);
-
-void fill_pathname_join_noext(char *out_path,
-      const char *dir, const char *path, size_t size);
-
 /**
  * fill_pathname_join_delim:
  * @out_path           : output path
@@ -433,31 +393,6 @@ void fill_pathname_join_noext(char *out_path,
  **/
 size_t fill_pathname_join_delim(char *out_path, const char *dir,
       const char *path, const char delim, size_t size);
-
-size_t fill_pathname_join_delim_concat(char *out_path, const char *dir,
-      const char *path, const char delim, const char *concat,
-      size_t size);
-
-/**
- * fill_short_pathname_representation:
- * @out_rep            : output representation
- * @in_path            : input path
- * @size               : size of output representation
- *
- * Generates a short representation of path. It should only
- * be used for displaying the result; the output representation is not
- * binding in any meaningful way (for a normal path, this is the same as basename)
- * In case of more complex URLs, this should cut everything except for
- * the main image file.
- *
- * E.g.: "/path/to/game.img" -> game.img
- *       "/path/to/myarchive.7z#folder/to/game.img" -> game.img
- */
-size_t fill_short_pathname_representation(char* out_rep,
-      const char *in_path, size_t size);
-
-void fill_short_pathname_representation_noext(char* out_rep,
-      const char *in_path, size_t size);
 
 void fill_pathname_expand_special(char *out_path,
       const char *in_path, size_t size);

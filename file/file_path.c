@@ -114,18 +114,17 @@ void path_linked_list_add_path(struct path_linked_list *in_path_linked_list, cha
       the path for the first item
    */
    if (!in_path_linked_list->path)
-   {
       in_path_linked_list->path = strdup(path);
-   }
    else
    {  
-      struct path_linked_list *head = in_path_linked_list;
       struct path_linked_list *node = (struct path_linked_list*) malloc(sizeof(*node));
 
       if (node)
       {
-         node->next        = NULL;
-         node->path        = strdup(path);
+         struct path_linked_list *head = in_path_linked_list;
+
+         node->next                    = NULL;
+         node->path                    = strdup(path);
 
          if (head)
          {
@@ -285,7 +284,7 @@ void fill_pathname(char *out_path, const char *in_path,
       const char *replace, size_t size)
 {
    char tmp_path[PATH_MAX_LENGTH];
-   char *tok                      = NULL;
+   char *tok   = NULL;
 
    tmp_path[0] = '\0';
 
@@ -293,29 +292,10 @@ void fill_pathname(char *out_path, const char *in_path,
    if ((tok = (char*)strrchr(path_basename(tmp_path), '.')))
       *tok = '\0';
 
-   fill_pathname_noext(out_path, tmp_path, replace, size);
+   strlcpy(out_path, tmp_path, size);
+   strlcat(out_path, replace, size);
 }
 
-/**
- * fill_pathname_noext:
- * @out_path           : output path
- * @in_path            : input  path
- * @replace            : what to replace
- * @size               : buffer size of output path
- *
- * Appends a filename extension 'replace' to 'in_path', and outputs
- * result in 'out_path'.
- *
- * Assumes in_path has no extension. If an extension is still
- * present in 'in_path', it will be ignored.
- *
- */
-size_t fill_pathname_noext(char *out_path, const char *in_path,
-      const char *replace, size_t size)
-{
-   strlcpy(out_path, in_path, size);
-   return strlcat(out_path, replace, size);
-}
 
 char *find_last_slash(const char *str)
 {
@@ -396,26 +376,9 @@ size_t fill_pathname_dir(char *in_dir, const char *in_basename,
 size_t fill_pathname_base(char *out, const char *in_path, size_t size)
 {
    const char     *ptr = path_basename(in_path);
-
-   if (!ptr)
-      ptr = in_path;
-
-   return strlcpy(out, ptr, size);
-}
-
-void fill_pathname_base_noext(char *out,
-      const char *in_path, size_t size)
-{
-   fill_pathname_base(out, in_path, size);
-   path_remove_extension(out);
-}
-
-size_t fill_pathname_base_ext(char *out,
-      const char *in_path, const char *ext,
-      size_t size)
-{
-   fill_pathname_base_noext(out, in_path, size);
-   return strlcat(out, ext, size);
+   if (ptr)
+      return strlcpy(out, ptr, size);
+   return strlcpy(out, in_path, size);
 }
 
 /**
@@ -434,13 +397,6 @@ void fill_pathname_basedir(char *out_dir,
    if (out_dir != in_path)
       strlcpy(out_dir, in_path, size);
    path_basedir(out_dir);
-}
-
-void fill_pathname_basedir_noext(char *out_dir,
-      const char *in_path, size_t size)
-{
-   fill_pathname_basedir(out_dir, in_path, size);
-   path_remove_extension(out_dir);
 }
 
 /**
@@ -550,7 +506,7 @@ size_t fill_dated_filename(char *out_filename,
 void fill_str_dated_filename(char *out_filename,
       const char *in_str, const char *ext, size_t size)
 {
-   char format[256];
+   char format[NAME_MAX_LENGTH];
    struct tm tm_;
    time_t cur_time = time(NULL);
 
@@ -561,15 +517,15 @@ void fill_str_dated_filename(char *out_filename,
    if (string_is_empty(ext))
    {
       strftime(format, sizeof(format), "-%y%m%d-%H%M%S", &tm_);
-      fill_pathname_noext(out_filename, in_str, format, size);
+      strlcpy(out_filename, in_str, size);
+      strlcat(out_filename, format, size);
    }
    else
    {
       strftime(format, sizeof(format), "-%y%m%d-%H%M%S.", &tm_);
-
-      fill_pathname_join_concat_noext(out_filename,
-            in_str, format, ext,
-            size);
+      strlcpy(out_filename, in_str, size);
+      strlcat(out_filename, format, size);
+      strlcat(out_filename, ext,    size);
    }
 }
 
@@ -719,11 +675,12 @@ char *path_resolve_realpath(char *buf, size_t size, bool resolve_symlinks)
 #if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
 #ifdef _WIN32
    char *ret = NULL;
-   wchar_t abs_path[PATH_MAX_LENGTH];
    wchar_t *rel_path = utf8_to_utf16_string_alloc(buf);
 
    if (rel_path)
    {
+      wchar_t abs_path[PATH_MAX_LENGTH];
+
       if (_wfullpath(abs_path, rel_path, PATH_MAX_LENGTH))
       {
          char *tmp = utf16_to_utf8_string_alloc(abs_path);
@@ -764,7 +721,7 @@ char *path_resolve_realpath(char *buf, size_t size, bool resolve_symlinks)
       return buf;
    }
 
-   t = 0; /* length of output */
+   t       = 0; /* length of output */
    buf_end = buf + strlen(buf);
 
    if (!path_is_absolute(buf))
@@ -827,9 +784,8 @@ char *path_resolve_realpath(char *buf, size_t size, bool resolve_symlinks)
          while (p <= next)
             tmp[t++] = *p++;
       }
-
-   }
-   while (next < buf_end);
+   }while(next < buf_end);
+   
 
 end:
    tmp[t] = '\0';
@@ -906,7 +862,9 @@ void fill_pathname_resolve_relative(char *out_path,
       return;
    }
 
-   fill_pathname_basedir(out_path, in_refpath, size);
+   if (out_path != in_refpath)
+      strlcpy(out_path, in_refpath, size);
+   path_basedir(out_path);
    strlcat(out_path, in_path, size);
    path_resolve_realpath(out_path, size, false);
 }
@@ -947,31 +905,6 @@ size_t fill_pathname_join_special_ext(char *out_path,
    return strlcat(out_path, ext, size);
 }
 
-size_t fill_pathname_join_concat_noext(char *out_path,
-      const char *dir, const char *path,
-      const char *concat,
-      size_t size)
-{
-   fill_pathname_noext(out_path, dir, path, size);
-   return strlcat(out_path, concat, size);
-}
-
-size_t fill_pathname_join_concat(char *out_path,
-      const char *dir, const char *path,
-      const char *concat,
-      size_t size)
-{
-   fill_pathname_join(out_path, dir, path, size);
-   return strlcat(out_path, concat, size);
-}
-
-void fill_pathname_join_noext(char *out_path,
-      const char *dir, const char *path, size_t size)
-{
-   fill_pathname_join(out_path, dir, path, size);
-   path_remove_extension(out_path);
-}
-
 /**
  * fill_pathname_join_delim:
  * @out_path           : output path
@@ -997,51 +930,8 @@ size_t fill_pathname_join_delim(char *out_path, const char *dir,
    out_path[copied+1] = '\0';
 
    if (path)
-      copied = strlcat(out_path, path, size);
+      return strlcat(out_path, path, size);
    return copied;
-}
-
-size_t fill_pathname_join_delim_concat(char *out_path, const char *dir,
-      const char *path, const char delim, const char *concat,
-      size_t size)
-{
-   fill_pathname_join_delim(out_path, dir, path, delim, size);
-   return strlcat(out_path, concat, size);
-}
-
-/**
- * fill_short_pathname_representation:
- * @out_rep            : output representation
- * @in_path            : input path
- * @size               : size of output representation
- *
- * Generates a short representation of path. It should only
- * be used for displaying the result; the output representation is not
- * binding in any meaningful way (for a normal path, this is the same as basename)
- * In case of more complex URLs, this should cut everything except for
- * the main image file.
- *
- * E.g.: "/path/to/game.img" -> game.img
- *       "/path/to/myarchive.7z#folder/to/game.img" -> game.img
- */
-size_t fill_short_pathname_representation(char* out_rep,
-      const char *in_path, size_t size)
-{
-   char path_short[NAME_MAX_LENGTH];
-
-   path_short[0] = '\0';
-
-   fill_pathname(path_short, path_basename(in_path), "",
-            sizeof(path_short));
-
-   return strlcpy(out_rep, path_short, size);
-}
-
-void fill_short_pathname_representation_noext(char* out_rep,
-      const char *in_path, size_t size)
-{
-   fill_short_pathname_representation(out_rep, in_path, size);
-   path_remove_extension(out_rep);
 }
 
 void fill_pathname_expand_special(char *out_path,
@@ -1186,7 +1076,7 @@ void pathname_conform_slashes_to_os(char *path)
          *p = PATH_DEFAULT_SLASH_C();
 }
 
-/* Change all shashes to forward so they are more portable between windows and linux */
+/* Change all shashes to forward so they are more portable between Windows and Linux */
 void pathname_make_slashes_portable(char *path)
 {
    /* Conform slashes to os standard so we get proper matching */
@@ -1283,14 +1173,11 @@ void path_basedir_wrapper(char *path)
 
 #ifdef HAVE_COMPRESSION
    /* We want to find the directory with the archive in basedir. */
-   last = (char*)path_get_archive_delim(path);
-   if (last)
+   if ((last = (char*)path_get_archive_delim(path)))
       *last = '\0';
 #endif
 
-   last = find_last_slash(path);
-
-   if (last)
+   if ((last = find_last_slash(path)))
       last[1] = '\0';
    else
       strlcpy(path, "." PATH_DEFAULT_SLASH(), 3);
@@ -1395,9 +1282,8 @@ void fill_pathname_application_path(char *s, size_t len)
 
          snprintf(link_path, sizeof(link_path), "/proc/%u/%s",
                (unsigned)pid, exts[i]);
-         ret = readlink(link_path, s, len - 1);
 
-         if (ret >= 0)
+         if ((ret = readlink(link_path, s, len - 1)) >= 0)
          {
             s[ret] = '\0';
             return;
