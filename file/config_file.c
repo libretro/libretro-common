@@ -399,12 +399,8 @@ void config_file_add_reference(config_file_t *conf, char *path)
 {
    /* It is expected that the conf has it's path already set */
    char short_path[PATH_MAX_LENGTH];
-   
-   short_path[0] = '\0';
-   
    if (!conf->references)
       conf->references = path_linked_list_new();
-
    fill_pathname_abbreviated_or_relative(short_path, conf->path, path, sizeof(short_path));
    path_linked_list_add_path(conf->references, short_path);
 }
@@ -540,7 +536,6 @@ static bool config_file_parse_line(config_file_t *conf,
             return false;
          }
 
-         real_path[0]         = '\0';
          config_file_add_sub_conf(conf, path,
             real_path, sizeof(real_path), cb);
 
@@ -1232,8 +1227,6 @@ void config_set_path(config_file_t *conf, const char *entry, const char *val)
    config_set_string(conf, entry, val);
 #else
    char buf[PATH_MAX_LENGTH];
-
-   buf[0] = '\0';
    fill_pathname_abbreviate_special(buf, val, sizeof(buf));
    config_set_string(conf, entry, buf);
 #endif
@@ -1374,11 +1367,6 @@ void config_file_dump(config_file_t *conf, FILE *file, bool sort)
       fprintf(file, "#include \"%s\"\n", includes->path);
       includes = includes->next;
    }
-}
-
-bool config_entry_exists(config_file_t *conf, const char *entry)
-{
-   return (bool)RHMAP_HAS_STR(conf->entries_map, entry);
 }
 
 bool config_get_entry_list_head(config_file_t *conf,
