@@ -30,7 +30,6 @@
 
 #include <boolean.h>
 #include <file/file_path.h>
-#include <retro_assert.h>
 #include <retro_miscellaneous.h>
 #include <string/stdstring.h>
 #include <time/rtime.h>
@@ -278,8 +277,10 @@ bool path_is_compressed_file(const char* path)
  * out_path = "/foo/bar/baz/boo.asm"
  * E.g.: in_path = "/foo/bar/baz/boo.c", replace = ""     =>
  * out_path = "/foo/bar/baz/boo"
+ *
+ * @return Length of the string copied into @out
  */
-void fill_pathname(char *out_path, const char *in_path,
+size_t fill_pathname(char *out_path, const char *in_path,
       const char *replace, size_t size)
 {
    char tmp_path[PATH_MAX_LENGTH];
@@ -289,7 +290,7 @@ void fill_pathname(char *out_path, const char *in_path,
       *tok = '\0';
 
    strlcpy(out_path, tmp_path, size);
-   strlcat(out_path, replace, size);
+   return strlcat(out_path, replace, size);
 }
 
 
@@ -516,8 +517,10 @@ size_t fill_dated_filename(char *out_filename,
  *
  * E.g.:
  * out_filename = "RetroArch-{year}{month}{day}-{Hour}{Minute}{Second}.{@ext}"
+ *
+ * @return Length of the string copied into @out_path
  **/
-void fill_str_dated_filename(char *out_filename,
+size_t fill_str_dated_filename(char *out_filename,
       const char *in_str, const char *ext, size_t size)
 {
    char format[NAME_MAX_LENGTH];
@@ -530,14 +533,11 @@ void fill_str_dated_filename(char *out_filename,
    if (string_is_empty(ext))
    {
       strftime(format, sizeof(format), "-%y%m%d-%H%M%S", &tm_);
-      strlcat(out_filename, format, size);
+      return strlcat(out_filename, format, size);
    }
-   else
-   {
-      strftime(format, sizeof(format), "-%y%m%d-%H%M%S.", &tm_);
-      strlcat(out_filename, format, size);
-      strlcat(out_filename, ext,    size);
-   }
+   strftime(format, sizeof(format), "-%y%m%d-%H%M%S.", &tm_);
+   strlcat(out_filename, format, size);
+   return strlcat(out_filename, ext, size);
 }
 
 /**
@@ -829,6 +829,8 @@ end:
  * Both @path and @base are assumed to be absolute paths without "." or "..".
  *
  * E.g. path /a/b/e/f.cg with base /a/b/c/d/ turns into ../../e/f.cg
+ *
+ * @return Length of the string copied into @out
  **/
 size_t path_relative_to(char *out,
       const char *path, const char *base, size_t size)
@@ -906,13 +908,44 @@ void fill_pathname_resolve_relative(char *out_path,
  * Joins a directory (@dir) and path (@path) together.
  * Makes sure not to get  two consecutive slashes
  * between directory and path.
+ *
+ * Deprecated. Use fill_pathname_join_special() instead
+ * if you can ensure @dir and @out_path won't overlap.
+ *
+ * @return Length of the string copied into @out_path
  **/
 size_t fill_pathname_join(char *out_path,
       const char *dir, const char *path, size_t size)
 {
-   size_t len = 0;
    if (out_path != dir)
-      len = strlcpy(out_path, dir, size);
+      strlcpy(out_path, dir, size);
+   if (*out_path)
+      fill_pathname_slash(out_path, size);
+   return strlcat(out_path, path, size);
+}
+
+/**
+ * fill_pathname_join_special:
+ * @out_path           : output path
+ * @dir                : directory. Cannot be identical to @out_path
+ * @path               : path
+ * @size               : size of output path
+ *
+ *
+ * Specialized version of fill_pathname_join.
+ * Unlike fill_pathname_join(),
+ * @dir and @out_path CANNOT be identical.
+ *
+ * Joins a directory (@dir) and path (@path) together.
+ * Makes sure not to get  two consecutive slashes
+ * between directory and path.
+ *
+ * @return Length of the string copied into @out_path
+ **/
+size_t fill_pathname_join_special(char *out_path,
+      const char *dir, const char *path, size_t size)
+{
+   size_t len = strlcpy(out_path, dir, size);
 
    if (*out_path)
    {
@@ -927,7 +960,10 @@ size_t fill_pathname_join(char *out_path,
          }
       }
       else
-         strlcat(out_path, PATH_DEFAULT_SLASH(), size);
+      {
+         out_path[len]      = PATH_DEFAULT_SLASH_C();
+         out_path[len+1]    = '\0';
+      }
    }
 
    return strlcat(out_path, path, size);
@@ -975,59 +1011,35 @@ size_t fill_pathname_join_delim(char *out_path, const char *dir,
    return copied;
 }
 
-void fill_pathname_expand_special(char *out_path,
+size_t fill_pathname_expand_special(char *out_path,
       const char *in_path, size_t size)
 {
 #if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
+   char *app_dir = NULL;
    if (in_path[0] == '~')
    {
-      char *home_dir = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
-      fill_pathname_home_dir(home_dir,
-         PATH_MAX_LENGTH * sizeof(char));
-
-      if (*home_dir)
-      {
-         size_t src_size = strlcpy(out_path, home_dir, size);
-         retro_assert(src_size < size);
-
-         out_path  += src_size;
-         size      -= src_size;
-
-         if (!PATH_CHAR_IS_SLASH(out_path[-1]))
-         {
-            src_size = strlcpy(out_path, PATH_DEFAULT_SLASH(), size);
-            retro_assert(src_size < size);
-
-            out_path += src_size;
-            size     -= src_size;
-         }
-
-         in_path += 2;
-      }
-
-      free(home_dir);
+      app_dir    = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
+      fill_pathname_home_dir(app_dir, PATH_MAX_LENGTH * sizeof(char));
    }
    else if (in_path[0] == ':')
    {
-      char *application_dir = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
+      app_dir    = (char*)malloc(PATH_MAX_LENGTH * sizeof(char));
+      app_dir[0] = '\0';
+      fill_pathname_application_dir(app_dir, PATH_MAX_LENGTH * sizeof(char));
+   }
 
-      application_dir[0]    = '\0';
-
-      fill_pathname_application_dir(application_dir,
-            PATH_MAX_LENGTH * sizeof(char));
-
-      if (*application_dir)
+   if (app_dir)
+   {
+      if (*app_dir)
       {
-         size_t src_size   = strlcpy(out_path, application_dir, size);
-         retro_assert(src_size < size);
+         size_t src_size = strlcpy(out_path, app_dir, size);
 
-         out_path  += src_size;
-         size      -= src_size;
+         out_path       += src_size;
+         size           -= src_size;
 
          if (!PATH_CHAR_IS_SLASH(out_path[-1]))
          {
-            src_size = strlcpy(out_path, PATH_DEFAULT_SLASH(), size);
-            retro_assert(src_size < size);
+            src_size  = strlcpy(out_path, PATH_DEFAULT_SLASH(), size);
 
             out_path += src_size;
             size     -= src_size;
@@ -1036,14 +1048,13 @@ void fill_pathname_expand_special(char *out_path,
          in_path += 2;
       }
 
-      free(application_dir);
+      free(app_dir);
    }
 #endif
-
-   retro_assert(strlcpy(out_path, in_path, size) < size);
+   return strlcpy(out_path, in_path, size);
 }
 
-void fill_pathname_abbreviate_special(char *out_path,
+size_t fill_pathname_abbreviate_special(char *out_path,
       const char *in_path, size_t size)
 {
 #if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
@@ -1080,8 +1091,6 @@ void fill_pathname_abbreviate_special(char *out_path,
       {
          size_t src_size  = strlcpy(out_path, notations[i], size);
 
-         retro_assert(src_size < size);
-
          out_path        += src_size;
          size            -= src_size;
          in_path         += strlen(candidates[i]);
@@ -1096,10 +1105,8 @@ void fill_pathname_abbreviate_special(char *out_path,
          break; /* Don't allow more abbrevs to take place. */
       }
    }
-
 #endif
-
-   retro_assert(strlcpy(out_path, in_path, size) < size);
+   return strlcpy(out_path, in_path, size);
 }
 
 /**
@@ -1174,8 +1181,10 @@ static int get_pathname_num_slashes(const char *in_path)
  * If lengths of abbreviated and relative paths are the same,
  * the relative path will be used
  * @in_path can be an absolute, relative or abbreviated path
+ *
+ * @return Length of the string copied into @out_path
  **/
-void fill_pathname_abbreviated_or_relative(char *out_path,
+size_t fill_pathname_abbreviated_or_relative(char *out_path,
       const char *in_refpath, const char *in_path, size_t size)
 {
    char in_path_conformed[PATH_MAX_LENGTH];
@@ -1220,9 +1229,8 @@ void fill_pathname_abbreviated_or_relative(char *out_path,
    /* Use the shortest path, preferring the relative path*/
    if (  get_pathname_num_slashes(relative_path) <= 
          get_pathname_num_slashes(abbreviated_path))
-      retro_assert(strlcpy(out_path, relative_path, size) < size);
-   else
-      retro_assert(strlcpy(out_path, abbreviated_path, size) < size);
+      return strlcpy(out_path, relative_path, size);
+   return strlcpy(out_path, abbreviated_path, size);
 }
 
 /**
@@ -1306,8 +1314,9 @@ void fill_pathname_application_path(char *s, size_t len)
          char resolved_bundle_dir_buf[PATH_MAX_LENGTH] = {0};
          if (realpath(s, resolved_bundle_dir_buf))
          {
-            strlcpy(s, resolved_bundle_dir_buf, len - 1);
-            strlcat(s, "/", len);
+            size_t _len = strlcpy(s, resolved_bundle_dir_buf, len - 1);
+            s[_len  ]   = '/';
+            s[_len+1]   = '\0';
          }
       }
 #endif
@@ -1317,7 +1326,7 @@ void fill_pathname_application_path(char *s, size_t len)
 #ifndef HAVE_COCOATOUCH
       /* Not sure what this does but it breaks 
        * stuff for iOS, so skipping */
-      retro_assert(strlcat(s, "nobin", len) < len);
+      strlcat(s, "nobin", len);
 #endif
       return;
    }

@@ -225,6 +225,8 @@ char *path_resolve_realpath(char *buf, size_t size, bool resolve_symlinks);
  * Both @path and @base are assumed to be absolute paths without "." or "..".
  *
  * E.g. path /a/b/e/f.cgp with base /a/b/c/d/ turns into ../../e/f.cgp
+ *
+ * @return Length of the string copied into @out
  **/
 size_t path_relative_to(char *out, const char *path, const char *base,
       size_t size);
@@ -264,8 +266,10 @@ bool path_is_absolute(const char *path);
  * - calls strlcpy 2x
  * - calls strrchr
  * - calls strlcat
+ *
+ * @return Length of the string copied into @out
  */
-void fill_pathname(char *out_path, const char *in_path,
+size_t fill_pathname(char *out_path, const char *in_path,
       const char *replace, size_t size);
 
 /**
@@ -309,8 +313,10 @@ size_t fill_dated_filename(char *out_filename,
  * - Calls string_is_empty()
  * - Calls strftime
  * - Calls strlcat at least 2x
+ *
+ * @return Length of the string copied into @out_path
  **/
-void fill_str_dated_filename(char *out_filename,
+size_t fill_str_dated_filename(char *out_filename,
       const char *in_str, const char *ext, size_t size);
 
 /**
@@ -451,11 +457,42 @@ void fill_pathname_resolve_relative(char *out_path, const char *in_refpath,
  * 
  * Hidden non-leaf function cost: 
  * - calls strlcpy
- * - calls find_last_slash()
+ * - calls fill_pathname_slash()
  * - calls strlcat
+ *
+ * Deprecated. Use fill_pathname_join_special() instead
+ * if you can ensure @dir != @out_path
+ *
+ * @return Length of the string copied into @out_path
  **/
 size_t fill_pathname_join(char *out_path, const char *dir,
       const char *path, size_t size);
+
+/**
+ * fill_pathname_join_special:
+ * @out_path           : output path
+ * @dir                : directory. Cannot be identical to @out_path
+ * @path               : path
+ * @size               : size of output path
+ *
+ *
+ * Specialized version of fill_pathname_join.
+ * Unlike fill_pathname_join(),
+ * @dir and @out_path CANNOT be identical.
+ *
+ * Joins a directory (@dir) and path (@path) together.
+ * Makes sure not to get two consecutive slashes
+ * between directory and path.
+ *
+ * Hidden non-leaf function cost: 
+ * - calls strlcpy
+ * - calls find_last_slash()
+ * - calls strlcat
+ *
+ * @return Length of the string copied into @out_path
+ **/
+size_t fill_pathname_join_special(char *out_path,
+      const char *dir, const char *path, size_t size);
 
 size_t fill_pathname_join_special_ext(char *out_path,
       const char *dir,  const char *path,
@@ -481,10 +518,10 @@ size_t fill_pathname_join_special_ext(char *out_path,
 size_t fill_pathname_join_delim(char *out_path, const char *dir,
       const char *path, const char delim, size_t size);
 
-void fill_pathname_expand_special(char *out_path,
+size_t fill_pathname_expand_special(char *out_path,
       const char *in_path, size_t size);
 
-void fill_pathname_abbreviate_special(char *out_path,
+size_t fill_pathname_abbreviate_special(char *out_path,
       const char *in_path, size_t size);
 
 /**
@@ -496,8 +533,10 @@ void fill_pathname_abbreviate_special(char *out_path,
  * If lengths of abbreviated and relative paths are the same,
  * the relative path will be used
  * @in_path can be an absolute, relative or abbreviated path
+ *
+ * @return Length of the string copied into @out_path
  **/
-void fill_pathname_abbreviated_or_relative(char *out_path,
+size_t fill_pathname_abbreviated_or_relative(char *out_path,
 		const char *in_refpath, const char *in_path, size_t size);
 
 /**
