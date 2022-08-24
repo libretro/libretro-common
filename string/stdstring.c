@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <string.h>
 
+#include <compat/strl.h>
 #include <string/stdstring.h>
 #include <encodings/utf.h>
 
@@ -89,9 +90,11 @@ char *string_ucwords(char *s)
 }
 
 char *string_replace_substring(const char *in,
-      const char *pattern, const char *replacement)
+      const char *pattern, size_t pattern_len,
+      const char *replacement, size_t replacement_len)
 {
-   size_t numhits, pattern_len, replacement_len, outlen;
+   size_t outlen;
+   size_t numhits     = 0;
    const char *inat   = NULL;
    const char *inprev = NULL;
    char          *out = NULL;
@@ -102,9 +105,6 @@ char *string_replace_substring(const char *in,
    if (!pattern || !replacement)
       return strdup(in);
 
-   pattern_len     = strlen(pattern);
-   replacement_len = strlen(replacement);
-   numhits         = 0;
    inat            = in;
 
    while ((inat = strstr(inat, pattern)))
@@ -128,7 +128,7 @@ char *string_replace_substring(const char *in,
       outat += inat-inprev;
       memcpy(outat, replacement, replacement_len);
       outat += replacement_len;
-      inat += pattern_len;
+      inat  += pattern_len;
       inprev = inat;
    }
    strcpy(outat, inprev);
@@ -217,13 +217,14 @@ char *string_trim_whitespace(char *const s)
  * correctly any text containing so-called 'wide' Unicode
  * characters (e.g. CJK languages, emojis, etc.).
  **/
-void word_wrap(char *dst, size_t dst_size, const char *src,
-      int line_width, int wideglyph_width, unsigned max_lines)
+void word_wrap(
+      char *dst,       size_t dst_size,
+      const char *src, size_t src_len,
+      int line_width,  int wideglyph_width, unsigned max_lines)
 {
    char *lastspace     = NULL;
    unsigned counter    = 0;
    unsigned lines      = 1;
-   size_t src_len      = strlen(src);
    const char *src_end = src + src_len;
 
    /* Prevent buffer overflow */
@@ -234,7 +235,7 @@ void word_wrap(char *dst, size_t dst_size, const char *src,
     * than line width */
    if (src_len < line_width)
    {
-      strcpy(dst, src);
+      strlcpy(dst, src, dst_size);
       return;
    }
 
@@ -256,7 +257,7 @@ void word_wrap(char *dst, size_t dst_size, const char *src,
           * length is less than line width */
          if (src_end - src <= line_width)
          {
-            strcpy(dst, src);
+            strlcpy(dst, src, dst_size);
             return;
          }
      }
@@ -283,7 +284,7 @@ void word_wrap(char *dst, size_t dst_size, const char *src,
              * length is less than line width */
             if (src_end - src < line_width)
             {
-               strcpy(dst, src);
+               strlcpy(dst, src, dst_size);
                return;
             }
          }
@@ -327,12 +328,12 @@ void word_wrap(char *dst, size_t dst_size, const char *src,
  * @wideglyph_width value.
  **/
 void word_wrap_wideglyph(char *dst, size_t dst_size,
-      const char *src, int line_width,
+      const char *src, size_t src_len, int line_width,
       int wideglyph_width, unsigned max_lines)
 {
    char *lastspace                   = NULL;
    char *lastwideglyph               = NULL;
-   const char *src_end               = src + strlen(src);
+   const char *src_end               = src + src_len;
    unsigned lines                    = 1;
    /* 'line_width' means max numbers of characters per line,
     * but this metric is only meaningful when dealing with
