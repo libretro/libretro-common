@@ -560,10 +560,16 @@ int64_t retro_vfs_file_truncate_impl(libretro_vfs_implementation_file *stream, i
 {
 #ifdef _WIN32
    if (stream && _chsize(_fileno(stream->fp), length) == 0)
+   {
+	   stream->size = length;
 	   return 0;
+   }
 #elif !defined(VITA) && !defined(PSP) && !defined(PS2) && !defined(ORBIS) && (!defined(SWITCH) || defined(HAVE_LIBNX))
    if (stream && ftruncate(fileno(stream->fp), (off_t)length) == 0)
+   {
+      stream->size = length;
       return 0;
+   }
 #endif
    return -1;
 }
@@ -604,21 +610,7 @@ int64_t retro_vfs_file_tell_impl(libretro_vfs_implementation_file *stream)
 int64_t retro_vfs_file_seek_impl(libretro_vfs_implementation_file *stream,
       int64_t offset, int seek_position)
 {
-   int whence = -1;
-   switch (seek_position)
-   {
-      case RETRO_VFS_SEEK_POSITION_START:
-         whence = SEEK_SET;
-         break;
-      case RETRO_VFS_SEEK_POSITION_CURRENT:
-         whence = SEEK_CUR;
-         break;
-      case RETRO_VFS_SEEK_POSITION_END:
-         whence = SEEK_END;
-         break;
-   }
-
-   return retro_vfs_file_seek_internal(stream, offset, whence);
+   return retro_vfs_file_seek_internal(stream, offset, seek_position);
 }
 
 int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream,
@@ -656,16 +648,34 @@ int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream,
 
 int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, const void *s, uint64_t len)
 {
+   int64_t pos = 0;
+   size_t result = -1;
+
    if (!stream)
       return -1;
 
    if ((stream->hints & RFILE_HINT_UNBUFFERED) == 0)
-      return fwrite(s, 1, (size_t)len, stream->fp);
+   {
+      pos = retro_vfs_file_tell_impl(stream);
+      result = fwrite(s, 1, (size_t)len, stream->fp);
+
+      if (result != -1 && pos + result > stream->size)
+         stream->size = pos + result;
+
+      return result;
+   }
 #ifdef HAVE_MMAP
    if (stream->hints & RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS)
       return -1;
 #endif
-   return write(stream->fd, s, (size_t)len);
+
+   pos = retro_vfs_file_tell_impl(stream);
+   result = write(stream->fd, s, (size_t)len);
+
+   if (result != -1 && pos + result > stream->size)
+      stream->size = pos + result;
+
+   return result;
 }
 
 int retro_vfs_file_flush_impl(libretro_vfs_implementation_file *stream)
@@ -1015,7 +1025,6 @@ libretro_vfs_implementation_dir *retro_vfs_opendir_impl(
       const char *name, bool include_hidden)
 {
 #if defined(_WIN32)
-   unsigned path_len;
    char path_buf[1024];
    size_t copied      = 0;
 #if defined(LEGACY_WIN32)
@@ -1026,7 +1035,7 @@ libretro_vfs_implementation_dir *retro_vfs_opendir_impl(
 #endif
    libretro_vfs_implementation_dir *rdir;
 
-   /*Reject null or empty string paths*/
+   /* Reject NULL or empty string paths*/
    if (!name || (*name == 0))
       return NULL;
 
@@ -1038,16 +1047,13 @@ libretro_vfs_implementation_dir *retro_vfs_opendir_impl(
    rdir->orig_path       = strdup(name);
 
 #if defined(_WIN32)
-   path_buf[0]           = '\0';
-   path_len              = strlen(name);
-
    copied                = strlcpy(path_buf, name, sizeof(path_buf));
 
    /* Non-NT platforms don't like extra slashes in the path */
-   if (name[path_len - 1] != '\\')
-      path_buf[copied++]   = '\\';
+   if (path_buf[copied - 1] != '\\')
+      path_buf [copied++]  = '\\';
 
-   path_buf[copied]        = '*';
+   path_buf[copied  ]      = '*';
    path_buf[copied+1]      = '\0';
 
 #if defined(LEGACY_WIN32)
