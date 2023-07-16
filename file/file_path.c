@@ -328,14 +328,16 @@ bool path_is_compressed_file(const char* path)
 size_t fill_pathname(char *out_path, const char *in_path,
       const char *replace, size_t size)
 {
+   size_t _len;
    char tmp_path[PATH_MAX_LENGTH];
    char *tok   = NULL;
    strlcpy(tmp_path, in_path, sizeof(tmp_path));
    if ((tok = (char*)strrchr(path_basename(tmp_path), '.')))
       *tok = '\0';
 
-   strlcpy(out_path, tmp_path, size);
-   return strlcat(out_path, replace, size);
+   _len  = strlcpy(out_path, tmp_path, size);
+   _len += strlcpy(out_path + _len, replace, size - _len);
+   return _len;
 }
 
 
@@ -381,12 +383,12 @@ void fill_pathname_slash(char *path, size_t size)
       return;
    }
 
-   path_len               = strlen(path);
+   path_len            = strlen(path);
    /* Try to preserve slash type. */
    if (last_slash != (path + path_len - 1))
    {
-      path[path_len]   = last_slash[0];
-      path[path_len+1] = '\0';
+      path[  path_len] = last_slash[0];
+      path[++path_len] = '\0';
    }
 }
 
@@ -1000,14 +1002,14 @@ size_t fill_pathname_join_special(char *out_path,
          /* Try to preserve slash type. */
          if (last_slash != (out_path + len - 1))
          {
-            out_path[len]   = last_slash[0];
-            out_path[len+1] = '\0';
+            out_path[  len] = last_slash[0];
+            out_path[++len] = '\0';
          }
       }
       else
       {
-         out_path[len]      = PATH_DEFAULT_SLASH_C();
-         out_path[len+1]    = '\0';
+         out_path[  len]    = PATH_DEFAULT_SLASH_C();
+         out_path[++len]    = '\0';
       }
    }
 
@@ -1360,8 +1362,8 @@ void fill_pathname_application_path(char *s, size_t len)
          if (realpath(s, resolved_bundle_dir_buf))
          {
             size_t _len = strlcpy(s, resolved_bundle_dir_buf, len - 1);
-            s[_len  ]   = '/';
-            s[_len+1]   = '\0';
+            s[  _len]   = '/';
+            s[++_len]   = '\0';
          }
       }
 #endif
