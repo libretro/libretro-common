@@ -307,8 +307,7 @@ enum retro_language
 /* Regular save RAM. This RAM is usually found on a game cartridge,
  * backed up by a battery.
  * If save game data is too complex for a single memory buffer,
- * the SAVE_DIRECTORY (preferably) or SYSTEM_DIRECTORY environment
- * callback can be used. */
+ * the SAVE_DIRECTORY environment callback should be used. */
 #define RETRO_MEMORY_SAVE_RAM    0
 
 /* Some games have a built-in clock to keep track of time.
@@ -552,18 +551,42 @@ enum retro_mod
                                             * If called, it should be called in retro_load_game().
                                             */
 #define RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY 9
-                                           /* const char ** --
-                                            * Returns the "system" directory of the frontend.
-                                            * This directory can be used to store system specific
-                                            * content such as BIOSes, configuration data, etc.
-                                            * The returned value can be NULL.
-                                            * If so, no such directory is defined,
-                                            * and it's up to the implementation to find a suitable directory.
+                                           /* 
+                                            * const char **: the "system" directory of the frontend.
                                             *
-                                            * NOTE: Some cores used this folder also for "save" data such as
-                                            * memory cards, etc, for lack of a better place to put it.
-                                            * This is now discouraged, and if possible, cores should try to
-                                            * use the new GET_SAVE_DIRECTORY.
+                                            * This directory should be used to store static core-specific data such
+                                            * as BIOSes, fonts, or metadata that is required to fully execute one or
+                                            * more types of content that the core supports.
+                                            * 
+                                            * FRONTENDS  --------------------
+                                            * Frontends that support cores which require a SYSTEM directory  
+                                            * should ensure that they provide a valid, existing directory in response
+                                            * to this callback. The SYSTEM directory does not need to be distinct from
+                                            * other directories in the real filesystem however; for example, in some
+                                            * environments the frontend may return the same directory for the SYSTEM
+                                            * and the SAVE directory because only one directory is user-accessible.
+                                            *
+                                            * Frontends should return NULL to indicate that no SYSTEM directory
+                                            * is available so the core can determine whether or not to operate without
+                                            * a SYSTEM directory.
+                                            *
+                                            * CORES  ------------------------
+                                            * The libretro API does not support the frontend changing the
+                                            * SYSTEM directory during core operation therefore it is recommended to
+                                            * check the SYSTEM directory once, by convention during retro_load_game().
+                                            * Cores have no reason to write data to the SYSTEM directory, only read it.
+                                            * Data should be written to the SAVE directory.
+                                            *
+                                            * HISTORICAL NOTES  -------------
+                                            * 1. Before RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY was added to the libretro
+                                            * API, cores conventionallly would use the path of the content being loaded
+                                            * by inspecting content->path during retro_load_game(). This approach can
+                                            * still be used for cores that need to support frontends from before
+                                            * RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY became part of the API.
+                                            * 2. After RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY was added, but before
+                                            * RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY was added to the libretro
+                                            * API, cores conventionally used the SYSTEM directory for "save" data. That
+                                            * behavior is no longer recommended.
                                             */
 #define RETRO_ENVIRONMENT_SET_PIXEL_FORMAT 10
                                            /* const enum retro_pixel_format * --
@@ -804,19 +827,30 @@ enum retro_mod
                                             * and it's up to the implementation to find a suitable directory.
                                             */
 #define RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY 31
-                                           /* const char ** --
-                                            * Returns the "save" directory of the frontend, unless there is no
-                                            * save directory available. The save directory should be used to
-                                            * store SRAM, memory cards, high scores, etc, if the libretro core
-                                            * cannot use the regular memory interface (retro_get_memory_data()).
+                                           /* 
+                                            * const char **: the "save" directory of the frontend.
                                             *
-                                            * If the frontend cannot designate a save directory, it will return
-                                            * NULL to indicate that the core should attempt to operate without a
-                                            * save directory set.
+                                            * The SAVE directory should be used to store SRAM, memory cards, high scores,
+                                            * and any other core-generated data if the core cannot use the regular memory
+                                            * interface (retro_get_memory_data()).
                                             *
-                                            * NOTE: early libretro cores used the system directory for save
-                                            * files. Cores that need to be backwards-compatible can still check
-                                            * GET_SYSTEM_DIRECTORY.
+                                            * FRONTENDS  --------------------
+                                            * Frontends that support cores which require a SAVE directory 
+                                            * should ensure that they provide a valid, existing directory in response
+                                            * to this callback. The SAVE directory does not need to be distinct from
+                                            * other directories in the real filesystem however; for example, in some
+                                            * environments the frontend may return the same directory for the SYSTEM
+                                            * and the SAVE directory because only one directory is user-accessible.
+                                            *
+                                            * Frontends should return NULL to indicate that no SAVE directory
+                                            * is available so the core can determine whether or not to operate without
+                                            * a SAVE directory.
+                                            *
+                                            * CORES  ------------------------
+                                            * The libretro API does not support the frontend changing the
+                                            * SAVE directory during core operation therefore it is recommended to
+                                            * check the SAVE directory once, by convention during retro_load_game().
+                                            *
                                             */
 #define RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO 32
                                            /* const struct retro_system_av_info * --
