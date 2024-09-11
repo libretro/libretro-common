@@ -1173,6 +1173,45 @@ size_t fill_pathname_abbreviate_special(char *out_path,
 }
 
 /**
+ * sanitize_path_part:
+ *
+ * @path_part               : directory or filename
+ *
+ * Takes single part of a path eg. single filename
+ * or directory, and removes any special chars that are
+ * unavailable.
+ *
+ * @returns new string that has been sanitized
+ **/
+const char *sanitize_path_part(const char *path_part, size_t size)
+{
+   int i;
+   int j = 0;
+   char *tmp = NULL;
+   const char *special_chars = "<>:\"/\\|?*";
+
+   if (string_is_empty(path_part))
+      return NULL;
+
+   tmp = (char *)malloc((size + 1) * sizeof(char));
+
+   for (i = 0; path_part[i] != '\0'; i++)
+   {
+      /* Check if the current character is
+       * one of the special characters */
+
+      /*  If not, copy it to the temporary array */
+      if (!strchr(special_chars, path_part[i]))
+         tmp[j++] = path_part[i];
+   }
+
+   tmp[j] = '\0';
+
+   /* Return the new string */
+   return tmp;
+}
+
+/**
  * pathname_conform_slashes_to_os:
  *
  * @path               : path
