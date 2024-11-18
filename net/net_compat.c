@@ -115,8 +115,8 @@ int inet_pton(int af, const char *src, void *dst)
 #elif defined(_XBOX)
 struct hostent *gethostbyname(const char *name)
 {
-   static struct in_addr addr = {0};
-   static struct hostent he   = {0};
+   static struct in_addr addr;
+   static struct hostent he;
    WSAEVENT event;
    XNDNS          *dns = NULL;
    struct hostent *ret = NULL;
@@ -180,8 +180,8 @@ uint32_t inet_addr(const char *cp)
 
 struct hostent *gethostbyname(const char *name)
 {
-   static struct SceNetInAddr addr = {0};
-   static struct hostent      he   = {0};
+   static struct SceNetInAddr addr;
+   static struct hostent      he;
    int rid;
    struct hostent *ret = NULL;
 
@@ -389,7 +389,7 @@ bool addr_6to4(struct sockaddr_storage *addr)
 {
 #ifdef HAVE_INET6
    /* ::ffff:a.b.c.d */
-   static const uint16_t preffix[] = {0,0,0,0,0,0xffff};
+   static const uint16_t prefix[] = {0,0,0,0,0,0xffff};
    uint32_t address;
    uint16_t port;
    struct sockaddr_in6 *addr6 = (struct sockaddr_in6*)addr;
@@ -402,14 +402,14 @@ bool addr_6to4(struct sockaddr_storage *addr)
          return true;
       case AF_INET6:
          /* Is the address provided an IPv4? */
-         if (!memcmp(&addr6->sin6_addr, preffix, sizeof(preffix)))
+         if (!memcmp(&addr6->sin6_addr, prefix, sizeof(prefix)))
             break;
       default:
          /* We don't know how to handle this. */
          return false;
    }
 
-   memcpy(&address, ((uint8_t*)&addr6->sin6_addr) + sizeof(preffix),
+   memcpy(&address, ((uint8_t*)&addr6->sin6_addr) + sizeof(prefix),
       sizeof(address));
    port = addr6->sin6_port;
 
