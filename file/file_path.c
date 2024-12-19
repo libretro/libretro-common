@@ -451,17 +451,18 @@ void fill_pathname_basedir(char *s, const char *in_path, size_t len)
 
 /**
  * fill_pathname_parent_dir_name:
- * @s                  : output directory
+ * @s                  : output string
  * @in_dir             : input directory
- * @len                : size of output directory
+ * @len                : size of @s
  *
  * Copies only the parent directory name of @in_dir into @s.
  * The two buffers must not overlap. Removes trailing '/'.
  *
- * @return true on success, false if a slash was not found in the path.
+ * @return Length of the string copied into @s
  **/
-bool fill_pathname_parent_dir_name(char *s, const char *in_dir, size_t len)
+size_t fill_pathname_parent_dir_name(char *s, const char *in_dir, size_t len)
 {
+   size_t _len           = 0;
    char *tmp             = strdup(in_dir);
    const char *slash     = strrchr(tmp, '/');
    const char *backslash = strrchr(tmp, '\\');
@@ -493,15 +494,13 @@ bool fill_pathname_parent_dir_name(char *s, const char *in_dir, size_t len)
    {
        /* If path starts with an slash, eliminate it. */
        if (path_is_absolute(in_dir))
-           strlcpy(s, in_dir + 1, len);
+           _len = strlcpy(s, in_dir + 1, len);
        else
-           strlcpy(s, in_dir,     len);
-       free(tmp);
-       return true;
+           _len = strlcpy(s, in_dir,     len);
    }
 
    free(tmp);
-   return false;
+   return _len;
 }
 
 /**
@@ -1364,91 +1363,73 @@ void path_basedir_wrapper(char *s)
 #if !defined(RARCH_CONSOLE) && defined(RARCH_INTERNAL)
 size_t fill_pathname_application_path(char *s, size_t len)
 {
-   size_t i;
-#ifdef __APPLE__
-  CFBundleRef bundle = CFBundleGetMainBundle();
-#endif
-#ifdef _WIN32
-   DWORD ret = 0;
-   wchar_t wstr[PATH_MAX_LENGTH] = {0};
-#endif
-#ifdef __HAIKU__
-   image_info info;
-   int32_t cookie = 0;
-#endif
-   (void)i;
-
-   if (!len)
-      return 0;
-
+   if (len)
+   {
 #if defined(_WIN32)
 #ifdef LEGACY_WIN32
-   ret    = GetModuleFileNameA(NULL, s, len);
+      DWORD ret = GetModuleFileNameA(NULL, s, len);
 #else
-   ret    = GetModuleFileNameW(NULL, wstr, ARRAY_SIZE(wstr));
-
-   if (*wstr)
-   {
-      char *str = utf16_to_utf8_string_alloc(wstr);
-
-      if (str)
+      wchar_t wstr[PATH_MAX_LENGTH] = {0};
+      DWORD ret = GetModuleFileNameW(NULL, wstr, ARRAY_SIZE(wstr));
+      if (*wstr)
       {
-         strlcpy(s, str, len);
-         free(str);
-      }
-   }
-#endif
-   s[ret] = '\0';
-   return ret;
-#elif defined(__APPLE__)
-   if (bundle)
-   {
-      size_t rv               = 0;
-      CFURLRef bundle_url     = CFBundleCopyBundleURL(bundle);
-      CFStringRef bundle_path = CFURLCopyPath(bundle_url);
-      CFStringGetCString(bundle_path, s, len, kCFStringEncodingUTF8);
-#ifdef HAVE_COCOATOUCH
-      {
-         /* This needs to be done so that the path becomes
-          * /private/var/... and this
-          * is used consistently throughout for the iOS bundle path */
-         char resolved_bundle_dir_buf[DIR_MAX_LENGTH] = {0};
-         if (realpath(s, resolved_bundle_dir_buf))
+         char *str = utf16_to_utf8_string_alloc(wstr);
+         if (str)
          {
-            size_t _len = strlcpy(s, resolved_bundle_dir_buf, len - 1);
-            s[  _len]   = '/';
-            s[++_len]   = '\0';
-            rv = _len;
+            strlcpy(s, str, len);
+            free(str);
          }
       }
+#endif
+      s[ret] = '\0';
+      return ret;
+#elif defined(__APPLE__)
+      CFBundleRef bundle = CFBundleGetMainBundle();
+      if (bundle)
+      {
+         size_t rv               = 0;
+         CFURLRef bundle_url     = CFBundleCopyBundleURL(bundle);
+         CFStringRef bundle_path = CFURLCopyPath(bundle_url);
+         CFStringGetCString(bundle_path, s, len, kCFStringEncodingUTF8);
+#ifdef HAVE_COCOATOUCH
+         {
+            /* This needs to be done so that the path becomes
+             * /private/var/... and this
+             * is used consistently throughout for the iOS bundle path */
+            char resolved_bundle_dir_buf[DIR_MAX_LENGTH] = {0};
+            if (realpath(s, resolved_bundle_dir_buf))
+            {
+               size_t _len = strlcpy(s, resolved_bundle_dir_buf, len - 1);
+               s[  _len]   = '/';
+               s[++_len]   = '\0';
+               rv = _len;
+            }
+         }
 #else
-      rv = CFStringGetLength(bundle_path);
+         rv = CFStringGetLength(bundle_path);
 #endif
 
-      CFRelease(bundle_path);
-      CFRelease(bundle_url);
-      return rv;
-   }
-   return 0;
-#elif defined(__HAIKU__)
-   while (get_next_image_info(0, &cookie, &info) == B_OK)
-   {
-      if (info.type == B_APP_IMAGE)
-      {
-         return strlcpy(s, info.name, len);
+         CFRelease(bundle_path);
+         CFRelease(bundle_url);
+         return rv;
       }
-   }
+#elif defined(__HAIKU__)
+      image_info info;
+      int32_t cookie = 0;
+      while (get_next_image_info(0, &cookie, &info) == B_OK)
+      {
+         if (info.type == B_APP_IMAGE)
+            return strlcpy(s, info.name, len);
+      }
 #elif defined(__QNX__)
-   char *buff = malloc(len);
-   size_t rv = 0;
-
-   if (_cmdname(buff))
-      rv = strlcpy(s, buff, len);
-
-   free(buff);
-   return rv;
+      char *buff = malloc(len);
+      size_t rv = 0;
+      if (_cmdname(buff))
+         rv = strlcpy(s, buff, len);
+      free(buff);
+      return rv;
 #else
-   {
+      size_t i;
       static const char *exts[] = { "exe", "file", "path/a.out" };
       char link_path[255];
       pid_t pid   = getpid();
@@ -1469,9 +1450,9 @@ size_t fill_pathname_application_path(char *s, size_t len)
             return ret;
          }
       }
-      return 0;
-   }
 #endif
+   }
+   return 0;
 }
 
 void fill_pathname_application_dir(char *s, size_t len)
