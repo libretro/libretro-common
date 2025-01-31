@@ -76,6 +76,7 @@
 struct audio_mixer_sound
 {
    enum audio_mixer_type type;
+   void* user_data;
 
    union
    {
