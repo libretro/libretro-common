@@ -512,7 +512,7 @@ size_t fill_pathname_parent_dir_name(char *s, const char *in_dir, size_t len)
  * If the path was already at the root directory,
  * @s will be an empty string.
  **/
-void fill_pathname_parent_dir(char *s,
+size_t fill_pathname_parent_dir(char *s,
       const char *in_dir, size_t len)
 {
    size_t _len = 0;
@@ -520,7 +520,7 @@ void fill_pathname_parent_dir(char *s,
       _len = strlen(s);
    else
       _len = strlcpy(s, in_dir, len);
-   path_parent_dir(s, _len);
+   return path_parent_dir(s, _len);
 }
 
 /**
@@ -1055,6 +1055,8 @@ size_t fill_pathname_join_delim(char *s, const char *dir,
       _len     = strlen(dir);
    else
       _len     = strlcpy(s, dir, len);
+   if (len - _len < 2)
+      return _len;
    s[_len++]   = delim;
    s[_len  ]   = '\0';
    if (path)

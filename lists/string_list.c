@@ -177,8 +177,8 @@ bool string_list_append(struct string_list *list, const char *elem,
     * it) capacity will be zero. This will cause
     * a segfault. Handle this case by forcing the new
     * capacity to a fixed size of 32 */
-   if (list->size >= list->cap &&
-         !string_list_capacity(list,
+   if (      list->size >= list->cap
+         && !string_list_capacity(list,
                (list->cap > 0) ? (list->cap * 2) : 32))
       return false;
 
@@ -252,8 +252,7 @@ void string_list_set(struct string_list *list,
 void string_list_join_concat(char *s, size_t len,
       const struct string_list *list, const char *delim)
 {
-   size_t i;
-   size_t _len = strlen_size(s, len);
+   size_t _len = strlen(s);
 
    /* If @s is already 'full', nothing
     * further can be added
@@ -262,17 +261,15 @@ void string_list_join_concat(char *s, size_t len,
     *   in which case any attempt to increment
     *   @s or decrement @len would lead to
     *   undefined behaviour */
-   if (_len >= len)
-      return;
-
-   s      += _len;
-   len    -= _len;
-
-   for (i = 0; i < list->size; i++)
+   if (_len < len)
    {
-      size_t __len = strlcat(s, list->elems[i].data, len);
-      if ((i + 1) < list->size)
-         strlcpy(s + __len, delim, len - __len);
+      size_t i;
+      for (i = 0; i < list->size; i++)
+      {
+         _len += strlcpy(s + _len, list->elems[i].data, len - _len);
+         if ((i + 1) < list->size)
+            _len += strlcpy(s + _len, delim, len - _len);
+      }
    }
 }
 
@@ -288,19 +285,17 @@ void string_list_join_concat(char *s, size_t len,
  *
  * A string list will be joined/concatenated as a
  * string to @s, delimited by @delim.
- *
- * TODO/FIXME - eliminate the strlcat
  **/
 void string_list_join_concat_special(char *s, size_t len,
       const struct string_list *list, const char *delim)
 {
    size_t i;
-
+   size_t _len = strlen(s);
    for (i = 0; i < list->size; i++)
    {
-      size_t __len = strlcat(s, list->elems[i].data, len);
+      _len += strlcpy(s + _len, list->elems[i].data, len - _len);
       if ((i + 1) < list->size)
-         strlcpy(s + __len, delim, len - __len);
+         _len += strlcpy(s + _len, delim, len - _len);
    }
 }
 
@@ -394,7 +389,7 @@ bool string_split_noalloc(struct string_list *list,
  **/
 struct string_list *string_separate(char *str, const char *delim)
 {
-   char *token              = NULL;
+   char *tok                = NULL;
    char **str_ptr           = NULL;
    struct string_list *list = NULL;
 
@@ -405,23 +400,23 @@ struct string_list *string_separate(char *str, const char *delim)
 	   return NULL;
 
    str_ptr = &str;
-   token   = string_tokenize(str_ptr, delim);
+   tok     = string_tokenize(str_ptr, delim);
 
-   while (token)
+   while (tok)
    {
       union string_list_elem_attr attr;
 
       attr.i = 0;
 
-      if (!string_list_append(list, token, attr))
+      if (!string_list_append(list, tok, attr))
       {
-         free(token);
+         free(tok);
          string_list_free(list);
          return NULL;
       }
 
-      free(token);
-      token = string_tokenize(str_ptr, delim);
+      free(tok);
+      tok = string_tokenize(str_ptr, delim);
    }
 
    return list;
@@ -431,7 +426,7 @@ bool string_separate_noalloc(
       struct string_list *list,
       char *str, const char *delim)
 {
-   char *token              = NULL;
+   char *tok                = NULL;
    char **str_ptr           = NULL;
 
    /* Sanity check */
@@ -439,24 +434,23 @@ bool string_separate_noalloc(
       return false;
 
    str_ptr = &str;
-   token   = string_tokenize(str_ptr, delim);
+   tok     = string_tokenize(str_ptr, delim);
 
-   while (token)
+   while (tok)
    {
       union string_list_elem_attr attr;
 
       attr.i = 0;
 
-      if (!string_list_append(list, token, attr))
+      if (!string_list_append(list, tok, attr))
       {
-         free(token);
+         free(tok);
          return false;
       }
 
-      free(token);
-      token = string_tokenize(str_ptr, delim);
+      free(tok);
+      tok = string_tokenize(str_ptr, delim);
    }
-
    return true;
 }
 
