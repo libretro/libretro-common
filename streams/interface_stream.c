@@ -382,8 +382,8 @@ int64_t intfstream_write(intfstream_internal_t *intf,
 int intfstream_printf(intfstream_internal_t *intf,
       const char* format, ...)
 {
+   int ret;
    va_list vl;
-   int result;
 
    if (!intf)
       return 0;
@@ -392,9 +392,9 @@ int intfstream_printf(intfstream_internal_t *intf,
    {
       case INTFSTREAM_FILE:
          va_start(vl, format);
-         result = filestream_vprintf(intf->file.fp, format, vl);
+         ret = filestream_vprintf(intf->file.fp, format, vl);
          va_end(vl);
-         return result;
+         return ret;
       case INTFSTREAM_MEMORY:
          return -1;
       case INTFSTREAM_CHD:
@@ -402,9 +402,9 @@ int intfstream_printf(intfstream_internal_t *intf,
       case INTFSTREAM_RZIP:
 #if defined(HAVE_ZLIB)
          va_start(vl, format);
-         result = rzipstream_vprintf(intf->rzip.fp, format, vl);
+         ret = rzipstream_vprintf(intf->rzip.fp, format, vl);
          va_end(vl);
-         return result;
+         return ret;
 #else
          return -1;
 #endif
@@ -434,7 +434,7 @@ int64_t intfstream_get_ptr(intfstream_internal_t* intf)
 }
 
 char *intfstream_gets(intfstream_internal_t *intf,
-      char *buffer, uint64_t len)
+      char *s, uint64_t len)
 {
    if (!intf)
       return NULL;
@@ -443,19 +443,19 @@ char *intfstream_gets(intfstream_internal_t *intf,
    {
       case INTFSTREAM_FILE:
          return filestream_gets(intf->file.fp,
-               buffer, (size_t)len);
+               s, (size_t)len);
       case INTFSTREAM_MEMORY:
          return memstream_gets(intf->memory.fp,
-               buffer, (size_t)len);
+               s, (size_t)len);
       case INTFSTREAM_CHD:
 #ifdef HAVE_CHD
-         return chdstream_gets(intf->chd.fp, buffer, len);
+         return chdstream_gets(intf->chd.fp, s, len);
 #else
          break;
 #endif
       case INTFSTREAM_RZIP:
 #if defined(HAVE_ZLIB)
-         return rzipstream_gets(intf->rzip.fp, buffer, (size_t)len);
+         return rzipstream_gets(intf->rzip.fp, s, (size_t)len);
 #else
          break;
 #endif
@@ -713,7 +713,7 @@ intfstream_t *intfstream_open_memory(void *data,
    info.type            = INTFSTREAM_MEMORY;
    info.memory.buf.data = (uint8_t*)data;
    info.memory.buf.size = size;
-   info.memory.writable = false;
+   info.memory.writable = (mode & RETRO_VFS_FILE_ACCESS_WRITE) != 0;
 
    if (!(fd = (intfstream_t*)intfstream_init(&info)))
       return NULL;
@@ -729,23 +729,7 @@ intfstream_t *intfstream_open_memory(void *data,
 intfstream_t *intfstream_open_writable_memory(void *data,
       unsigned mode, unsigned hints, uint64_t size)
 {
-   intfstream_info_t info;
-   intfstream_t *fd     = NULL;
-
-   info.type            = INTFSTREAM_MEMORY;
-   info.memory.buf.data = (uint8_t*)data;
-   info.memory.buf.size = size;
-   info.memory.writable = true;
-
-   if (!(fd = (intfstream_t*)intfstream_init(&info)))
-      return NULL;
-
-   if (intfstream_open(fd, NULL, mode, hints))
-      return fd;
-
-   intfstream_close(fd);
-   free(fd);
-   return NULL;
+   return intfstream_open_memory(data, mode | RETRO_VFS_FILE_ACCESS_WRITE, hints, size);
 }
 
 intfstream_t *intfstream_open_chd_track(const char *path,
