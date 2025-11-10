@@ -1027,7 +1027,7 @@ void rglBindFragDataLocation(GLuint program, GLuint colorNumber,
 #ifdef GLSM_DEBUG
    log_cb(RETRO_LOG_INFO, "glBindFragDataLocation.\n");
 #endif
-#if !defined(HAVE_OPENGLES2)
+#if defined(HAVE_OPENGL_CORE)
    glBindFragDataLocation(program, colorNumber, name);
 #endif
 }
