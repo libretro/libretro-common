@@ -20,7 +20,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <string/stdstring.h>
+#include <string.h>
 #include <file/file_path.h>
 
 #include <streams/file_stream.h>
@@ -120,8 +120,8 @@ static bool rzipstream_read_file_header(rzipstream_t *stream)
    if ((stream->chunk_size = (
                             (uint32_t)header_bytes[11] << 24)
                          | ((uint32_t)header_bytes[10] << 16)
-                         | ((uint32_t)header_bytes[9]  <<  8)
-                         | (uint32_t)header_bytes[8]) == 0)
+                         | ((uint32_t)header_bytes[9]  << 8)
+                         |  (uint32_t)header_bytes[8]) == 0)
       return false;
 
    /* Get total uncompressed data size - next 8 bytes */
@@ -133,7 +133,7 @@ static bool rzipstream_read_file_header(rzipstream_t *stream)
                    | ((uint64_t)header_bytes[15] << 24)
                    | ((uint64_t)header_bytes[14] << 16)
                    | ((uint64_t)header_bytes[13] <<  8)
-                   | (uint64_t)header_bytes[12]) == 0)
+                   |  (uint64_t)header_bytes[12]) == 0)
       return false;
 
    stream->is_compressed = true;
@@ -388,8 +388,8 @@ rzipstream_t* rzipstream_open(const char *path, unsigned mode)
    /* Sanity check
     * > Only RETRO_VFS_FILE_ACCESS_READ and
     *   RETRO_VFS_FILE_ACCESS_WRITE are supported */
-   if (string_is_empty(path)
-       || (   (mode != RETRO_VFS_FILE_ACCESS_READ)
+   if (
+          (   (mode != RETRO_VFS_FILE_ACCESS_READ)
            && (mode != RETRO_VFS_FILE_ACCESS_WRITE)))
       return NULL;
 

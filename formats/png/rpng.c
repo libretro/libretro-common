@@ -46,7 +46,6 @@
 #include <formats/image.h>
 #include <formats/rpng.h>
 #include <streams/trans_stream.h>
-#include <string/stdstring.h>
 
 #include "rpng_internal.h"
 
@@ -353,6 +352,8 @@ static void rpng_copy_line_rgb_neon(uint32_t *data,
 #endif /* RPNG_SIMD_NEON */
 
 #if defined(DEBUG) || defined(RPNG_TEST)
+#include <stdio.h>
+
 static bool rpng_process_ihdr(struct png_ihdr *ihdr)
 {
    uint8_t ihdr_depth = ihdr->depth;
