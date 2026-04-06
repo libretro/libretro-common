@@ -32,6 +32,7 @@
 #include <retro_common_api.h>
 #include <retro_inline.h>
 #include <compat/strl.h>
+#include <compat/posix_string.h>
 
 RETRO_BEGIN_DECLS
 
@@ -59,12 +60,16 @@ RETRO_BEGIN_DECLS
 
 static INLINE bool string_is_empty(const char *data)
 {
-   return !data || (*data == '\0');
+   return !data || !*data;
 }
 
 static INLINE bool string_is_equal(const char *a, const char *b)
 {
-   return (a && b) ? !strcmp(a, b) : false;
+   if (a == b)
+      return true;
+   if (!a || !b)
+      return false;
+   return !strcmp(a, b);
 }
 
 static INLINE bool string_starts_with_size(const char *str, const char *prefix,
@@ -108,7 +113,6 @@ static INLINE size_t strlen_size(const char *str, size_t len)
       while (i < len && str[i]) i++;
    return i;
 }
-
 
 static INLINE bool string_is_equal_case_insensitive(const char *a,
       const char *b)
