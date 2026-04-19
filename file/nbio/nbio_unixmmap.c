@@ -83,21 +83,24 @@ static void *nbio_mmap_unix_open(const char * filename, unsigned mode)
       return NULL;
    }
 
-   /* Hint sequential access pattern for read modes — the kernel
-    * will aggressively readahead and drop pages behind the cursor.
-    * madvise is available on all BSDs and macOS (which define BSD).
-    * Guard against hypothetical targets where sys/mman.h exists
-    * but madvise or MADV_SEQUENTIAL is missing. */
-#if defined(MADV_SEQUENTIAL)
-   if (ptr && _len != 0 && (mode == NBIO_READ || mode == BIO_READ))
-      madvise(ptr, _len, MADV_SEQUENTIAL);
-#endif
-
    handle            = malloc(sizeof(struct nbio_mmap_unix_t));
    handle->fd        = fd;
    handle->map_flags = map_flags[mode];
    handle->len       = _len;
    handle->ptr       = ptr;
+
+   /* For read-only mappings the fd is no longer needed once mmap has
+    * succeeded — the mapping remains valid after close(). Release it
+    * immediately so that loading many small files (e.g. hundreds of
+    * menu thumbnails via the async task queue) doesn't exhaust
+    * RLIMIT_NOFILE and cause unrelated fopen() calls to fail. The
+    * resize path (write mode) still needs the fd for ftruncate, so
+    * only close for read-only modes. */
+   if (o_flags[mode] == O_RDONLY)
+   {
+      close(fd);
+      handle->fd = -1;
+   }
    return handle;
 }
 
@@ -162,7 +165,8 @@ static void nbio_mmap_unix_free(void *data)
    struct nbio_mmap_unix_t* handle = (struct nbio_mmap_unix_t*)data;
    if (!handle)
       return;
-   close(handle->fd);
+   if (handle->fd >= 0)
+      close(handle->fd);
    munmap(handle->ptr, handle->len);
    free(handle);
 }

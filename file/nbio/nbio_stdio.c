@@ -26,21 +26,6 @@
 #include <malloc.h>
 #endif
 
-/* posix_fadvise for sequential readahead hints.
- * Available on Linux and most BSDs, but NOT on macOS/iOS (Darwin),
- * Wii U, 3DS, Vita, Switch, PS2, PS3, PS4/Orbis, or Windows. */
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(WIIU) \
- && !defined(_3DS) && !defined(VITA) && !defined(HAVE_LIBNX) \
- && !defined(SWITCH) && !defined(GEKKO) && !defined(__CELLOS_LV2__) \
- && !defined(__PSL1GHT__) && !defined(PSP) && !defined(PS2) \
- && !defined(ORBIS) \
- && (defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) \
-     || defined(__OpenBSD__) || defined(__DragonFly__) \
-     || (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L))
-#include <fcntl.h>
-#define NBIO_HAVE_FADVISE 1
-#endif
-
 #include <file/nbio.h>
 #include <encodings/utf.h>
 
@@ -192,15 +177,6 @@ static void nbio_stdio_begin_read(void *data)
 
    fseek_wrap(handle->f, 0, SEEK_SET);
 
-#ifdef NBIO_HAVE_FADVISE
-   /* Hint sequential access so the kernel enlarges its readahead window */
-   {
-      int fd = fileno(handle->f);
-      if (fd >= 0)
-         posix_fadvise(fd, 0, (off_t)handle->len, POSIX_FADV_SEQUENTIAL);
-   }
-#endif
-
    handle->op       = NBIO_READ;
    handle->progress = 0;
 }
@@ -276,14 +252,19 @@ static void nbio_stdio_resize(void *data, size_t len)
    if (len < handle->len)
       abort();
 
+   /* Attempt the realloc BEFORE committing the new length.  If it
+    * fails, the old pointer and its old size are still valid; the
+    * caller can retry or abandon.  Pre-patch we wrote handle->len
+    * = len first, then on realloc failure the handle claimed it
+    * owned a larger buffer than it actually did -- subsequent
+    * fread/fwrite iterate up to handle->len and walk off the end. */
+   if (!(new_data = realloc(handle->data, len)))
+      return;
+
+   handle->data     = new_data;
    handle->len      = len;
    handle->progress = len;
    handle->op       = -1;
-
-   new_data         = realloc(handle->data, handle->len);
-
-   if (new_data)
-      handle->data  = new_data;
 }
 
 static void *nbio_stdio_get_ptr(void *data, size_t* len)
@@ -363,14 +344,6 @@ static void *nbio_stdio_load_entire(void *data, size_t *len)
       return NULL;
 
    fseek_wrap(handle->f, 0, SEEK_SET);
-
-#ifdef NBIO_HAVE_FADVISE
-   {
-      int fd = fileno(handle->f);
-      if (fd >= 0)
-         posix_fadvise(fd, 0, (off_t)handle->len, POSIX_FADV_SEQUENTIAL);
-   }
-#endif
 
    /* Single fread of the entire file */
    if (handle->len > 0)

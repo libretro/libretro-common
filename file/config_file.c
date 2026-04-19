@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 
 #include <retro_miscellaneous.h>
 #include <compat/strl.h>
@@ -245,7 +246,7 @@ static char *config_file_extract_value(char *line)
       size_t idx  = 0;
       char *value = NULL;
       /* Find next space character */
-      while (line[idx] && isgraph((int)line[idx]))
+      while (line[idx] && isgraph((unsigned char)line[idx]))
          idx++;
 
       line[idx] = '\0';
@@ -379,7 +380,11 @@ static void config_file_add_sub_conf(config_file_t *conf, char *path,
    {
       node->next        = NULL;
       /* Add include list */
-      node->path        = strdup(path);
+      if (!(node->path = strdup(path)))
+      {
+         free(node);
+         goto realpath;
+      }
 
       if (head)
       {
@@ -392,6 +397,7 @@ static void config_file_add_sub_conf(config_file_t *conf, char *path,
          conf->includes = node;
    }
 
+realpath:
    config_file_get_realpath(s, len, path,
          conf->path);
 }
@@ -503,8 +509,9 @@ static bool config_file_parse_line(config_file_t *conf,
    if (comment)
    {
       char *path           = NULL;
-      bool include_found   = !memcmp(comment, "include ",   8);
-      bool reference_found = !memcmp(comment, "reference ", 10);
+      size_t clen          = strlen(comment);
+      bool include_found   = clen >= 8  && !memcmp(comment, "include ",   8);
+      bool reference_found = clen >= 10 && !memcmp(comment, "reference ", 10);
       /* All comments except those starting with the include or
        * reference directive are ignored */
       if (!include_found && !reference_found)
@@ -567,7 +574,7 @@ static bool config_file_parse_line(config_file_t *conf,
     * then copy once - avoids malloc+realloc growth pattern */
    {
       const char *key_start = line;
-      while (isgraph((int)*line))
+      while (isgraph((unsigned char)*line))
          line++;
       idx = (size_t)(line - key_start);
       if (idx == 0)
@@ -702,6 +709,23 @@ bool config_file_deinitialize(config_file_t *conf)
       free(conf->path);
 
    RHMAP_FREE(conf->entries_map);
+
+   /* NULL out all pointer fields so that a caller who reuses the
+    * struct after deinitialize() -- or who accidentally calls
+    * deinitialize() twice -- does not chase dangling pointers.  The
+    * free() calls above leave every listed field pointing at freed
+    * memory; without these NULLs any subsequent config_* call on
+    * this struct is undefined behaviour.  config_file_free() frees
+    * the struct itself immediately after this, so for that path the
+    * NULLs are redundant but harmless; config_file_deinitialize()
+    * is a public API callable on its own. */
+   conf->entries     = NULL;
+   conf->tail        = NULL;
+   conf->last        = NULL;
+   conf->includes    = NULL;
+   conf->references  = NULL;
+   conf->path        = NULL;
+   /* entries_map is cleared by RHMAP_FREE */
 
    return true;
 }
@@ -962,17 +986,22 @@ bool config_get_float(config_file_t *conf, const char *key, float *in)
 bool config_get_int(config_file_t *conf, const char *key, int *in)
 {
    const struct config_entry_list *entry = config_get_entry(conf, key);
-   errno = 0;
 
    if (entry)
    {
-      int val = (int)strtol(entry->value, NULL, 0);
+      long  val;
+      char *end = NULL;
+      errno = 0;
+      val   = strtol(entry->value, &end, 0);
 
-      if (errno == 0)
-      {
-         *in = val;
-         return true;
-      }
+      if (errno != 0 || end == entry->value || *end != '\0')
+         return false;
+
+      if (val < INT_MIN || val > INT_MAX)
+         return false;
+
+      *in = (int)val;
+      return true;
    }
 
    return false;
@@ -1008,17 +1037,19 @@ bool config_get_size_t(config_file_t *conf, const char *key, size_t *in)
 bool config_get_uint64(config_file_t *conf, const char *key, uint64_t *in)
 {
    const struct config_entry_list *entry = config_get_entry(conf, key);
-   errno = 0;
 
    if (entry)
    {
-      uint64_t val = (uint64_t)strtoull(entry->value, NULL, 0);
+      uint64_t val;
+      char    *end = NULL;
+      errno = 0;
+      val   = (uint64_t)strtoull(entry->value, &end, 0);
 
-      if (errno == 0)
-      {
-         *in = val;
-         return true;
-      }
+      if (errno != 0 || end == entry->value || *end != '\0')
+         return false;
+
+      *in = val;
+      return true;
    }
    return false;
 }
@@ -1027,17 +1058,22 @@ bool config_get_uint64(config_file_t *conf, const char *key, uint64_t *in)
 bool config_get_uint(config_file_t *conf, const char *key, unsigned *in)
 {
    const struct config_entry_list *entry = config_get_entry(conf, key);
-   errno = 0;
 
    if (entry)
    {
-      unsigned val = (unsigned)strtoul(entry->value, NULL, 0);
+      unsigned long  val;
+      char          *end = NULL;
+      errno = 0;
+      val   = strtoul(entry->value, &end, 0);
 
-      if (errno == 0)
-      {
-         *in = val;
-         return true;
-      }
+      if (errno != 0 || end == entry->value || *end != '\0')
+         return false;
+
+      if (val > UINT_MAX)
+         return false;
+
+      *in = (unsigned)val;
+      return true;
    }
 
    return false;
@@ -1046,17 +1082,22 @@ bool config_get_uint(config_file_t *conf, const char *key, unsigned *in)
 bool config_get_hex(config_file_t *conf, const char *key, unsigned *in)
 {
    const struct config_entry_list *entry = config_get_entry(conf, key);
-   errno = 0;
 
    if (entry)
    {
-      unsigned val = (unsigned)strtoul(entry->value, NULL, 16);
+      unsigned long  val;
+      char          *end = NULL;
+      errno = 0;
+      val   = strtoul(entry->value, &end, 16);
 
-      if (errno == 0)
-      {
-         *in = val;
-         return true;
-      }
+      if (errno != 0 || end == entry->value || *end != '\0')
+         return false;
+
+      if (val > UINT_MAX)
+         return false;
+
+      *in = (unsigned)val;
+      return true;
    }
 
    return false;
@@ -1097,11 +1138,19 @@ bool config_get_char(config_file_t *conf, const char *key, char *in)
 bool config_get_string(config_file_t *conf, const char *key, char **str)
 {
    const struct config_entry_list *entry = config_get_entry(conf, key);
+   char *dup;
 
    if (!entry || !entry->value)
       return false;
 
-   *str = strdup(entry->value);
+   /* strdup can fail; pre-patch the function claimed success with
+    * *str possibly left as NULL or uninitialised garbage.  Callers
+    * that don't defensively zero *str ahead of the call end up
+    * dereferencing a stale pointer. */
+   if (!(dup = strdup(entry->value)))
+      return false;
+
+   *str = dup;
    return true;
 }
 
@@ -1220,9 +1269,20 @@ void config_set_string(config_file_t *conf, const char *key, const char *val)
    if (!(entry = (struct config_entry_list*)malloc(sizeof(*entry))))
       return;
    entry->readonly  = false;
+   entry->next      = NULL;
    entry->key       = strdup(key);
    entry->value     = strdup(val);
-   entry->next      = NULL;
+   /* If either strdup failed, don't insert a half-initialised entry
+    * into the list or hash map -- RHMAP_SET_STR with a NULL key
+    * is undefined, and subsequent config_get_string/config_set_*
+    * calls on this key would chase a NULL key. */
+   if (!entry->key || !entry->value)
+   {
+      free(entry->key);
+      free(entry->value);
+      free(entry);
+      return;
+   }
    conf->flags     |= CONF_FILE_FLG_MODIFIED;
    if (last)
       last->next    = entry;

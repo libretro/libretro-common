@@ -52,7 +52,13 @@ extern nbio_intf_t nbio_stdio;
 
 #endif
 
-#if defined(__linux__)
+/* Disabled: the Linux AIO backend calls io_setup/io_destroy per
+ * file handle, adding ~35us of kernel overhead per open+close.
+ * For the small-file burst pattern used by menu icon loading
+ * (40+ files of 4-64KB), this makes it ~2x slower than stdio.
+ * Fall through to nbio_stdio on Linux until the AIO backend
+ * shares a single context across handles. */
+#if 0 /* was: defined(__linux__) */
 static nbio_intf_t *internal_nbio = &nbio_linux;
 #elif defined(HAVE_MMAP) && defined(BSD)
 static nbio_intf_t *internal_nbio = &nbio_mmap_unix;
