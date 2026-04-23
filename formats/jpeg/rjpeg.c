@@ -121,9 +121,14 @@ struct rjpeg
     * This overlaps the two phases and avoids the serial
     * entropy→done→resample pipeline. */
    rjpeg_resample          iter_res[4];       /* per-component resample state  */
-   uint8_t                *iter_output;       /* BGRA output buffer            */
+   uint8_t                *iter_output;       /* RGBA8888 output buffer        */
    unsigned                iter_out_row;      /* next output row to resample   */
    int                     iter_resample_ready; /* 1 = resample state inited   */
+
+   /* Output byte order selector. Latched from the rjpeg_process_image
+    * parameter and consulted by the resample+colorconvert callsites.
+    * false -> BGRA (ARGB32 on LE); true -> RGBA (ABGR32 on LE). */
+   bool                    supports_rgba;
 };
 
 #ifdef _MSC_VER
@@ -181,7 +186,8 @@ struct rjpeg
 #endif
 
 /* Auto-detect NEON support */
-#if !defined(RJPEG_NO_SIMD) && !defined(RJPEG_NEON) && (defined(__ARM_NEON__) || defined(HAVE_NEON))
+#if !defined(RJPEG_NO_SIMD) && !defined(RJPEG_NEON) \
+   && (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
 #define RJPEG_NEON
 #endif
 
@@ -241,17 +247,18 @@ struct rjpeg_jpeg_s
    void (*dequant_idct_block_kernel)(uint8_t *out, int out_stride,
          short data[64], uint8_t *dequant);
    void (*YCbCr_to_RGB_kernel)(uint8_t *out, const uint8_t *y, const uint8_t *pcb,
-         const uint8_t *pcr, int count, int step);
+         const uint8_t *pcr, int count, int step, bool supports_rgba);
    uint8_t *(*resample_row_hv_2_kernel)(uint8_t *out, uint8_t *in_near,
          uint8_t *in_far, int w, int hs);
-   /* Fused chroma upsample (hv_2) + YCbCr→BGRA.
+   /* Fused chroma upsample (hv_2) + YCbCr->RGBA8888.
     * Eliminates the linebuf write+read round-trip by keeping upsampled
     * chroma in SIMD registers and feeding directly to color math.
+    * Output byte order (BGRA vs RGBA) is selected by supports_rgba.
     * NULL = not available; use separate resample + colorconvert. */
    void (*upsample_YCbCr_to_BGRA_kernel)(uint8_t *out, const uint8_t *y_row,
          uint8_t *cb_near, uint8_t *cb_far,
          uint8_t *cr_near, uint8_t *cr_far,
-         int chroma_w, int out_w);
+         int chroma_w, int out_w, bool supports_rgba);
 
    /* definition of jpeg image component */
    struct
@@ -485,9 +492,7 @@ static void rjpeg_grow_buffer_unsafe(rjpeg_jpeg *j)
    {
       /* Already hit a marker — pad with zeros */
       while (j->code_bits <= 24)
-      {
          j->code_bits += 8;
-      }
       return;
    }
 
@@ -512,25 +517,42 @@ static void rjpeg_grow_buffer_unsafe(rjpeg_jpeg *j)
 
          /* Check each byte for 0xFF.  The compiler will branch-predict
           * these as not-taken since 0xFF is rare in entropy data. */
-         if (b0 == 0xFF) goto handle_ff_at_0;
+         if (b0 == 0xFF)
+            goto handle_ff_at_0;
          j->code_buffer |= (uint32_t)b0 << (24 - j->code_bits);
          j->code_bits   += 8;
-         if (j->code_bits > 24) { s->img_buffer += 1; return; }
+         if (j->code_bits > 24)
+         {
+            s->img_buffer += 1;
+            return;
+         }
 
-         if (b1 == 0xFF) goto handle_ff_at_1;
+         if (b1 == 0xFF)
+            goto handle_ff_at_1;
          j->code_buffer |= (uint32_t)b1 << (24 - j->code_bits);
          j->code_bits   += 8;
-         if (j->code_bits > 24) { s->img_buffer += 2; return; }
+         if (j->code_bits > 24)
+         {
+            s->img_buffer += 2;
+            return;
+         }
 
-         if (b2 == 0xFF) goto handle_ff_at_2;
+         if (b2 == 0xFF)
+            goto handle_ff_at_2;
          j->code_buffer |= (uint32_t)b2 << (24 - j->code_bits);
          j->code_bits   += 8;
-         if (j->code_bits > 24) { s->img_buffer += 3; return; }
+         if (j->code_bits > 24)
+         {
+            s->img_buffer += 3;
+            return;
+         }
 
-         if (b3 == 0xFF) goto handle_ff_at_3;
+         if (b3 == 0xFF)
+            goto handle_ff_at_3;
          j->code_buffer |= (uint32_t)b3 << (24 - j->code_bits);
          j->code_bits   += 8;
          s->img_buffer  += 4;
+
          return;
 
          /* 0xFF handling: consume the bytes before the 0xFF, then
@@ -652,13 +674,12 @@ static INLINE int rjpeg_jpeg_huff_decode(rjpeg_jpeg *j, rjpeg_huffman *h)
 
 /* _nocheck variant: caller guarantees code_bits >= 16.
  * Used from decode_block where grow_buffer was just called. */
-static INLINE int rjpeg_jpeg_huff_decode_nocheck(rjpeg_jpeg *j, rjpeg_huffman *h)
+static INLINE int rjpeg_jpeg_huff_decode_nocheck(rjpeg_jpeg *j,
+      rjpeg_huffman *h)
 {
    unsigned int temp;
-   int c,k;
-
-   c = (j->code_buffer >> (32 - FAST_BITS)) & ((1 << FAST_BITS)-1);
-   k = h->fast[c];
+   int c = (j->code_buffer >> (32 - FAST_BITS)) & ((1 << FAST_BITS)-1);
+   int k = h->fast[c];
 
    if (k < 255)
    {
@@ -702,23 +723,6 @@ static INLINE int rjpeg_extend_receive(rjpeg_jpeg *j, int n)
    int sgn;
    if (j->code_bits < n)
       rjpeg_grow_buffer_unsafe(j);
-
-   sgn             = (int32_t)j->code_buffer >> 31;
-   k               = RJPEG_LROT(j->code_buffer, n);
-   j->code_buffer  = k & ~rjpeg_bmask[n];
-   k              &= rjpeg_bmask[n];
-   j->code_bits   -= n;
-   return k + (rjpeg_jbias[n] & ~sgn);
-}
-
-/* _nocheck variant: caller guarantees code_bits >= n.
- * After grow_buffer fills to 24+ bits and DC huff_decode consumes
- * at most 16 bits, at least 8 bits remain — enough for any
- * DC category (max 11 bits). */
-static INLINE int rjpeg_extend_receive_nocheck(rjpeg_jpeg *j, int n)
-{
-   unsigned int k;
-   int sgn;
 
    sgn             = (int32_t)j->code_buffer >> 31;
    k               = RJPEG_LROT(j->code_buffer, n);
@@ -3186,41 +3190,79 @@ static uint8_t *rjpeg_resample_row_generic(uint8_t *out,
 #define FLOAT2FIXED(x)  (((int) ((x) * 4096.0f + 0.5f)) << 8)
 #endif
 
+/* Scalar YCbCr -> RGBA8888 (BGRA byte order) or RGBA (RGBA byte order).
+ *
+ * Byte order is selected by supports_rgba:
+ *   false -> out[0..3] = B,G,R,0xff  (reads as ARGB32 on LE; default)
+ *   true  -> out[0..3] = R,G,B,0xff  (reads as ABGR32 on LE; needed by
+ *                                     GLES drivers without BGRA8888)
+ *
+ * The branch is hoisted out of the loop: two tight loops rather than
+ * per-pixel branching. Matches rpng's pattern. */
 static void rjpeg_YCbCr_to_RGB_row(uint8_t *out, const uint8_t *y,
-      const uint8_t *pcb, const uint8_t *pcr, int count, int step)
+      const uint8_t *pcb, const uint8_t *pcr, int count, int step,
+      bool supports_rgba)
 {
    int i;
-   for (i = 0; i < count; ++i)
+   if (supports_rgba)
    {
-      int y_fixed = (y[i] << 20) + (1<<19); /* rounding */
-      int cr = pcr[i] - 128;
-      int cb = pcb[i] - 128;
-      int r = y_fixed +  cr* FLOAT2FIXED(1.40200f);
-      int g = y_fixed + (cr*-FLOAT2FIXED(0.71414f)) + ((cb*-FLOAT2FIXED(0.34414f)) & 0xffff0000);
-      int b = y_fixed                               +   cb* FLOAT2FIXED(1.77200f);
-      r >>= 20;
-      g >>= 20;
-      b >>= 20;
-      if ((unsigned) r > 255)
-         r = (r < 0) ? 0 : 255;
-      if ((unsigned) g > 255)
-         g = (g < 0) ? 0 : 255;
-      if ((unsigned) b > 255)
-         b = (b < 0) ? 0 : 255;
-      /* Write BGRA byte order so the uint32 reads as ARGB --
-       * this fuses the old RGBA->ARGB swizzle pass into the
-       * color conversion itself. */
-      out[0] = (uint8_t)b;
-      out[1] = (uint8_t)g;
-      out[2] = (uint8_t)r;
-      out[3] = 255;
-      out += step;
+      for (i = 0; i < count; ++i)
+      {
+         int y_fixed = (y[i] << 20) + (1<<19); /* rounding */
+         int cr = pcr[i] - 128;
+         int cb = pcb[i] - 128;
+         int r = y_fixed +  cr* FLOAT2FIXED(1.40200f);
+         int g = y_fixed + (cr*-FLOAT2FIXED(0.71414f)) + ((cb*-FLOAT2FIXED(0.34414f)) & 0xffff0000);
+         int b = y_fixed                               +   cb* FLOAT2FIXED(1.77200f);
+         r >>= 20;
+         g >>= 20;
+         b >>= 20;
+         if ((unsigned) r > 255)
+            r = (r < 0) ? 0 : 255;
+         if ((unsigned) g > 255)
+            g = (g < 0) ? 0 : 255;
+         if ((unsigned) b > 255)
+            b = (b < 0) ? 0 : 255;
+         out[0] = (uint8_t)r;
+         out[1] = (uint8_t)g;
+         out[2] = (uint8_t)b;
+         out[3] = 255;
+         out += step;
+      }
+   }
+   else
+   {
+      for (i = 0; i < count; ++i)
+      {
+         int y_fixed = (y[i] << 20) + (1<<19); /* rounding */
+         int cr = pcr[i] - 128;
+         int cb = pcb[i] - 128;
+         int r = y_fixed +  cr* FLOAT2FIXED(1.40200f);
+         int g = y_fixed + (cr*-FLOAT2FIXED(0.71414f)) + ((cb*-FLOAT2FIXED(0.34414f)) & 0xffff0000);
+         int b = y_fixed                               +   cb* FLOAT2FIXED(1.77200f);
+         r >>= 20;
+         g >>= 20;
+         b >>= 20;
+         if ((unsigned) r > 255)
+            r = (r < 0) ? 0 : 255;
+         if ((unsigned) g > 255)
+            g = (g < 0) ? 0 : 255;
+         if ((unsigned) b > 255)
+            b = (b < 0) ? 0 : 255;
+         /* BGRA byte order -- reads as ARGB32 on LE. */
+         out[0] = (uint8_t)b;
+         out[1] = (uint8_t)g;
+         out[2] = (uint8_t)r;
+         out[3] = 255;
+         out += step;
+      }
    }
 }
 
 #if defined(__SSE2__) || defined(RJPEG_NEON)
 static void rjpeg_YCbCr_to_RGB_simd(uint8_t *out, const uint8_t *y,
-      const uint8_t *pcb, const uint8_t *pcr, int count, int step)
+      const uint8_t *pcb, const uint8_t *pcr, int count, int step,
+      bool supports_rgba)
 {
    int i = 0;
 
@@ -3270,11 +3312,14 @@ static void rjpeg_YCbCr_to_RGB_simd(uint8_t *out, const uint8_t *y,
          __m128i bw = _mm_srai_epi16(bws, 4);
          __m128i gw = _mm_srai_epi16(gws, 4);
 
-         /* back to byte, set up for transpose
-          * Pack B in low half, R in high half (was R,B) so the
-          * interleave produces BGRA byte order directly -- this
-          * eliminates the separate RGBA->ARGB swizzle pass. */
-         __m128i brb = _mm_packus_epi16(bw, rw);
+         /* Back to byte, set up for transpose. The first pack decides
+          * whether R or B goes into the low position of each output pixel:
+          *   packus(bw, rw) -> BGRA byte order (ARGB32 on LE)
+          *   packus(rw, bw) -> RGBA byte order (ABGR32 on LE, supports_rgba)
+          * The rest of the unpack cascade is identical either way. */
+         __m128i brb = supports_rgba
+            ? _mm_packus_epi16(rw, bw)
+            : _mm_packus_epi16(bw, rw);
          __m128i gxb = _mm_packus_epi16(gw, xw);
 
          /* transpose to interleave channels */
@@ -3295,7 +3340,6 @@ static void rjpeg_YCbCr_to_RGB_simd(uint8_t *out, const uint8_t *y,
    /* in this version, step=3 support would be easy to add. but is there demand? */
    if (step == 4)
    {
-      /* this is a fairly straightforward implementation and not super-optimized. */
       uint8x8_t signflip = vdup_n_u8(0x80);
       int16x8_t cr_const0 = vdupq_n_s16(   (short) ( 1.40200f*4096.0f+0.5f));
       int16x8_t cr_const1 = vdupq_n_s16( - (short) ( 0.71414f*4096.0f+0.5f));
@@ -3327,45 +3371,40 @@ static void rjpeg_YCbCr_to_RGB_simd(uint8_t *out, const uint8_t *y,
          int16x8_t gws = vaddq_s16(vaddq_s16(yws, cb0), cr1);
          int16x8_t bws = vaddq_s16(yws, cb1);
 
-         /* undo scaling, round, convert to byte
-          * Output BGRA byte order directly to eliminate
-          * the separate RGBA->ARGB swizzle pass. */
-         o.val[0] = vqrshrun_n_s16(bws, 4);
+         /* Undo scaling, round, convert to byte. vst4_u8 interleaves
+          * val[0..3] into successive output bytes; whichever of R/B
+          * we put into val[0] becomes the pixel's low byte:
+          *   val[0]=b, val[2]=r -> BGRA byte order (ARGB32 on LE)
+          *   val[0]=r, val[2]=b -> RGBA byte order (ABGR32 on LE, supports_rgba)
+          * val[1]=g and val[3]=alpha are invariant. */
+         if (supports_rgba)
+         {
+            o.val[0] = vqrshrun_n_s16(rws, 4);
+            o.val[2] = vqrshrun_n_s16(bws, 4);
+         }
+         else
+         {
+            o.val[0] = vqrshrun_n_s16(bws, 4);
+            o.val[2] = vqrshrun_n_s16(rws, 4);
+         }
          o.val[1] = vqrshrun_n_s16(gws, 4);
-         o.val[2] = vqrshrun_n_s16(rws, 4);
          o.val[3] = vdup_n_u8(255);
 
-         /* store, interleaving b/g/r/a */
+         /* store, interleaving low/1/2/alpha */
          vst4_u8(out, o);
          out += 8*4;
       }
    }
 #endif
 
-   for (; i < count; ++i)
-   {
-      int y_fixed = (y[i] << 20) + (1<<19); /* rounding */
-      int cr      = pcr[i] - 128;
-      int cb      = pcb[i] - 128;
-      int r       = y_fixed + cr* FLOAT2FIXED(1.40200f);
-      int g       = y_fixed + cr*-FLOAT2FIXED(0.71414f) + ((cb*-FLOAT2FIXED(0.34414f)) & 0xffff0000);
-      int b       = y_fixed                             +   cb* FLOAT2FIXED(1.77200f);
-      r >>= 20;
-      g >>= 20;
-      b >>= 20;
-      if ((unsigned) r > 255)
-         r = (r < 0) ? 0 : 255;
-      if ((unsigned) g > 255)
-         g = (g < 0) ? 0 : 255;
-      if ((unsigned) b > 255)
-         b = (b < 0) ? 0 : 255;
-      /* BGRA byte order -- matches the SIMD paths above */
-      out[0] = (uint8_t)b;
-      out[1] = (uint8_t)g;
-      out[2] = (uint8_t)r;
-      out[3] = 255;
-      out += step;
-   }
+   /* Scalar tail for the remaining pixels the SIMD loop couldn't
+    * consume: count%8 at step==4, or step!=4, or the whole row in
+    * rgba mode on NEON where the SIMD loop was skipped entirely.
+    * Delegating to the scalar kernel keeps the two paths bit-identical
+    * and honours supports_rgba without duplicating the branch here. */
+   if (i < count)
+      rjpeg_YCbCr_to_RGB_row(out, y + i, pcb + i, pcr + i,
+            count - i, step, supports_rgba);
 }
 #endif
 
@@ -3392,7 +3431,7 @@ static void rjpeg_YCbCr_to_RGB_simd(uint8_t *out, const uint8_t *y,
 static void rjpeg_upsample_YCbCr_to_BGRA_row(uint8_t *out, const uint8_t *y_row,
       uint8_t *cb_near, uint8_t *cb_far,
       uint8_t *cr_near, uint8_t *cr_far,
-      int chroma_w, int out_w)
+      int chroma_w, int out_w, bool supports_rgba)
 {
    /* Stack buffers for upsampled chroma (chroma_w*2 output pixels).
     * For typical RetroArch images, chroma_w <= 960 so 1920 bytes each. */
@@ -3400,14 +3439,14 @@ static void rjpeg_upsample_YCbCr_to_BGRA_row(uint8_t *out, const uint8_t *y_row,
 
    rjpeg_resample_row_hv_2(cb_buf, cb_near, cb_far, chroma_w, 2);
    rjpeg_resample_row_hv_2(cr_buf, cr_near, cr_far, chroma_w, 2);
-   rjpeg_YCbCr_to_RGB_row(out, y_row, cb_buf, cr_buf, out_w, 4);
+   rjpeg_YCbCr_to_RGB_row(out, y_row, cb_buf, cr_buf, out_w, 4, supports_rgba);
 }
 
 #if defined(__SSE2__) || defined(RJPEG_NEON)
 static void rjpeg_upsample_YCbCr_to_BGRA_simd(uint8_t *out, const uint8_t *y_row,
       uint8_t *cb_near, uint8_t *cb_far,
       uint8_t *cr_near, uint8_t *cr_far,
-      int chroma_w, int out_w)
+      int chroma_w, int out_w, bool supports_rgba)
 {
    int i = 0, px = 0;
    int cb_carry = 3 * cb_near[0] + cb_far[0];
@@ -3528,7 +3567,11 @@ static void rjpeg_upsample_YCbCr_to_BGRA_simd(uint8_t *out, const uint8_t *y_row
             bw  = _mm_srai_epi16(bws, 4);
             gw  = _mm_srai_epi16(gws, 4);
 
-            brb = _mm_packus_epi16(bw, rw);
+            /* Swap pack arg order when emitting RGBA byte order; see
+             * rjpeg_YCbCr_to_RGB_simd for the reasoning. */
+            brb = supports_rgba
+               ? _mm_packus_epi16(rw, bw)
+               : _mm_packus_epi16(bw, rw);
             gxb = _mm_packus_epi16(gw, xw);
 
             t0 = _mm_unpacklo_epi8(brb, gxb);
@@ -3564,7 +3607,9 @@ static void rjpeg_upsample_YCbCr_to_BGRA_simd(uint8_t *out, const uint8_t *y_row
             bw  = _mm_srai_epi16(bws, 4);
             gw  = _mm_srai_epi16(gws, 4);
 
-            brb = _mm_packus_epi16(bw, rw);
+            brb = supports_rgba
+               ? _mm_packus_epi16(rw, bw)
+               : _mm_packus_epi16(bw, rw);
             gxb = _mm_packus_epi16(gw, xw);
 
             t0 = _mm_unpacklo_epi8(brb, gxb);
@@ -3656,10 +3701,22 @@ static void rjpeg_upsample_YCbCr_to_BGRA_simd(uint8_t *out, const uint8_t *y_row
                int16x8_t cr1 = vqdmulhq_s16(crw, cr_const1);
                int16x8_t cb1 = vqdmulhq_s16(cbw, cb_const1);
 
+               /* Match rjpeg_YCbCr_to_RGB_simd: val[0]<->val[2] swap
+                * selects the output byte order. B goes into the
+                * (y + cb1) slot and R into (y + cr0) regardless;
+                * only which output lane they land in changes. */
                uint8x8x4_t o;
-               o.val[0] = vqrshrun_n_s16(vaddq_s16(yws, cb1), 4);
+               if (supports_rgba)
+               {
+                  o.val[0] = vqrshrun_n_s16(vaddq_s16(yws, cr0), 4);
+                  o.val[2] = vqrshrun_n_s16(vaddq_s16(yws, cb1), 4);
+               }
+               else
+               {
+                  o.val[0] = vqrshrun_n_s16(vaddq_s16(yws, cb1), 4);
+                  o.val[2] = vqrshrun_n_s16(vaddq_s16(yws, cr0), 4);
+               }
                o.val[1] = vqrshrun_n_s16(vaddq_s16(vaddq_s16(yws, cb0), cr1), 4);
-               o.val[2] = vqrshrun_n_s16(vaddq_s16(yws, cr0), 4);
                o.val[3] = vdup_n_u8(255);
 
                vst4_u8(out + (px + j*8)*4, o);
@@ -3709,7 +3766,7 @@ static void rjpeg_upsample_YCbCr_to_BGRA_simd(uint8_t *out, const uint8_t *y_row
 
          if (tail_out > op) tail_out = op;
          rjpeg_YCbCr_to_RGB_row(out + px*4, y_row + px,
-               cb_buf, cr_buf, tail_out, 4);
+               cb_buf, cr_buf, tail_out, 4, supports_rgba);
       }
    }
 }
@@ -4033,12 +4090,14 @@ static void rjpeg_iterate_resample_rows(rjpeg_t *rjpeg, unsigned max_row)
                z->upsample_YCbCr_to_BGRA_kernel(out, y,
                      fused_cb_near, fused_cb_far,
                      fused_cr_near, fused_cr_far,
-                     rjpeg->iter_res[1].w_lores, z->img_x);
+                     rjpeg->iter_res[1].w_lores, z->img_x,
+                     rjpeg->supports_rgba);
             }
             else
             {
                z->YCbCr_to_RGB_kernel(out, y, coutput[1],
-                     coutput[2], z->img_x, 4);
+                     coutput[2], z->img_x, 4,
+                     rjpeg->supports_rgba);
             }
          }
       }
@@ -4457,6 +4516,9 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
    if (!rjpeg)
       return IMAGE_PROCESS_ERROR;
 
+   /* Latch for the kernel callsites below. */
+   rjpeg->supports_rgba = supports_rgba;
+
    /* -----------------------------------------------------------
     * Phase 0 -- DECODE: either use the already-decoded data from
     * the iterative path (rjpeg_iterate_image), or fall back to
@@ -4696,12 +4758,14 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
                      z->upsample_YCbCr_to_BGRA_kernel(out, y,
                            fused_cb_near, fused_cb_far,
                            fused_cr_near, fused_cr_far,
-                           proc->res_comp[1].w_lores, z->img_x);
+                           proc->res_comp[1].w_lores, z->img_x,
+                           rjpeg->supports_rgba);
                   }
                   else
                   {
                      z->YCbCr_to_RGB_kernel(out, y, proc->coutput[1],
-                           proc->coutput[2], z->img_x, proc->n);
+                           proc->coutput[2], z->img_x, proc->n,
+                           rjpeg->supports_rgba);
                   }
                }
                else
