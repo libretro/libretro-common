@@ -347,6 +347,8 @@ size_t fill_pathname(char *s, const char *in_path,
 {
    char *tok   = NULL;
    size_t _len = strlcpy(s, in_path, len);
+   if (_len >= len)
+      _len = (len > 0) ? len - 1 : 0;
    if ((tok = (char*)strrchr(path_basename(s), '.')))
    {
       *tok = '\0'; _len = tok - s;
@@ -1399,6 +1401,14 @@ size_t fill_pathname_application_path(char *s, size_t len)
 #elif defined(__QNX__)
       char *buff  = (char*)malloc(len);
       size_t _len = 0;
+      /* NULL-check the malloc: _cmdname writes through its
+       * buffer argument (populates with the command path),
+       * NULL-derefs on OOM.  Leave s as it was set by the
+       * caller (empty or previous value) and return 0 -
+       * callers treat 0 as 'unable to resolve own path' and
+       * fall back to argv[0] or similar. */
+      if (!buff)
+         return 0;
       if (_cmdname(buff))
          _len = strlcpy(s, buff, len);
       free(buff);
