@@ -23,6 +23,8 @@
 #ifndef __LIBRETRO_SDK_ATOMIC_H
 #define __LIBRETRO_SDK_ATOMIC_H
 
+#include <retro_common_api.h>
+
 /* Minimal portable atomic operations for SPSC patterns.
  *
  * This header consolidates the ad-hoc atomic shims previously duplicated
@@ -321,10 +323,12 @@
 #endif
 
 /* The header contains only macros and integer typedefs; there are no
- * function declarations and therefore no need for RETRO_BEGIN_DECLS /
- * extern "C" wrapping.  In particular the C++11 backend below
- * #includes <atomic>, whose templates cannot be declared with C
- * linkage, so the wrapper would actively break that path. */
+ * function declarations and therefore no need for RETRO_BEGIN_DECLS
+ * around the file.  The C++11 backend below #includes <atomic>, whose
+ * templates cannot be declared with C linkage; if a caller wraps its
+ * #include of this header in extern "C" { ... } (e.g. ui_qt.cpp under
+ * !CXX_BUILD), libstdc++ <atomic> emits dozens of "template with C
+ * linkage" errors.  RETRO_BEGIN_DECLS_CXX below escapes that. */
 
 /* ---- C11 <stdatomic.h> ------------------------------------------------- */
 #if defined(RETRO_ATOMIC_BACKEND_C11)
@@ -359,8 +363,10 @@ typedef atomic_size_t retro_atomic_size_t;
 /* ---- C++11 <atomic> --------------------------------------------------- */
 #elif defined(RETRO_ATOMIC_BACKEND_CXX11)
 
+RETRO_BEGIN_DECLS_CXX
 #include <atomic>
 #include <cstddef>
+RETRO_END_DECLS_CXX
 /* This header is included by C++ TUs in C++11+ mode (gated on
  * __cplusplus >= 201103L or _MSVC_LANG >= 201103L).  We use the
  * std::atomic_* free-function forms rather than the member-function
