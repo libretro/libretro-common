@@ -97,7 +97,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
+#include <boolean.h>
 
 #include <retro_common_api.h>
 #include <retro_atomic.h>
