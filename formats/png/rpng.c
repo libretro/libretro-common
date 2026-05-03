@@ -1618,9 +1618,10 @@ bool rpng_iterate_image(rpng_t *rpng)
          return false;
 
       case PNG_CHUNK_IHDR:
-         if (     (rpng->flags & RPNG_FLAG_HAS_IHDR)
-               || (rpng->flags & RPNG_FLAG_HAS_IDAT)
-               || (rpng->flags & RPNG_FLAG_HAS_IEND))
+         if (rpng->flags & (
+                    RPNG_FLAG_HAS_IHDR 
+                  | RPNG_FLAG_HAS_IDAT
+                  | RPNG_FLAG_HAS_IEND))
             return false;
 
          if (chunk_size != 13)
@@ -1705,11 +1706,12 @@ bool rpng_iterate_image(rpng_t *rpng)
             if (chunk_size % 3)
                return false;
 
-            if (     !(rpng->flags & RPNG_FLAG_HAS_IHDR)
-                  ||  (rpng->flags & RPNG_FLAG_HAS_PLTE)
-                  ||  (rpng->flags & RPNG_FLAG_HAS_IEND)
-                  ||  (rpng->flags & RPNG_FLAG_HAS_IDAT)
-                  ||  (rpng->flags & RPNG_FLAG_HAS_TRNS))
+            if (    !(rpng->flags & RPNG_FLAG_HAS_IHDR) 
+                  || (rpng->flags & (
+                        RPNG_FLAG_HAS_PLTE 
+                      | RPNG_FLAG_HAS_IEND 
+                      | RPNG_FLAG_HAS_IDAT
+                      | RPNG_FLAG_HAS_TRNS)))
                return false;
 
             buf += 8;
@@ -1770,8 +1772,7 @@ bool rpng_iterate_image(rpng_t *rpng)
          break;
 
       case PNG_CHUNK_IEND:
-         if (     !(rpng->flags & RPNG_FLAG_HAS_IHDR)
-               || !(rpng->flags & RPNG_FLAG_HAS_IDAT))
+         if ((rpng->flags & (RPNG_FLAG_HAS_IHDR | RPNG_FLAG_HAS_IDAT)) != (RPNG_FLAG_HAS_IHDR | RPNG_FLAG_HAS_IDAT))
             return false;
 
          rpng->flags         |= RPNG_FLAG_HAS_IEND;
