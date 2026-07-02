@@ -1700,20 +1700,6 @@ enum retro_mod
 #define RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS 44
 
 /**
- * The frontend will try to use a "shared" context when setting up a hardware context.
- * Mostly applicable to OpenGL.
- *
- * In order for this to have any effect,
- * the core must call \c RETRO_ENVIRONMENT_SET_HW_RENDER at some point
- * if it hasn't already.
- *
- * @param data Ignored.
- * @returns \c true if the environment call is available
- * and the frontend supports shared hardware contexts.
- */
-#define RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT (44 | RETRO_ENVIRONMENT_EXPERIMENTAL)
-
-/**
  * Returns an interface that the core can use to access the file system.
  * Should be called as early as possible.
  *
@@ -2695,6 +2681,50 @@ enum retro_mod
  * @see retro_audio_sample_float_callback
  */
 #define RETRO_ENVIRONMENT_GET_AUDIO_SAMPLE_BATCH_FLOAT (85 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+/**
+ * Queries how much system memory the frontend has available.
+ *
+ * A core may use this to size large internal allocations (a memory pool,
+ * heap or asset cache) to the running machine instead of to a fixed
+ * compile-time default. The reported values are advisory snapshots: \c free
+ * in particular may include reclaimable cache and can change immediately
+ * after the call, so a core should take a fraction of it and clamp the
+ * result -- it must never assume it can allocate the whole amount.
+ *
+ * Frontends that do not implement this return \c false, in which case the
+ * core is expected to fall back to its own defaults.
+ *
+ * @param[out] data <tt>struct retro_memory_status *</tt>.
+ * @return \c true if the frontend filled in the structure, \c false otherwise.
+ * @see retro_memory_status
+ */
+#define RETRO_ENVIRONMENT_GET_MEMORY_STATUS (86 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+/**
+ * The frontend will try to use a "shared" context when setting up a hardware context.
+ * Mostly applicable to OpenGL.
+ *
+ * In order for this to have any effect,
+ * the core must call \c RETRO_ENVIRONMENT_SET_HW_RENDER at some point
+ * if it hasn't already.
+ *
+ * @param data Ignored.
+ * @returns \c true if the environment call is available
+ * and the frontend supports shared hardware contexts.
+ */
+#define RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT (87 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
+/**
+ * Result of \c RETRO_ENVIRONMENT_GET_MEMORY_STATUS.
+ *
+ * Sizes are in bytes; a field the frontend cannot determine is left at 0.
+ */
+struct retro_memory_status
+{
+   uint64_t free;   /**< Physical memory currently available to allocate. */
+   uint64_t total;  /**< Total physical memory installed. */
+};
 
 /**@}*/
 
