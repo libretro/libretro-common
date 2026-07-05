@@ -41,6 +41,9 @@
 #ifdef HAVE_RWEBP
 #include <formats/rwebp.h>
 #endif
+#ifdef HAVE_RDDS
+#include <formats/rdds.h>
+#endif
 
 #include <formats/image.h>
 
@@ -75,6 +78,11 @@ void image_transfer_free(void *data, enum image_type_enum type)
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          rwebp_free((rwebp_t*)data);
+#endif
+         break;
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         rdds_free((rdds_t*)data);
 #endif
          break;
       case IMAGE_TYPE_NONE:
@@ -116,6 +124,12 @@ void *image_transfer_new(enum image_type_enum type)
 #else
          break;
 #endif
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         return rdds_alloc();
+#else
+         break;
+#endif
       default:
          break;
    }
@@ -154,6 +168,12 @@ bool image_transfer_start(void *data, enum image_type_enum type)
          return true;
       case IMAGE_TYPE_WEBP:
          return true;
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         return true;
+#else
+         break;
+#endif
       case IMAGE_TYPE_NONE:
          break;
    }
@@ -189,6 +209,12 @@ bool image_transfer_is_valid(
          return true;
       case IMAGE_TYPE_WEBP:
          return true;
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         return true;
+#else
+         break;
+#endif
       case IMAGE_TYPE_NONE:
          break;
    }
@@ -227,6 +253,11 @@ void image_transfer_set_buffer_ptr(
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          rwebp_set_buf_ptr((rwebp_t*)data, (uint8_t*)ptr, len);
+#endif
+         break;
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         rdds_set_buf_ptr((rdds_t*)data, (uint8_t*)ptr);
 #endif
          break;
       case IMAGE_TYPE_NONE:
@@ -281,6 +312,14 @@ int image_transfer_process(
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          ret = rwebp_process_image((rwebp_t*)data,
+               (void**)buf, len, width, height, supports_rgba);
+         break;
+#else
+         break;
+#endif
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         ret = rdds_process_image((rdds_t*)data,
                (void**)buf, len, width, height, supports_rgba);
          break;
 #else
@@ -361,6 +400,26 @@ int image_transfer_process(
    return ret;
 }
 
+bool image_transfer_get_gpu_layout(
+      void *data,
+      enum image_type_enum type,
+      size_t len,
+      struct image_gpu_layout *out)
+{
+   switch (type)
+   {
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         return rdds_get_gpu_layout((rdds_t*)data, len, out);
+#else
+         break;
+#endif
+      default:
+         break;
+   }
+   return false;
+}
+
 bool image_transfer_iterate(void *data, enum image_type_enum type)
 {
 
@@ -388,6 +447,12 @@ bool image_transfer_iterate(void *data, enum image_type_enum type)
          return false;
       case IMAGE_TYPE_WEBP:
          return false;
+      case IMAGE_TYPE_DDS:
+#ifdef HAVE_RDDS
+         return false;
+#else
+         break;
+#endif
       case IMAGE_TYPE_NONE:
          return false;
    }
