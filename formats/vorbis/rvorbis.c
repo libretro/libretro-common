@@ -4666,7 +4666,7 @@ static int vorbis_seek_frame_from_page(rvorbis *f, uint32_t page_start, uint32_t
       int n;
       rvorbis_get_frame_float(f, &n, NULL);
       assert(target_sample > frame_start);
-      assert(f->channel_buffer_start + (int) (target_sample-frame_start) < f->channel_buffer_end);
+      assert(f->channel_buffer_start + (int) (target_sample-frame_start) <= f->channel_buffer_end);
       f->channel_buffer_start += (target_sample - frame_start);
    }
 
