@@ -64,7 +64,9 @@ enum audio_type_enum
    AUDIO_TYPE_WAV,
    AUDIO_TYPE_FLAC,
    AUDIO_TYPE_VORBIS,
-   AUDIO_TYPE_MP3
+   AUDIO_TYPE_MP3,
+   AUDIO_TYPE_MOD,  /* tracker module: MOD / S3M / XM (rmodtracker) */
+   AUDIO_TYPE_OPUS  /* Opus (ropus); demuxed path only (no Ogg parser) */
 };
 
 /* Guess the codec from a file-name/extension (counterpart of
@@ -81,6 +83,22 @@ void *audio_transfer_new(enum audio_type_enum type);
  * lifetime of the decoder. Call before audio_transfer_start. */
 void  audio_transfer_set_buffer_ptr(void *data, enum audio_type_enum type,
       void *ptr, size_t len);
+
+/* Point the context at a DEMUXED elementary stream instead of a
+ * self-framed file: 'setup' is the codec's out-of-band configuration
+ * (a container's CodecPrivate -- e.g. the Vorbis identification/comment/
+ * setup headers, xiph-laced, or an Opus OpusHead), and 'packets' is the
+ * concatenation of the coded frames in decode order.  Some codecs need
+ * the coded frames delimited; 'sizes'/'num_packets', when provided, give
+ * the byte length of each packet in order (pass NULL/0 when the codec's
+ * frames are self-delimiting).  All buffers are borrowed and must outlive
+ * the decoder.  Used by container demuxers (e.g. WebM) that have already
+ * separated setup from payload; call instead of set_buffer_ptr, before
+ * audio_transfer_start. Returns false if the codec has no demuxed path. */
+bool  audio_transfer_set_demuxed_ptr(void *data, enum audio_type_enum type,
+      const void *setup, size_t setup_size,
+      const void *packets, size_t packets_size,
+      const uint32_t *sizes, size_t num_packets);
 
 /* Open the decoder over the buffer set above. Returns false on malformed
  * input. */
