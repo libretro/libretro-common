@@ -752,8 +752,13 @@ static int lookup1_values(int entries, int dim)
    int r = (int) floor(exp((float) log((float) entries) / dim));
    if ((int) floor(pow((float) r+1, dim)) <= entries)   /* (int) cast for MinGW warning; */
       ++r;                                              /* floor() to avoid _ftol() when non-CRT */
-   assert(pow((float) r+1, dim) > entries);
-   assert((int) floor(pow((float) r, dim)) <= entries); /* (int),floor() as above */
+   /* On well-formed data these invariants hold; on malformed entries/dim
+    * they can fail.  Return 0 so the caller (which already rejects a
+    * zero lookup_values) errors out gracefully instead of asserting. */
+   if (!(pow((float) r+1, dim) > entries))
+      return 0;
+   if (!((int) floor(pow((float) r, dim)) <= entries))
+      return 0;
    return r;
 }
 
@@ -1622,11 +1627,24 @@ static INLINE void draw_line(float *output, int x0, int y0, int x1, int y1, int 
 {
    int dy = y1 - y0;
    int adx = x1 - x0;
-   int ady = abs(dy);
+   /* See draw_line_q: guard against a malformed floor's non-increasing
+    * X coordinates dividing by zero here. */
+   int ady;
    int x=x0,y=y0;
    int err = 0;
    int sy;
-   int base = dy / adx;
+   int base;
+   if (adx <= 0)
+      return;
+   /* y is interpolated between y0 and y1, so clamping the endpoints to
+    * the inverse_db_table[] range keeps every lookup below in bounds
+    * even if a malformed floor produced an out-of-range Y value. */
+   if (y0 < 0) y0 = 0; else if (y0 > 255) y0 = 255;
+   if (y1 < 0) y1 = 0; else if (y1 > 255) y1 = 255;
+   dy   = y1 - y0;
+   y    = y0;
+   ady  = abs(dy);
+   base = dy / adx;
 
    if (dy < 0)
       sy = base - 1;
@@ -1680,7 +1698,16 @@ static void decode_residue(vorb *f, float *residue_buffers[], int ch, int n, int
    int rtype = f->residue_types[rn];
    int c = r->classbook;
    int classwords = f->codebooks[c].dimensions;
-   int n_read = r->end - r->begin;
+   /* A residue's begin/end may legally exceed the vector actually
+    * decoded (libvorbis routinely writes type-2 coupled ranges over the
+    * interleaved ch*n vector); the spec behaviour, and upstream
+    * stb_vorbis's, is to clamp to the actual vector size at decode
+    * time, never to reject.  This also bounds part_read, keeping the
+    * temp classification array allocation below safe. */
+   unsigned int actual_size = rtype == 2 ? (unsigned int)n * 2 : (unsigned int)n;
+   unsigned int limit_r_begin = r->begin < actual_size ? r->begin : actual_size;
+   unsigned int limit_r_end   = r->end   < actual_size ? r->end   : actual_size;
+   int n_read = (int)(limit_r_end - limit_r_begin);
    int part_read = n_read / r->part_size;
    int temp_alloc_point = temp_alloc_save(f);
    uint8_t ***part_classdata = (uint8_t ***) temp_block_array(f,f->channels, part_read * sizeof(**part_classdata));
@@ -3472,7 +3499,16 @@ static void decode_residue_q(vorb *f, int32_t *residue_buffers[], int ch, int n,
    int rtype = f->residue_types[rn];
    int c = r->classbook;
    int classwords = f->codebooks[c].dimensions;
-   int n_read = r->end - r->begin;
+   /* A residue's begin/end may legally exceed the vector actually
+    * decoded (libvorbis routinely writes type-2 coupled ranges over the
+    * interleaved ch*n vector); the spec behaviour, and upstream
+    * stb_vorbis's, is to clamp to the actual vector size at decode
+    * time, never to reject.  This also bounds part_read, keeping the
+    * temp classification array allocation below safe. */
+   unsigned int actual_size = rtype == 2 ? (unsigned int)n * 2 : (unsigned int)n;
+   unsigned int limit_r_begin = r->begin < actual_size ? r->begin : actual_size;
+   unsigned int limit_r_end   = r->end   < actual_size ? r->end   : actual_size;
+   int n_read = (int)(limit_r_end - limit_r_begin);
    int part_read = n_read / r->part_size;
    int temp_alloc_point = temp_alloc_save(f);
    uint8_t ***part_classdata = (uint8_t ***) temp_block_array(f,f->channels, part_read * sizeof(**part_classdata));
@@ -3646,11 +3682,26 @@ static INLINE void draw_line_q(int32_t *output, int x0, int y0, int x1, int y1, 
 {
    int dy = y1 - y0;
    int adx = x1 - x0;
-   int ady = abs(dy);
+   /* A valid floor's X coordinates are strictly increasing, so adx > 0;
+    * a malformed floor can repeat or unsort them, which would divide by
+    * zero below.  A zero/negative-width segment covers no samples, so
+    * skip it. */
+   int ady;
    int x=x0,y=y0;
    int err = 0;
    int sy;
-   int base = dy / adx;
+   int base;
+   if (adx <= 0)
+      return;
+   /* y is interpolated between y0 and y1, so clamping the endpoints to
+    * the inverse_db_q31[] range keeps every lookup below in bounds even
+    * if a malformed floor produced an out-of-range Y value. */
+   if (y0 < 0) y0 = 0; else if (y0 > 255) y0 = 255;
+   if (y1 < 0) y1 = 0; else if (y1 > 255) y1 = 255;
+   dy   = y1 - y0;
+   y    = y0;
+   ady  = abs(dy);
+   base = dy / adx;
 
    if (dy < 0)
       sy = base - 1;
@@ -4412,6 +4463,8 @@ static int start_decoder(vorb *f)
             f->setup_temp_memory_required = c->entries;
 
          c->codeword_lengths = (uint8_t *) setup_malloc(f, c->entries);
+         if (!c->codeword_lengths)
+            return error(f, RVORBIS_outofmem);
          memcpy(c->codeword_lengths, lengths, c->entries);
          setup_temp_free(f, lengths, c->entries); /* note this is only safe if there have been no intervening temp mallocs! */
          lengths = c->codeword_lengths;
@@ -4691,6 +4744,12 @@ skip:;
    /* Residue */
    f->residue_count = get_bits(f, 6)+1;
    f->residue_config = (Residue *) setup_malloc(f, f->residue_count * sizeof(*f->residue_config));
+   if (!f->residue_config)
+      return error(f, RVORBIS_outofmem);
+   /* setup_malloc does not zero: clear so a mid-parse error() leaves the
+    * unvisited residues' classdata/residue_books pointers NULL for
+    * vorbis_deinit rather than freeing uninitialised garbage. */
+   memset(f->residue_config, 0, f->residue_count * sizeof(*f->residue_config));
    for (i=0; i < f->residue_count; ++i)
    {
       uint8_t residue_cascade[64];
@@ -4700,6 +4759,17 @@ skip:;
       r->begin = get_bits(f, 24);
       r->end = get_bits(f, 24);
       r->part_size = get_bits(f,24)+1;
+      /* begin/end are unbounded 24-bit fields.  Do not reject large
+       * values outright: libvorbis legally writes type-2 coupled ranges
+       * over the interleaved ch*n vector, i.e. up to twice the
+       * half-block (seen in ordinary stereo files).  decode_residue[_q]
+       * clamps to the actual decoded vector at run time (as upstream
+       * stb_vorbis does), which is what makes the temp classification
+       * array sizing safe; here only reject inverted ranges and values
+       * beyond the largest vector any mode can decode. */
+      if (r->begin > r->end ||
+            r->end > 2u * (uint32_t)(f->blocksize_1 >> 1))
+         return error(f, RVORBIS_invalid_setup);
       r->classifications = get_bits(f,6)+1;
       r->classbook = get_bits(f,8);
       for (j=0; j < r->classifications; ++j) {
@@ -4738,6 +4808,11 @@ skip:;
 
    f->mapping_count = get_bits(f,6)+1;
    f->mapping = (Mapping *) setup_malloc(f, f->mapping_count * sizeof(*f->mapping));
+   if (f->mapping == NULL)                    return error(f, RVORBIS_outofmem);
+   /* setup_malloc does not zero: clear the per-mapping chan pointers so
+    * that if a later error() aborts this loop, vorbis_deinit only frees
+    * pointers that were actually assigned (or NULL). */
+   memset(f->mapping, 0, f->mapping_count * sizeof(*f->mapping));
    for (i=0; i < f->mapping_count; ++i) {
       Mapping *m = f->mapping + i;
       int mapping_type = get_bits(f,16);

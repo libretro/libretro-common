@@ -85,6 +85,16 @@ enum image_type_enum image_texture_get_type(const char *path)
              (ext[2] | 0x20) == 's')
             return IMAGE_TYPE_DDS;
 #endif
+#ifdef HAVE_RMP4
+         if ((ext[0] | 0x20) == 'm' &&
+              ext[1]         == '4' &&
+             (ext[2] | 0x20) == 'v')
+            return IMAGE_TYPE_MP4;
+         if ((ext[0] | 0x20) == 'm' &&
+             (ext[1] | 0x20) == 'p' &&
+              ext[2]         == '4')
+            return IMAGE_TYPE_MP4;
+#endif
          break;
 
       case 4:
@@ -277,6 +287,31 @@ bool image_texture_realize_rgba(struct texture_image *img)
    img->width  = w;
    img->height = h;
    return true;
+}
+
+void image_texture_narrow_10bit(struct texture_image *img)
+{
+   size_t n, i;
+   uint32_t *px;
+   if (!img || !img->pix10 || !img->pixels)
+      return;
+   px = img->pixels;
+   n  = (size_t)img->width * img->height;
+   /* Narrow packed XRGB2101010 (R[29:20] G[19:10] B[9:0]) to 8-bit ARGB8888
+    * (0xAARRGGBB, opaque) in place, for drivers without native 10-bit
+    * texture support. Matches the >> 2 narrowing used elsewhere. */
+   for (i = 0; i < n; i++)
+   {
+      uint32_t p = px[i];
+      uint32_t r = (p >> 20) & 0x3ff;
+      uint32_t g = (p >> 10) & 0x3ff;
+      uint32_t b =  p        & 0x3ff;
+      px[i] = 0xff000000u
+            | ((r >> 2) << 16)
+            | ((g >> 2) <<  8)
+            |  (b >> 2);
+   }
+   img->pix10 = false;
 }
 
 bool image_texture_load_buffer(struct texture_image *out_img,

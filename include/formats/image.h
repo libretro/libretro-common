@@ -48,6 +48,11 @@ struct texture_image
    unsigned width;
    unsigned height;
    bool supports_rgba;
+   /* When true, ->pixels holds packed XRGB2101010 (10-bit per channel,
+    * bits [29:20]=R [19:10]=G [9:0]=B) rather than 8-bit RGBA/BGRA. Only
+    * honoured by drivers that advertise GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE;
+    * others fall back to an 8-bit copy via image_texture_narrow_10bit(). */
+   bool pix10;
    /* Optional GPU-native compressed payload (BCn).  When non-NULL a
     * capable driver may upload it directly and leave ->pixels NULL;
     * image_texture_realize_rgba() decodes to ->pixels on demand for
@@ -64,7 +69,8 @@ enum image_type_enum
    IMAGE_TYPE_TGA,
    IMAGE_TYPE_WEBP,
    IMAGE_TYPE_DDS,
-   IMAGE_TYPE_WEBM
+   IMAGE_TYPE_WEBM,
+   IMAGE_TYPE_MP4
 };
 
 #define IMAGE_MAX_MIPS 16
@@ -141,6 +147,11 @@ void image_texture_free(struct texture_image *img);
  * a driver cannot sample img->compressed->format. */
 bool image_texture_realize_rgba(struct texture_image *img);
 
+/* Narrow a texture_image whose ->pixels hold packed XRGB2101010 down to
+ * 8-bit ARGB8888 in place (and clear ->pix10), for drivers that cannot sample
+ * a 10-bit texture. No-op unless ->pix10 is set. */
+void image_texture_narrow_10bit(struct texture_image *img);
+
 /* Image transfer */
 
 void image_transfer_free(void *data, enum image_type_enum type);
@@ -176,6 +187,15 @@ bool image_transfer_get_gpu_layout(
 bool image_transfer_iterate(void *data, enum image_type_enum type);
 
 bool image_transfer_is_valid(void *data, enum image_type_enum type);
+
+/* True if the last processed frame was written as packed XRGB2101010
+ * (10-bit); only the video decoders can report this, for HDR sources. */
+bool image_transfer_is_10bit(void *data, enum image_type_enum type);
+
+/* Ask a video decoder to emit packed XRGB2101010 for 10-bit HDR sources
+ * (still-image types ignore it). */
+void image_transfer_set_want_10bit(void *data, enum image_type_enum type,
+      int want);
 
 /* Animation (animated images: WEBP, and the video track of WEBM).
  *

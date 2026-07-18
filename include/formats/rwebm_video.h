@@ -43,7 +43,42 @@ rwebm_video_t *rwebm_video_alloc(void);
 
 void rwebm_video_free(rwebm_video_t *webm);
 
+/* 10-bit 4:2:0 -> 32-bit RGB.  Planes are uint16 samples with strides in
+ * PIXELS.  matrix / transfer / range are ISO/IEC 23001-8 code points as
+ * carried by the webm Colour element (0 = absent; HD-appropriate
+ * defaults are chosen).  transfer 16 (PQ / HDR10) is tone-mapped to SDR
+ * (hable curve, auto exposure, MaxCLL-driven peak with a
+ * 1000-nit fallback, BT.2020 -> 709
+ * gamut); anything else is converted as SDR and rounded to 8 bits.
+ * abgr nonzero packs R in the low byte (thumbnail convention); zero
+ * packs XRGB8888 (libretro frontend convention). */
+void rwebm_video_blit_i420_hbd(uint32_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range,
+      unsigned max_cll, int abgr);
+
+/* Native 10-bit variant: same SDR-encoded colour as the _hbd path (PQ/HDR10
+ * tone-mapped, BT.2020 -> 709 gamut, sRGB transfer) but emitted at 10-bit
+ * precision into packed XRGB2101010 (bits [29:20]=R [19:10]=G [9:0]=B, native
+ * endian) instead of narrowing to 8 bits, so gradients band less. Used when
+ * the frontend accepts RETRO_PIXEL_FORMAT_XRGB2101010. The frontend HDR path
+ * expects an SDR-encoded source, so this raises bit depth only and does not
+ * pass PQ through. */
+void rwebm_video_blit_i420_10bit(uint32_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range,
+      unsigned max_cll);
+
 bool rwebm_video_set_buf_ptr(rwebm_video_t *webm, void *data, size_t len);
+
+/* Request packed XRGB2101010 (10-bit) output for 10-bit HDR sources; 8-bit
+ * sources are unaffected. Off by default. */
+void rwebm_video_set_want_10bit(rwebm_video_t *webm, int want);
+
+/* True if the last rwebm_video_process_image() produced XRGB2101010. */
+bool rwebm_video_is_10bit(const rwebm_video_t *webm);
 
 /* Decodes the first displayed frame of the first supported video track
  * into a freshly malloc'd buffer at *buf. Returns IMAGE_PROCESS_END on
