@@ -70,7 +70,14 @@ struct rmp4_video_stream
    int          ts_count;   /* entries stored in ts                   */
    int          num_frames; /* total video packets in the stream      */
    int          disp_idx;   /* ordinal of the next displayed picture  */
-   int          catchup;    /* seek in progress: skip colour conversion */
+   /* The displayed picture most recently produced by a step.  Its
+    * planes stay inside the decoder until the next decode or drain
+    * call, so colour conversion into 'frame' is deferred to
+    * rmp4_video_stream_render and never happens at all for frames a
+    * caller passes over with rmp4_video_stream_skip (this replaces
+    * the old seek-only 'catchup' blit suppression). */
+   int          rndr_kind;     /* 0 none, 1 vp8, 2 vp9, 3 h264       */
+   int          rndr_vp9_show; /* fbs index of the vp9 picture       */
    int          wait_key;   /* a reference failed; hold out for a key */
    int          track;      /* index of the chosen video track        */
    unsigned     matrix;     /* colr matrix_coefficients; 0 untagged   */
@@ -114,6 +121,16 @@ struct rmp4_video
    int            still_stage; /* enum above */
    int            want10;     /* caller requested 10-bit thumbnail output */
    int            last_10bit; /* last processed frame was XRGB2101010 */
+   /* Bytes of 'buf' actually read so far, for decoding a still from a
+    * file whose read is in progress: 0 means fully resident (the
+    * default; set_buf_ptr keeps it), and the still decode returns
+    * IMAGE_PROCESS_WAIT instead of erroring when it runs into the
+    * wall.  Raised by rmp4_video_set_avail. */
+   size_t         avail;
+   int            partial;    /* set_avail was called: 'avail' is live
+                                 (0 is a valid value - nothing read
+                                 yet - so it cannot double as the
+                                 unset sentinel) */
 };
 
 static int rmp4_video_ts_cmp(const void *a, const void *b)
@@ -491,19 +508,21 @@ static void rmp4_video_stream_close_decoder(rmp4_video_stream_t *s)
  * one-shot behaviour. */
 
 static rmp4_video_stream_t *rmp4_video_stream_open_begin(
-      const uint8_t *buf, size_t len)
+      const uint8_t *buf, size_t len, size_t avail, int *need_more)
 {
    rmp4_video_stream_t *s;
    const rmp4_track *trk = NULL;
    int i, num_tracks;
 
+   if (need_more)
+      *need_more = 0;
    if (!buf || !len)
       return NULL;
 
    if (!(s = (rmp4_video_stream_t*)calloc(1, sizeof(*s))))
       return NULL;
 
-   if (!(s->demux = rmp4_open_memory(buf, len)))
+   if (!(s->demux = rmp4_open_memory_avail(buf, len, avail, need_more)))
       goto fail;
 
    /* Pick the first video track whose codec we can decode. */
@@ -563,20 +582,28 @@ fail:
 static int rmp4_video_stream_scan_step(rmp4_video_stream_t *s,
       int max_packets)
 {
-   rmp4_packet pkt;
-   int walked = 0;
+   /* Timestamps come straight from the moov sample tables - the old
+    * packet walk produced exactly these values (it recorded
+    * pkt.timestamp for the video track only, in cursor order) but
+    * went through rmp4_read_packet, which now gates on each sample's
+    * media bytes being resident; the tables need no media bytes at
+    * all, so a partially-read file can pre-scan the moment its moov
+    * is parsed. */
+   uint32_t       count = 0;
+   const int64_t *pts   = rmp4_track_pts(s->demux, s->track, &count);
+   int            walked = 0;
 
-   while (s->num_frames < RMP4_VIDEO_MAX_TS)
+   if (!pts)
+      return 1;
+   while (s->num_frames < RMP4_VIDEO_MAX_TS
+         && (uint32_t)s->ts_count < count)
    {
       if (max_packets > 0 && walked >= max_packets)
          return 0;
-      if (rmp4_read_packet(s->demux, &pkt) != 1)
-         break;
-      walked++;
-      if (pkt.track != s->track)
-         continue;
-      s->ts[s->ts_count++] = pkt.timestamp;
+      s->ts[s->ts_count] = pts[s->ts_count];
+      s->ts_count++;
       s->num_frames++;
+      walked++;
    }
    return 1;
 }
@@ -608,8 +635,28 @@ rmp4_video_stream_t *rmp4_video_stream_open(const uint8_t *buf,
 {
    rmp4_video_stream_t *s;
 
-   if (!(s = rmp4_video_stream_open_begin(buf, len)))
+   if (!(s = rmp4_video_stream_open_begin(buf, len, len, NULL)))
       return NULL;
+   rmp4_video_stream_scan_step(s, 0);
+   if (rmp4_video_stream_open_finish(s) != 0)
+   {
+      rmp4_video_stream_close(s);
+      return NULL;
+   }
+   return s;
+}
+
+rmp4_video_stream_t *rmp4_video_stream_open_avail(const uint8_t *buf,
+      size_t len, size_t avail, int *need_more)
+{
+   rmp4_video_stream_t *s;
+
+   if (need_more)
+      *need_more = 0;
+   if (!(s = rmp4_video_stream_open_begin(buf, len, avail, need_more)))
+      return NULL;
+   /* The pre-scan reads the moov sample tables (no media bytes), so
+    * once the open itself succeeded it always completes. */
    rmp4_video_stream_scan_step(s, 0);
    if (rmp4_video_stream_open_finish(s) != 0)
    {
@@ -680,6 +727,11 @@ static int rmp4_video_duration_ms(const rmp4_video_stream_t *s, int idx)
 static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
       const rmp4_packet *pkt)
 {
+   /* Any decode below can invalidate the previously recorded
+    * picture's planes; re-record on display.  (The wait_key early
+    * return clears too - harmless, callers only render after a
+    * displayed step.) */
+   s->rndr_kind = 0;
    /* A decoder can be absent if the re-open in rewind hit OOM. */
    if (!s->vp8
 #ifdef HAVE_RVP9
@@ -707,38 +759,8 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
       }
       if (last_show >= 0)
       {
-         const rvp9_fb *fb = &s->vp9->fbs[last_show];
-         unsigned w = (unsigned)fb->w < s->width  ? (unsigned)fb->w : s->width;
-         unsigned h = (unsigned)fb->h < s->height ? (unsigned)fb->h : s->height;
-         if (s->vp9->hd.bit_depth == 10)
-         {
-            /* Colour metadata comes from the sample entry's colr box when
-             * present; untagged files pass zeros and the shared blit picks
-             * HD-appropriate defaults (BT.2020-ncl for PQ, BT.709/601 by
-             * resolution), matching untagged webm content. Without this
-             * branch the 10-bit (uint16) planes were handed to the 8-bit
-             * blit and mis-decoded. */
-            if (s->catchup)
-               ;           /* discarded during a seek: skip conversion */
-            else if (s->want10)
-            {
-               rwebm_video_blit_i420_10bit(s->frame, s->width, w, h,
-                     (const uint16_t*)fb->y, s->vp9->ys,
-                     (const uint16_t*)fb->u, (const uint16_t*)fb->v,
-                     s->vp9->uvs, s->matrix, s->transfer, s->range, 0);
-               s->is10 = 1;
-            }
-            else
-               rwebm_video_blit_i420_hbd(s->frame, s->width, w, h,
-                     (const uint16_t*)fb->y, s->vp9->ys,
-                     (const uint16_t*)fb->u, (const uint16_t*)fb->v,
-                     s->vp9->uvs, s->matrix, s->transfer, s->range, 0,
-                     s->emit_argb ? 0 : 1);
-         }
-         else if (!s->catchup)
-            rmp4_video_blit_i420(s->frame, s->width, w, h,
-                  fb->y, s->vp9->ys, fb->u, fb->v, s->vp9->uvs, s->matrix,
-                  s->emit_argb);
+         s->rndr_kind     = 2;
+         s->rndr_vp9_show = last_show;
          return 1;
       }
       return 0;
@@ -746,33 +768,17 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
 #endif
    if (s->codec == RMP4_CODEC_VP8)
    {
-      const uint8_t *y, *u, *v;
-      int ys, uvs, w, h, cw, ch;
       /* VP8 frame tag: bit 4 of byte 0 is show_frame. */
       int shown = (pkt->size > 0) && (pkt->data[0] & 0x10);
       if (rvp8_video_decode(s->vp8, pkt->data, pkt->size) != 0)
          return -1;
       if (!shown)
          return 0;
-      y = rvp8_video_plane(s->vp8, 0, &ys, &w, &h);
-      u = rvp8_video_plane(s->vp8, 1, &uvs, &cw, &ch);
-      v = rvp8_video_plane(s->vp8, 2, &uvs, &cw, &ch);
-      if (!y || !u || !v)
-         return -1;
-      if ((unsigned)w > s->width)
-         w = (int)s->width;
-      if ((unsigned)h > s->height)
-         h = (int)s->height;
-      if (!s->catchup)
-         rmp4_video_blit_i420(s->frame, s->width,
-               (unsigned)w, (unsigned)h, y, ys, u, v, uvs, s->matrix,
-               s->emit_argb);
+      s->rndr_kind = 1;
       return 1;
    }
    if (s->codec == RMP4_CODEC_H264)
    {
-      const uint8_t *y, *u, *v;
-      int ys, uvs, w, h, cw, ch;
       /* rh264 reconstructs Baseline through High profile (CAVLC and
        * CABAC entropy coding), handing pictures out in display order.
        * Anything it still cannot handle is skipped rather than
@@ -804,19 +810,10 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
          if (dec == 0)   /* consumed; picture held for display reordering */
             return 0;
       }
-      y = rh264_video_plane(s->h264, 0, &ys,  &w,  &h);
-      u = rh264_video_plane(s->h264, 1, &uvs, &cw, &ch);
-      v = rh264_video_plane(s->h264, 2, &uvs, &cw, &ch);
-      if (!y || !u || !v)
+      /* Planes stay valid until the next decode; defer conversion. */
+      if (!rh264_video_plane(s->h264, 0, NULL, NULL, NULL))
          return -1;
-      if ((unsigned)w > s->width)
-         w = (int)s->width;
-      if ((unsigned)h > s->height)
-         h = (int)s->height;
-      if (!s->catchup)
-         rmp4_video_blit_yuv(s->frame, s->width,
-               (unsigned)w, (unsigned)h, y, ys, u, v, uvs, s->matrix,
-               (ch < h) ? 1 : 0, s->emit_argb);
+      s->rndr_kind = 3;
       return 1;
    }
    return -1;
@@ -825,17 +822,27 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
 /* Advance by exactly one of the chosen track's packets (skipping other
  * tracks' packets, which are header reads only), or by one drained
  * reorder-queue picture once the packets are exhausted.  Returns 1
- * when a displayed picture is in s->frame (duration written), 0 when
- * the packet decoded but is not displayed, -1 at the end of a pass or
- * on a decode error. */
+ * when a displayed picture was consumed (render it on demand), 0 when
+ * the packet decoded but is not displayed, 2 when the next packet's
+ * bytes are not yet resident (partial read; nothing consumed - retry
+ * after rmp4_video_stream_set_avail), -1 at the end of a pass or on a
+ * decode error. */
 static int rmp4_video_stream_step(rmp4_video_stream_t *s,
       int *duration_ms)
 {
    rmp4_packet pkt;
 
-   while (rmp4_read_packet(s->demux, &pkt) == 1)
+   for (;;)
    {
-      int r;
+      int r = rmp4_read_packet(s->demux, &pkt);
+      if (r == RMP4_READ_AGAIN)
+         /* The sample's bytes are not buffered yet.  Do NOT fall
+          * through to the drain below: packets remain, and flushing
+          * the H.264 reorder queue now would present its held
+          * pictures early and out of order. */
+         return 2;
+      if (r != 1)
+         break;
       if (pkt.track != s->track)
          continue;
       r = rmp4_video_decode_packet(s, &pkt);
@@ -853,21 +860,10 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
     * pass, one per call, on the same presentation clock. */
    if (s->h264 && rh264_video_drain(s->h264) == 0)
    {
-      const uint8_t *y, *u, *v;
-      int ys, uvs, w, h, cw, ch;
-      y = rh264_video_plane(s->h264, 0, &ys,  &w,  &h);
-      u = rh264_video_plane(s->h264, 1, &uvs, &cw, &ch);
-      v = rh264_video_plane(s->h264, 2, &uvs, &cw, &ch);
-      if (y && u && v)
+      s->rndr_kind = 0;   /* the drain replaced the current picture */
+      if (rh264_video_plane(s->h264, 0, NULL, NULL, NULL))
       {
-         if ((unsigned)w > s->width)
-            w = (int)s->width;
-         if ((unsigned)h > s->height)
-            h = (int)s->height;
-         if (!s->catchup)
-            rmp4_video_blit_yuv(s->frame, s->width,
-                  (unsigned)w, (unsigned)h, y, ys, u, v, uvs, s->matrix,
-               (ch < h) ? 1 : 0, s->emit_argb);
+         s->rndr_kind = 3;
          if (duration_ms)
             *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
          s->disp_idx++;
@@ -877,23 +873,136 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
    return -1;             /* end of one pass */
 }
 
-const uint32_t *rmp4_video_stream_next(rmp4_video_stream_t *s,
-      int *duration_ms)
+int rmp4_video_stream_skip(rmp4_video_stream_t *s, int *duration_ms)
 {
    int r;
 
    if (!s)
-      return NULL;
+      return -1;
 
+   /* 2 (not yet resident) also ends the loop: nothing was consumed,
+    * and the caller retries after feeding more bytes.  Fully-resident
+    * streams never see it. */
    while ((r = rmp4_video_stream_step(s, duration_ms)) == 0)
       ;                   /* non-shown frame: keep going      */
-   return (r == 1) ? s->frame : NULL;
+   return r;
+}
+
+void rmp4_video_stream_set_avail(rmp4_video_stream_t *s, size_t avail)
+{
+   if (s)
+      rmp4_set_avail(s->demux, avail);
+}
+
+size_t rmp4_video_stream_media_floor(rmp4_video_stream_t *s)
+{
+   return s ? rmp4_media_floor(s->demux) : 0;
+}
+
+size_t rmp4_video_stream_consumed(rmp4_video_stream_t *s)
+{
+   return s ? rmp4_consumed(s->demux) : 0;
+}
+
+const uint32_t *rmp4_video_stream_render(rmp4_video_stream_t *s)
+{
+   if (!s)
+      return NULL;
+   switch (s->rndr_kind)
+   {
+      case 1:  /* VP8: planes valid until the next decode call */
+      {
+         const uint8_t *y, *u, *v;
+         int ys, uvs, w, h, cw, ch;
+         y = rvp8_video_plane(s->vp8, 0, &ys, &w, &h);
+         u = rvp8_video_plane(s->vp8, 1, &uvs, &cw, &ch);
+         v = rvp8_video_plane(s->vp8, 2, &uvs, &cw, &ch);
+         if (!y || !u || !v)
+            return NULL;
+         if ((unsigned)w > s->width)
+            w = (int)s->width;
+         if ((unsigned)h > s->height)
+            h = (int)s->height;
+         rmp4_video_blit_i420(s->frame, s->width,
+               (unsigned)w, (unsigned)h, y, ys, u, v, uvs, s->matrix,
+               s->emit_argb);
+         return s->frame;
+      }
+#ifdef HAVE_RVP9
+      case 2:  /* VP9: the recorded show buffer */
+      {
+         const rvp9_fb *fb = &s->vp9->fbs[s->rndr_vp9_show];
+         unsigned w = (unsigned)fb->w < s->width  ? (unsigned)fb->w : s->width;
+         unsigned h = (unsigned)fb->h < s->height ? (unsigned)fb->h : s->height;
+         if (s->vp9->hd.bit_depth == 10)
+         {
+            /* Colour metadata comes from the sample entry's colr box when
+             * present; untagged files pass zeros and the shared blit picks
+             * HD-appropriate defaults (BT.2020-ncl for PQ, BT.709/601 by
+             * resolution), matching untagged webm content. Without this
+             * branch the 10-bit (uint16) planes were handed to the 8-bit
+             * blit and mis-decoded. */
+            if (s->want10)
+            {
+               rwebm_video_blit_i420_10bit(s->frame, s->width, w, h,
+                     (const uint16_t*)fb->y, s->vp9->ys,
+                     (const uint16_t*)fb->u, (const uint16_t*)fb->v,
+                     s->vp9->uvs, s->matrix, s->transfer, s->range, 0);
+               s->is10 = 1;
+            }
+            else
+               rwebm_video_blit_i420_hbd(s->frame, s->width, w, h,
+                     (const uint16_t*)fb->y, s->vp9->ys,
+                     (const uint16_t*)fb->u, (const uint16_t*)fb->v,
+                     s->vp9->uvs, s->matrix, s->transfer, s->range, 0,
+                     s->emit_argb ? 0 : 1);
+         }
+         else
+            rmp4_video_blit_i420(s->frame, s->width, w, h,
+                  fb->y, s->vp9->ys, fb->u, fb->v, s->vp9->uvs, s->matrix,
+                  s->emit_argb);
+         return s->frame;
+      }
+#endif
+      case 3:  /* H.264: planes valid until the next decode or drain */
+      {
+         const uint8_t *y, *u, *v;
+         int ys, uvs, w, h, cw, ch;
+         y = rh264_video_plane(s->h264, 0, &ys,  &w,  &h);
+         u = rh264_video_plane(s->h264, 1, &uvs, &cw, &ch);
+         v = rh264_video_plane(s->h264, 2, &uvs, &cw, &ch);
+         if (!y || !u || !v)
+            return NULL;
+         if ((unsigned)w > s->width)
+            w = (int)s->width;
+         if ((unsigned)h > s->height)
+            h = (int)s->height;
+         rmp4_video_blit_yuv(s->frame, s->width,
+               (unsigned)w, (unsigned)h, y, ys, u, v, uvs, s->matrix,
+               (ch < h) ? 1 : 0, s->emit_argb);
+         return s->frame;
+      }
+      default:
+         break;
+   }
+   return NULL;
+}
+
+const uint32_t *rmp4_video_stream_next(rmp4_video_stream_t *s,
+      int *duration_ms)
+{
+   if (!s)
+      return NULL;
+   if (rmp4_video_stream_skip(s, duration_ms) != 1)
+      return NULL;
+   return rmp4_video_stream_render(s);
 }
 
 void rmp4_video_stream_rewind(rmp4_video_stream_t *s)
 {
    if (!s)
       return;
+   s->rndr_kind = 0;   /* decoder reset invalidates the planes */
    rmp4_rewind(s->demux);
    s->disp_idx = 0;
    s->wait_key = 0;
@@ -964,14 +1073,14 @@ int64_t rmp4_video_stream_seek_ms(rmp4_video_stream_t *s, int64_t ms)
       n++;
    }
    s->disp_idx = kf;
-   s->catchup  = 1;
    while (s->disp_idx < tidx)
-      if (!rmp4_video_stream_next(s, NULL))
+      if (rmp4_video_stream_skip(s, NULL) != 1)
          break;
-   s->catchup  = 0;
    /* The target slot itself is left for the caller's next
     * rmp4_video_stream_next call, so the frame at the position is the
-    * one presented. */
+    * one presented; the catch-up pictures above were never colour
+    * converted, and none of them is renderable now. */
+   s->rndr_kind = 0;
    return s->disp_idx < s->ts_count ? s->ts[s->disp_idx] / 1000000 : 0;
 }
 
@@ -1031,6 +1140,19 @@ void rmp4_video_set_want_10bit(rmp4_video_t *mp4, int want)
       mp4->want10 = want ? 1 : 0;
 }
 
+void rmp4_video_set_avail(rmp4_video_t *mp4, size_t avail)
+{
+   if (!mp4)
+      return;
+   mp4->partial = 1;
+   if (avail > mp4->len)
+      avail = mp4->len;
+   if (avail > mp4->avail)   /* monotonic */
+      mp4->avail = avail;
+   if (mp4->stream)
+      rmp4_video_stream_set_avail(mp4->stream, mp4->avail);
+}
+
 /* True if the last rmp4_video_process_image() wrote packed XRGB2101010. */
 bool rmp4_video_is_10bit(const rmp4_video_t *mp4)
 {
@@ -1059,9 +1181,17 @@ int rmp4_video_process_image(rmp4_video_t *mp4, void **buf,
    if (!mp4 || !mp4->buf || !buf)
       return IMAGE_PROCESS_ERROR;
 
+   /* A partial reader raises mp4->avail between calls; push it down
+    * so blocked stages can make progress this call. */
+   if (mp4->stream && mp4->partial)
+      rmp4_video_stream_set_avail(mp4->stream, mp4->avail);
+
    switch (mp4->still_stage)
    {
       case RMP4_VIDEO_STILL_IDLE:
+      {
+         int    need_more = 0;
+         size_t avail     = mp4->partial ? mp4->avail : mp4->len;
          /* Defensive: a repeated process call re-opens from scratch. */
          if (mp4->stream)
          {
@@ -1069,10 +1199,14 @@ int rmp4_video_process_image(rmp4_video_t *mp4, void **buf,
             mp4->stream = NULL;
          }
          if (!(mp4->stream = rmp4_video_stream_open_begin(
-               mp4->buf, mp4->len)))
-            return IMAGE_PROCESS_ERROR;
+               mp4->buf, mp4->len, avail, &need_more)))
+            /* The moov is still arriving (or, for a trailing moov or a
+             * fragmented movie, most of the file is): wait for more
+             * bytes rather than failing. */
+            return need_more ? IMAGE_PROCESS_WAIT : IMAGE_PROCESS_ERROR;
          mp4->still_stage = RMP4_VIDEO_STILL_SCAN;
          return IMAGE_PROCESS_NEXT;
+      }
 
       case RMP4_VIDEO_STILL_SCAN:
          if (!rmp4_video_stream_scan_step(mp4->stream,
@@ -1100,9 +1234,14 @@ int rmp4_video_process_image(rmp4_video_t *mp4, void **buf,
    s = mp4->stream;
    if ((r = rmp4_video_stream_step(s, &duration_ms)) == 0)
       return IMAGE_PROCESS_NEXT;   /* non-shown frame decoded */
+   if (r == 2)
+      /* The next sample's bytes have not been read yet; nothing was
+       * consumed - resume here once more of the file has arrived. */
+      return IMAGE_PROCESS_WAIT;
    if (r < 0)
       goto fail;
-   frame = s->frame;
+   if (!(frame = rmp4_video_stream_render(s)))
+      goto fail;
 
    mp4->last_10bit = s->is10;
 

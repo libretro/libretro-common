@@ -96,7 +96,18 @@ void  audio_transfer_set_buffer_ptr(void *data, enum audio_type_enum type,
  * frames are self-delimiting).  All buffers are borrowed and must outlive
  * the decoder.  Used by container demuxers (e.g. WebM) that have already
  * separated setup from payload; call instead of set_buffer_ptr, before
- * audio_transfer_start. Returns false if the codec has no demuxed path. */
+ * audio_transfer_start. Returns false if the codec has no demuxed path.
+ *
+ * GROWTH CONTRACT: this call may be repeated after audio_transfer_start,
+ * mid-stream, to grow the packet set for a progressive source - e.g. a
+ * player appending packets as a file arrives.  It only rebases the
+ * borrowed pointers and counts; no decoder or consumption state is
+ * touched (all demuxed arms track their position by packet index and
+ * byte offset, dereferencing the bases fresh at each read), so the new
+ * arrays may live at a different address (realloc).  Caller contract:
+ * counts and sizes are monotonic and the common prefix is identical.
+ * A read that exhausted the packets returned 0 frames without latching
+ * end-of-stream, so growth resumes decoding even after starvation. */
 bool  audio_transfer_set_demuxed_ptr(void *data, enum audio_type_enum type,
       const void *setup, size_t setup_size,
       const void *packets, size_t packets_size,
@@ -153,6 +164,14 @@ int   audio_transfer_read_s16(void *data, enum audio_type_enum type,
       int16_t *out, size_t frames, size_t *frames_out);
 int   audio_transfer_read_f32(void *data, enum audio_type_enum type,
       float *out, size_t frames, size_t *frames_out);
+
+/* The codec's current byte offset within the buffer set by
+ * set_buffer_ptr - how far into the compressed stream the decoder
+ * has read.  Monotonic during playback, jumps back to the head on a
+ * loop seek.  A windowed source's feeder uses it to keep residency
+ * around the read position.  Returns 0 if the codec does not track
+ * a buffer offset (demuxed arms, MOD). */
+size_t audio_transfer_buffer_tell(void *data, enum audio_type_enum type);
 
 /* Seek to an absolute interleaved PCM frame (used to loop). true on
  * success. */

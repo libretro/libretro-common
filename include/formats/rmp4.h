@@ -109,6 +109,13 @@ void rmp4_close(rmp4_t *mp4);
 
 /* Track enumeration. */
 int               rmp4_num_tracks(const rmp4_t *mp4);
+
+/* Bounded-memory streaming support: the lowest media byte any track's
+ * first sample sits at (everything below is metadata the demuxer and
+ * its callers keep borrowed pointers into - it must stay resident),
+ * and the highest sample end delivered so far. */
+size_t            rmp4_media_floor(const rmp4_t *m);
+size_t            rmp4_consumed(const rmp4_t *m);
 const rmp4_track *rmp4_get_track(const rmp4_t *mp4, int index);
 
 /* Total duration in nanoseconds (from mvhd), or 0 if the file does not
@@ -119,7 +126,35 @@ int64_t rmp4_duration_ns(const rmp4_t *mp4);
  * Returns 1 on success, 0 at end of stream, -1 on a parse error. The
  * packet's data pointer aliases the input buffer and is valid until the
  * demuxer is closed. */
+/* Returned by rmp4_read_packet when the next sample's bytes lie beyond
+ * the prefix made available so far (see rmp4_set_avail): nothing was
+ * consumed; call again after more bytes arrive. */
+#define RMP4_READ_AGAIN 2
+
 int rmp4_read_packet(rmp4_t *mp4, rmp4_packet *pkt);
+
+/* Open against a partially-read buffer: only the first 'avail' bytes
+ * are valid (the rest may be uninitialised) and are never read.  Box
+ * bodies are hopped arithmetically, so a trailing moov (a file muxed
+ * without faststart) is found as soon as its own bytes arrive; a
+ * fragmented movie needs the whole file (its sample tables live in
+ * moof boxes interleaved to the end).  On failure, *need_more (when
+ * non-NULL) is set when the failure was running out of available
+ * bytes rather than malformed data - retry with a larger avail.
+ * rmp4_open_memory is this with avail == size. */
+rmp4_t *rmp4_open_memory_avail(const uint8_t *data, size_t size,
+      size_t avail, int *need_more);
+
+/* Raise the number of valid bytes (monotonic; clamped to the file
+ * size). */
+void rmp4_set_avail(rmp4_t *mp4, size_t avail);
+
+/* Borrow a track's presentation timestamps (decode order), straight
+ * from the sample tables - available as soon as the moov is parsed,
+ * with no reference to the media data.  Returns NULL for an invalid
+ * track; the array lives until rmp4_close. */
+const int64_t *rmp4_track_pts(const rmp4_t *mp4, int track,
+      uint32_t *count);
 
 /* Restart packet reading from the first sample. */
 void rmp4_rewind(rmp4_t *mp4);

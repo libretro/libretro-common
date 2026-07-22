@@ -37,7 +37,13 @@ enum image_process_code
    IMAGE_PROCESS_ERROR     = -2,
    IMAGE_PROCESS_ERROR_END = -1,
    IMAGE_PROCESS_NEXT      =  0,
-   IMAGE_PROCESS_END       =  1
+   IMAGE_PROCESS_END       =  1,
+   /* The transfer cannot advance until more of the file has been read
+    * into the buffer (see image_transfer_set_avail); nothing was
+    * consumed.  Only the video still decoders (WEBM, MP4) return
+    * this, and only after the caller opts in by setting an avail
+    * short of the full length. */
+   IMAGE_PROCESS_WAIT      =  2
 };
 
 struct texture_compressed;  /* defined below, after enum image_type_enum */
@@ -252,12 +258,43 @@ const uint32_t *image_transfer_anim_stream_next(void *stream,
 
 /* Ask the stream to emit ARGB words (non-zero) or the default R,G,B,A
  * memory order (zero) from the next frame on.  Returns true when the
- * stream type honours the request (the video streams: WEBM, MP4) so
- * the caller can skip its own R/B swizzle pass; false for types that
- * always emit the default order (animated WEBP), where the caller
- * must keep converting. */
+ * stream type honours the request (WEBM, MP4, and animated WEBP - the
+ * video streams bake the order in their blit, WEBP in its sub-frame
+ * decode stores, converting its persistent canvas once if the order
+ * changes mid-animation) so the caller can skip its own R/B swizzle
+ * pass; false for types that always emit the default order, where the
+ * caller must keep converting. */
 bool image_transfer_anim_stream_set_argb(void *stream,
       enum image_type_enum type, int argb);
+
+/* For decoding a still from a file whose read is still in progress:
+ * declare how many leading bytes of the buffer are valid.  Monotonic.
+ * Only the video types (WEBM, MP4) honour it - their process step
+ * returns IMAGE_PROCESS_WAIT instead of erroring at the wall - and it
+ * is a no-op for every other type, whose transfers must keep seeing
+ * fully-resident buffers. */
+void image_transfer_set_avail(void *data, enum image_type_enum type,
+      size_t avail);
+
+/* The stream-level counterpart, for an animation stream adopted from
+ * a still whose file read was still in flight: the demuxer's byte
+ * wall was captured at open, and nothing else raises it once the
+ * still's task is gone - without this, a stream adopted at N bytes
+ * read treats N as the end of the file and loops the animation
+ * there, forever.  Call with the full length once the read
+ * completes (or progressively, should a streaming consumer appear).
+ * No-op for types without a byte wall (animated WEBP). */
+void image_transfer_anim_stream_set_avail(void *stream,
+      enum image_type_enum type, size_t avail);
+
+/* Companion to the above for WEBM, whose timestamp pre-scan is
+ * truncated by the wall (timestamps live in the block headers): once
+ * the buffer is complete, finish the scan so per-frame durations
+ * match a stream opened over the whole file.  No-op for MP4 (its
+ * scan reads the moov tables and is never truncated) and for types
+ * without a scan. */
+void image_transfer_anim_stream_complete_scan(void *stream,
+      enum image_type_enum type, const void *buf, size_t len);
 
 void image_transfer_anim_stream_rewind(void *stream,
       enum image_type_enum type);

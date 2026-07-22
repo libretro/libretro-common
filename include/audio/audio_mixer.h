@@ -65,8 +65,13 @@ void audio_mixer_init(unsigned rate);
 
 void audio_mixer_done(void);
 
+/* want_s16 selects which PCM format is built at load - the one the
+ * mixer's current mode will play.  The other format derives on
+ * demand at the first mode-mismatched play (see the derivation notes
+ * in the implementation), so a WAV holds one PCM copy, not two. */
 audio_mixer_sound_t* audio_mixer_load_wav(void *buffer, int32_t size,
-      const char *resampler_ident, enum resampler_quality quality);
+      const char *resampler_ident, enum resampler_quality quality,
+      bool want_s16);
 audio_mixer_sound_t* audio_mixer_load_ogg(void *buffer, int32_t size);
 audio_mixer_sound_t* audio_mixer_load_mod(void *buffer, int32_t size);
 audio_mixer_sound_t* audio_mixer_load_flac(void *buffer, int32_t size);
@@ -78,7 +83,20 @@ audio_mixer_sound_t* audio_mixer_load_opus(void *buffer, int32_t size);
  * container carries no supported track. */
 audio_mixer_sound_t* audio_mixer_load_weba(void *buffer, int32_t size);
 
+/* Compressed-byte read position of a stream voice's decoder (0 when
+ * not a live buffer-mode stream voice).  Thread-safe. */
+size_t audio_mixer_voice_buffer_tell(audio_mixer_voice_t *voice);
+
 void audio_mixer_destroy(audio_mixer_sound_t* sound);
+
+/* Mark the sound's compressed source data as borrowed: destroy will
+ * hand it back through release(owner) instead of free()ing it.  For
+ * callers whose bytes live inside a larger owned object (a file
+ * mapping, a data_transfer) this removes the defensive copy.
+ * Ownership of 'owner' transfers on this call in every outcome
+ * (a NULL sound releases immediately). */
+void audio_mixer_sound_set_data_owner(audio_mixer_sound_t *sound,
+      void *owner, void (*release)(void *owner));
 
 audio_mixer_voice_t* audio_mixer_play(audio_mixer_sound_t* sound,
       bool repeat, float volume,

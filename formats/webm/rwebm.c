@@ -35,6 +35,7 @@
 #define ID_CODECID         0x86u
 #define ID_CODECPRIVATE    0x63A2u
 #define ID_CODECDELAY      0x56AAu
+#define ID_DEFAULTDURATION 0x23E383u
 #define ID_VIDEO           0xE0u
 #define ID_PIXELWIDTH      0xB0u
 #define ID_PIXELHEIGHT     0xBAu
@@ -169,6 +170,23 @@ static double be_float(const uint8_t *p, size_t n)
    return 0.0;
 }
 
+/* Matroska float elements are parsed straight from the file, so a
+ * malformed stream can carry a NaN, an infinity, or a finite value far
+ * outside any integer's range.  Converting such a double to an integer
+ * type is undefined behaviour in C (and in practice yields a garbage,
+ * often negative, value the caller would then trust as a rate or a
+ * duration).  Clamp to the destination range first; NaN maps to 0. */
+static double be_double_clamp(double v, double lo, double hi)
+{
+   if (!(v == v))   /* NaN */
+      return 0.0;
+   if (v < lo)
+      return lo;
+   if (v > hi)
+      return hi;
+   return v;
+}
+
 /* ===== Demuxer state ===== */
 
 struct rwebm
@@ -181,6 +199,12 @@ struct rwebm
    double         duration_ticks;   /* raw Duration element (scaled later) */
    const uint8_t *clusters_begin;   /* first byte after Tracks (first data)*/
    const uint8_t *segment_end;
+   /* End of the bytes that have actually been read into the buffer.
+    * Equal to segment_end for a fully-resident file; a partial reader
+    * raises it with rwebm_set_avail as bytes arrive.  The packet walk
+    * never parses past it: an element that would cross it yields
+    * RWEBM_READ_AGAIN without consuming anything. */
+   const uint8_t *avail_end;
    /* Packet-read cursor. */
    const uint8_t *cur;              /* walk position inside the segment    */
    int64_t        cluster_ts;       /* current cluster timestamp (ticks)   */
@@ -236,7 +260,11 @@ static void parse_track_av(const uint8_t *p, const uint8_t *end,
             trk->height      = (unsigned)be_uint(body, (size_t)sz);
             break;
          case ID_SAMPLINGFREQ:
-            trk->sample_rate = (unsigned)(be_float(body, (size_t)sz) + 0.5);
+            /* Clamp before the cast: an out-of-range float is UB to
+             * convert, and no real sampling frequency approaches
+             * UINT_MAX. */
+            trk->sample_rate = (unsigned)(be_double_clamp(
+                  be_float(body, (size_t)sz), 0.0, 4294967295.0) + 0.5);
             break;
          case ID_CHANNELS:
             trk->channels    = (unsigned)be_uint(body, (size_t)sz);
@@ -330,6 +358,9 @@ static void parse_track_entry(const uint8_t *p, const uint8_t *end,
             trk->codec_private      = body;
             trk->codec_private_size = (size_t)sz;
             break;
+         case ID_DEFAULTDURATION:
+            trk->default_duration_ns = be_uint(body, (size_t)sz);
+            break;
          case ID_CODECDELAY:
             /* nanoseconds of decoded output to drop from the stream
              * start (the encoder delay; AAC priming in mkv muxes) */
@@ -348,14 +379,36 @@ static void parse_track_entry(const uint8_t *p, const uint8_t *end,
 
 int64_t rwebm_duration_ns(const rwebm_t *webm)
 {
+   double ns;
    if (!webm || webm->duration_ticks <= 0.0)
       return 0;
-   return (int64_t)(webm->duration_ticks * (double)webm->timestamp_scale);
+   /* duration_ticks is a file-supplied float; the scaled product can
+    * exceed int64_t (or be NaN/inf), which is UB to convert.  Clamp to
+    * the int64 range - a saturated duration is harmless, an undefined
+    * conversion is not. */
+   ns = be_double_clamp(
+         webm->duration_ticks * (double)webm->timestamp_scale,
+         0.0, 9223372036854775807.0);
+   return (int64_t)ns;
 }
 
 int rwebm_num_tracks(const rwebm_t *webm)
 {
    return webm ? webm->num_tracks : 0;
+}
+
+size_t rwebm_media_floor(const rwebm_t *m)
+{
+   if (!m || !m->clusters_begin)
+      return 0;
+   return (size_t)(m->clusters_begin - m->data);
+}
+
+size_t rwebm_tell(const rwebm_t *m)
+{
+   if (!m || !m->cur)
+      return 0;
+   return (size_t)(m->cur - m->data);
 }
 
 const rwebm_track *rwebm_get_track(const rwebm_t *webm, int index)
@@ -425,25 +478,64 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
       return 1;
    }
 
-   r.p = webm->cur; r.end = webm->segment_end;
+   /* Parse against the available prefix only: bytes past avail_end are
+    * not yet in the buffer (a partial reader's tail is uninitialised),
+    * so an element crossing it must not be parsed - or consumed.  When
+    * avail_end == segment_end this clamp is the old behaviour. */
+   r.p = webm->cur; r.end = webm->avail_end;
    while (r.p < r.end)
    {
       int      ok;
       uint32_t id  = ebml_read_id(&r);
       uint64_t sz  = ebml_read_vint(&r, 1, &ok);
       const uint8_t *body = r.p;
-      if (!id || !ok || body + sz > r.end)
+      if (!id || !ok)
       {
+         if (webm->avail_end < webm->segment_end)
+            return RWEBM_READ_AGAIN;   /* header still arriving */
          webm->cur = r.end;
          return 0;
       }
-      if (id == ID_CLUSTER || id == ID_BLOCKGROUP)
+      if (id == ID_CLUSTER)
       {
-         /* Descend: Cluster holds Timestamp + blocks; BlockGroup wraps a
-          * single Block (plus DiscardPadding/duration/refs). Scan
-          * children. */
-         if (id == ID_BLOCKGROUP)
-            webm->pending_discard = 0;
+         /* Descend on the header alone: a short clip is often a single
+          * cluster spanning the whole file, so requiring the cluster's
+          * full extent inside the partial-read wall would hold every
+          * still hostage to the complete read.  Clamp the descent to
+          * the wall; each child gates itself, and the walker's
+          * established context-free resume (the cursor lands after
+          * each block, mid-cluster, every call) makes re-entry at the
+          * wall safe. */
+         const uint8_t *cend = body + sz;
+         if (cend > webm->segment_end)
+            cend = webm->segment_end;   /* malformed/overlong: clamp  */
+         r.p   = body;
+         r.end = cend < r.end ? cend : r.end;
+         continue;
+      }
+      if (body + sz > r.end)
+      {
+         /* Truncated at the wall: if the file continues past it, the
+          * element is merely not buffered yet - consume nothing (the
+          * cursor stays where this walk began; any elements skipped
+          * getting here are re-skipped on retry, which is idempotent)
+          * and ask the caller to retry with more data.  A genuinely
+          * malformed element yields spurious retries only until the
+          * read completes, when this path closes.  BlockGroup is
+          * deliberately NOT descended on a partial extent: its
+          * trailing siblings feed webm_group_discard, and a clamped
+          * group could yield a different DiscardPadding than the
+          * fully-resident decode. */
+         if (webm->avail_end < webm->segment_end)
+            return RWEBM_READ_AGAIN;
+         webm->cur = r.end;
+         return 0;
+      }
+      if (id == ID_BLOCKGROUP)
+      {
+         /* Descend: BlockGroup wraps a single Block (plus
+          * DiscardPadding/duration/refs). Scan children. */
+         webm->pending_discard = 0;
          r.p   = body;
          r.end = body + sz;
          continue;
@@ -639,13 +731,22 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
       /* Any other element: skip its body. */
       r.p = body + sz;
    }
+   if (webm->avail_end < webm->segment_end)
+   {
+      /* The walk consumed everything buffered so far without finding a
+       * block; remember the position so the retry resumes here instead
+       * of re-skipping (positions before r.p held no packets). */
+      webm->cur = r.p;
+      return RWEBM_READ_AGAIN;
+   }
    webm->cur = r.end;
    return 0;
 }
 
 /* ===== Open ===== */
 
-rwebm_t *rwebm_open_memory(const uint8_t *data, size_t size)
+rwebm_t *rwebm_open_memory_avail(const uint8_t *data, size_t size,
+      size_t avail, int *need_more)
 {
    rwebm_t    *w;
    ebml_reader r;
@@ -653,11 +754,23 @@ rwebm_t *rwebm_open_memory(const uint8_t *data, size_t size)
    uint32_t    id;
    uint64_t    sz;
    const uint8_t *seg_body;
+   const uint8_t *avail_end;
 
+   if (need_more)
+      *need_more = 0;
+   if (avail > size)
+      avail = size;
    if (!data || size < 8)
       return NULL;
+   if (avail < 8)
+      goto more;
 
-   r.p = data; r.end = data + size;
+   /* Header parsing is bounded by the available prefix: bytes past it
+    * are not yet in the buffer, and parsing them would read
+    * uninitialised memory.  At avail == size this is the old
+    * behaviour. */
+   avail_end = data + avail;
+   r.p = data; r.end = avail_end;
 
    /* EBML header must come first. */
    id = ebml_read_id(&r);
@@ -665,19 +778,19 @@ rwebm_t *rwebm_open_memory(const uint8_t *data, size_t size)
       return NULL;
    sz = ebml_read_vint(&r, 1, &ok);
    if (!ok || r.p + sz > r.end)
-      return NULL;
+      goto more_or_fail;
    r.p += sz;   /* skip the EBML header body (DocType etc.) */
 
    /* Segment. */
    id = ebml_read_id(&r);
    if (id != ID_SEGMENT)
-      return NULL;
+      goto more_or_fail;
    sz = ebml_read_vint(&r, 1, &ok);
    if (!ok)
-      return NULL;
+      goto more_or_fail;
    seg_body = r.p;
-   if (seg_body + sz > r.end)
-      sz = (uint64_t)(r.end - seg_body);   /* tolerate unknown/overlong    */
+   if (seg_body + sz > data + size)
+      sz = (uint64_t)(data + size - seg_body); /* tolerate unknown/overlong */
 
    w = (rwebm_t*)calloc(1, sizeof(*w));
    if (!w)
@@ -686,13 +799,16 @@ rwebm_t *rwebm_open_memory(const uint8_t *data, size_t size)
    w->size            = size;
    w->timestamp_scale = 1000000;   /* Matroska default: 1 ms per tick      */
    w->segment_end     = seg_body + sz;
+   w->avail_end       = avail_end < w->segment_end
+                      ? avail_end : w->segment_end;
 
    /* Walk the segment's top-level children for Info and Tracks; remember
     * where the first non-metadata element (usually the first Cluster)
     * begins so packet reading can start there. */
    {
       ebml_reader s;
-      s.p = seg_body; s.end = w->segment_end;
+      s.p = seg_body;
+      s.end = w->avail_end;   /* == segment_end when fully resident */
       w->clusters_begin = seg_body;
       while (s.p < s.end)
       {
@@ -752,11 +868,40 @@ rwebm_t *rwebm_open_memory(const uint8_t *data, size_t size)
 
    if (w->num_tracks == 0)
    {
+      /* No Tracks within the available prefix: either the header is
+       * still arriving (retry with more) or the file is malformed. */
       free(w);
-      return NULL;
+      goto more_or_fail;
    }
 
    w->cur        = w->clusters_begin;
    w->cluster_ts = 0;
    return w;
+
+more_or_fail:
+   if (avail == size)
+      return NULL;
+more:
+   if (need_more)
+      *need_more = 1;
+   return NULL;
+}
+
+rwebm_t *rwebm_open_memory(const uint8_t *data, size_t size)
+{
+   return rwebm_open_memory_avail(data, size, size, NULL);
+}
+
+void rwebm_set_avail(rwebm_t *webm, size_t avail)
+{
+   const uint8_t *e;
+   if (!webm)
+      return;
+   if (avail > webm->size)
+      avail = webm->size;
+   e = webm->data + avail;
+   if (e > webm->segment_end)
+      e = webm->segment_end;
+   if (e > webm->avail_end)   /* monotonic: bytes never un-arrive */
+      webm->avail_end = e;
 }

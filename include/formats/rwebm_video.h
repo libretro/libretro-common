@@ -77,6 +77,14 @@ bool rwebm_video_set_buf_ptr(rwebm_video_t *webm, void *data, size_t len);
  * sources are unaffected. Off by default. */
 void rwebm_video_set_want_10bit(rwebm_video_t *webm, int want);
 
+/* Partial-read support for the still decode: declare how many leading
+ * bytes of the buffer are valid (monotonic; 0 means fully resident).
+ * With a short avail, rwebm_video_process_image returns
+ * IMAGE_PROCESS_WAIT instead of failing when it needs bytes that have
+ * not arrived (the header, at least two scanned frames, or the first
+ * displayed frame's blocks). */
+void rwebm_video_set_avail(rwebm_video_t *webm, size_t avail);
+
 /* True if the last rwebm_video_process_image() produced XRGB2101010. */
 bool rwebm_video_is_10bit(const rwebm_video_t *webm);
 
@@ -109,6 +117,14 @@ rwebm_video_stream_t *rwebm_video_detach_stream(rwebm_video_t *webm);
 rwebm_video_stream_t *rwebm_video_stream_open(const uint8_t *buf,
       size_t len);
 
+/* Open against a partially-read buffer: 'avail' leading bytes are
+ * valid (raise later with the stream set_avail).  On NULL, *need_more
+ * distinguishes "feed more bytes and retry" from malformed data.  For WebM the
+ * pre-scan is truncated at the wall once two frames are known (call
+ * rwebm_video_stream_complete_scan when the file has fully arrived). */
+rwebm_video_stream_t *rwebm_video_stream_open_avail(const uint8_t *buf,
+      size_t len, size_t avail, int *need_more);
+
 void rwebm_video_stream_close(rwebm_video_stream_t *stream);
 
 /* num_frames is the number of coded video packets, saturating at the
@@ -137,6 +153,25 @@ const uint32_t *rwebm_video_stream_next(rwebm_video_stream_t *stream,
  * frames.  A stream detached from a still-image transfer starts at
  * the default order. */
 void rwebm_video_stream_set_argb(rwebm_video_stream_t *stream, int argb);
+
+/* Partial-read support: raise the number of leading buffer bytes that
+ * are valid (monotonic).  A blocked step resumes once the needed
+ * block's bytes are inside the window; fully-resident streams never
+ * block. */
+void rwebm_video_stream_set_avail(rwebm_video_stream_t *stream,
+      size_t avail);
+
+/* For a stream adopted from a still decoded against a partial read:
+ * once the whole file is in the buffer, finish the timestamp
+ * pre-scan the partial open truncated at its byte wall, making every
+ * per-frame duration identical to a stream opened over the complete
+ * file (a wall-truncated table otherwise paces frames past it by a
+ * single-interval estimate - for ms-rounded 30 fps content, a
+ * constant 33 where the true cadence alternates 33/34, i.e. a third
+ * of a millisecond of drift per frame until the table's cap).
+ * A bounded, header-only walk of at most the table cap's packets. */
+void rwebm_video_stream_complete_scan(rwebm_video_stream_t *stream,
+      const uint8_t *buf, size_t len);
 
 void rwebm_video_stream_rewind(rwebm_video_stream_t *stream);
 
