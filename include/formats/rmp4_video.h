@@ -63,6 +63,17 @@ int rmp4_video_process_image(rmp4_video_t *mp4, void **buf,
 
 typedef struct rmp4_video_stream rmp4_video_stream_t;
 
+/* Take ownership of the stream a successful rmp4_video_process_image
+ * left open, positioned just past the first displayed frame, so the
+ * caller can continue the video as an animation without re-opening
+ * (and re-pre-scanning) the file.  Returns NULL if no stream is held
+ * (no process call yet, it failed, or the stream was already
+ * detached).  The stream borrows the buffer given via
+ * rmp4_video_set_buf_ptr, which must outlive it; close it with
+ * rmp4_video_stream_close.  10-bit output requested for the still is
+ * dropped: detached streams emit 8-bit frames. */
+rmp4_video_stream_t *rmp4_video_detach_stream(rmp4_video_t *mp4);
+
 /* The buffer is BORROWED and must remain valid and unmodified until
  * rmp4_video_stream_close. Returns NULL when the data is not an MP4
  * stream, has no video track with a compiled-in codec, or contains no
@@ -72,18 +83,32 @@ rmp4_video_stream_t *rmp4_video_stream_open(const uint8_t *buf,
 
 void rmp4_video_stream_close(rmp4_video_stream_t *stream);
 
-/* num_frames is the number of coded video packets (an upper bound on
- * displayed frames when the stream carries non-shown frames).
- * loop_count is always 0: video loops indefinitely. */
+/* num_frames is the number of coded video packets, saturating at the
+ * pre-scan cap (a few thousand): treat it as "at least this many", an
+ * upper bound on displayed frames only below the cap (the stream may
+ * carry non-shown frames).  loop_count is always 0: video loops
+ * indefinitely. */
 void rmp4_video_stream_get_info(const rmp4_video_stream_t *stream,
       unsigned *width, unsigned *height, int *num_frames, int *loop_count);
 
 /* Decode the next displayed frame. Returns the frame pixels (valid until
  * the next call on this stream) and writes its display duration in ms
  * (0 when unknown; the caller applies its default), or NULL at the end
- * of one pass; call rmp4_video_stream_rewind to loop. */
+ * of one pass; call rmp4_video_stream_rewind to loop.  Pixels are in
+ * memory order R,G,B,A by default; see rmp4_video_stream_set_argb. */
 const uint32_t *rmp4_video_stream_next(rmp4_video_stream_t *stream,
       int *duration_ms);
+
+/* Select the channel order of subsequent frames: non-zero emits ARGB
+ * words (memory order B,G,R,A on little-endian), zero restores the
+ * default R,G,B,A memory order.  Applies to the 8-bit output paths;
+ * 10-bit XRGB2101010 output is unaffected.  The order is baked by the
+ * blit, so this costs nothing per frame - it exists so a caller whose
+ * upload format is ARGB does not need its own full-frame swizzle pass.
+ * Takes effect from the next decoded frame; may be changed between
+ * frames.  A stream detached from a still-image transfer starts at
+ * the default order. */
+void rmp4_video_stream_set_argb(rmp4_video_stream_t *stream, int argb);
 
 void rmp4_video_stream_rewind(rmp4_video_stream_t *stream);
 

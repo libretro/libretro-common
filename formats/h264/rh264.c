@@ -266,7 +266,15 @@ static int rh264_parse_pps(const uint8_t *rbsp,size_t size,rh264_pps *p){
    p->num_ref_idx_l1_default=rh264_ue(&b)+1;
    p->weighted_pred_flag=rh264_u1(&b);
    p->weighted_bipred_idc=(int)rh264_un(&b,2);
-   p->pic_init_qp=rh264_se(&b)+26; rh264_se(&b); p->chroma_qp_index_offset=rh264_se(&b);
+   /* pic_init_qp_minus26 is -(26 + 6*bit_depth_luma_minus8) .. +25
+    * (7.4.2.2), so for the 8-bit streams decoded here pic_init_qp lands
+    * in 0..51.  The slice QP derived from it indexes the dequantisation
+    * tables by qp%6 and shifts by qp/6, so an out-of-range value reaches
+    * them as a negative index. */
+   { int32_t q = rh264_se(&b) + 26;
+     if (q < 0 || q > 51) return 0;
+     p->pic_init_qp = (int)q; }
+   rh264_se(&b); p->chroma_qp_index_offset=rh264_se(&b);
    p->deblocking_filter_control_present=rh264_u1(&b); p->constrained_intra_pred_flag=rh264_u1(&b);
    if(rh264_u1(&b)) return 0;   /* redundant_pic_cnt_present unsupported */
    p->chroma_qp_index_offset2=p->chroma_qp_index_offset;
@@ -413,12 +421,7 @@ static int rh264_parse_slice_header_adv(rh264_bits *b,int nal_unit_type,int nal_
        * the address. */
       if(!sh->field_pic_flag&&sps->mb_adaptive_frame_field_flag)
          sh->first_mb_in_slice*=2;
-      /* 4:2:2 in a pair-scanned picture is refused.  The two are
-       * correct apart and wrong together: the chroma edges 4:2:2 adds
-       * come out filtered differently once the picture is walked in
-       * pairs, and the error feeds the pictures that follow. */
-      if(sps->chroma_format_idc==2&&sps->mb_adaptive_frame_field_flag)
-         return 0;
+
       /* B field pictures are still refused: their second list and the
        * direct modes need field machinery this does not have.  So are
        * CABAC ones: the significance maps of a field-coded block are
@@ -488,8 +491,12 @@ static int rh264_parse_slice_header_adv(rh264_bits *b,int nal_unit_type,int nal_
       sh->chroma_log2_denom=rh264_ue(b);
       /* 7.4.3.2 bounds both denominators to 0..7; a corrupt stream can
        * signal anything, and the unit-weight defaults below shift by
-       * the value read. */
-      if(sh->luma_log2_denom>7||sh->chroma_log2_denom>7)
+       * the value read.  Compare as unsigned: rh264_ue saturates to
+       * 0xFFFFFFFF on an over-long code, which lands in these ints as
+       * -1 and slips past a signed upper-bound test, leaving the shifts
+       * below - and the ones in the weighting itself - with a negative
+       * exponent. */
+      if((unsigned)sh->luma_log2_denom>7||(unsigned)sh->chroma_log2_denom>7)
          return 0;
       for(i=0;i<32;i++){
          sh->wp_lw[i]=(int16_t)(1<<sh->luma_log2_denom); sh->wp_lo[i]=0;
@@ -545,6 +552,11 @@ static int rh264_parse_slice_header_adv(rh264_bits *b,int nal_unit_type,int nal_
          &&sh->slice_type!=RH264_SLICE_SI)
       sh->cabac_init_idc=rh264_ue(b);
    sh->slice_qp=pps->pic_init_qp+rh264_se(b);
+   /* SliceQPY is 0..51 for 8-bit (7.4.3); the value feeds f->qp, which
+    * indexes the dequantisation tables by qp%6 and shifts by qp/6, and
+    * seeds the CABAC context initialisation.  Refuse the slice rather
+    * than let a corrupt delta drive those negative. */
+   if(sh->slice_qp<0||sh->slice_qp>51) return 0;
    if(pps->deblocking_filter_control_present){
       sh->disable_deblocking_filter_idc=rh264_ue(b);
       if(sh->disable_deblocking_filter_idc!=1){
@@ -800,7 +812,13 @@ static int rh264_coeff_token(rh264_bits *b, int nC,
 static int rh264_level_prefix(rh264_bits *b)
 {
    int lz = 0;
-   while (rh264_more_data(b) && rh264_u1(b) == 0)
+   /* level_prefix is a unary code the standard bounds well under 32 (a
+    * conformant level_code fits in the coefficient range); a corrupt or
+    * truncated stream can present an unbounded run of zeros, which would
+    * otherwise drive the 1 << (level_prefix - 3) below past the width of
+    * an int.  Stop counting at 32: the caller's level_code arithmetic
+    * then saturates harmlessly and the block is rejected downstream. */
+   while (lz < 32 && rh264_more_data(b) && rh264_u1(b) == 0)
       lz++;
    return lz;
 }
@@ -884,6 +902,15 @@ static int rh264_residual_block(rh264_bits *b, int nC, int maxNumCoeff,
                level[i] = (-level_code - 1) >> 1;
             else
                level[i] = (level_code + 2) >> 1;
+            /* A conformant coefficient level fits well inside 16 bits;
+             * anything larger is a corrupt or truncated stream.  Reject
+             * the block rather than let the value flow into the
+             * dequantisation multiplies (coeff * scale, scale up to a few
+             * hundred), where an out-of-range level would overflow the
+             * int product.  The bound is deliberately loose - it only
+             * rules out values no valid stream can produce. */
+            if (level[i] > (1 << 16) || level[i] < -(1 << 16))
+               return -1;
             if (suffix_length == 0)
                suffix_length = 1;
             if ((level[i] > (3 << (suffix_length - 1)) ||
@@ -1090,11 +1117,16 @@ typedef struct {
     * chroma keeps the luma height */
    int cmbh;
    int qp;
+   /* prediction may not use samples from inter-coded neighbours */
+   int constrained_intra;
    int chroma_qp_offset;   /* Cb */
    int chroma_qp_offset2;  /* Cr (second_chroma_qp_index_offset) */
    uint8_t *i4mode;   /* per-4x4-block intra mode, raster mbw*4 x mbh*4 */
    uint8_t *nzL;      /* per-4x4 luma nonzero count, same grid          */
-   uint8_t *nzC[2];   /* per-4x4 chroma nonzero (mbw*2 x mbh*2)         */
+   /* per-4x4 chroma nonzero counts.  One row per chroma BLOCK row, so
+    * mbw*2 wide and mbh*(cmbh/4) tall - twice as tall in 4:2:2, which
+    * keeps the luma height. */
+   uint8_t *nzC[2];
    uint8_t *mbqp;     /* per-MB luma QP (mbw x mbh)                     */
    uint8_t *mbt8;     /* per-MB 8x8-transform flag (mbw x mbh)          */
    uint8_t *mbslice;  /* per-MB slice index (mbw x mbh), for deblocking */
@@ -1523,12 +1555,18 @@ static int rh264_decode_chroma_residual(rh264_bits *b, rh264_frame *f,
          LS=f->w4[(inter?4:1)+comp][0]*rh264_dequant4_v[rem][0];
          for (k=0;k<nblk;k++)
          {
+            /* the coefficient is attacker-controlled and LS is up to
+             * a few hundred; their product can exceed int.  Multiply in
+             * uint32_t so the wrap is defined - the reconstruction of a
+             * malformed block is discarded, only its arithmetic must not
+             * be undefined. */
             if (nblk==8)
                cdc[comp][k] = (per >= 6)
-                  ? (int32_t)((uint32_t)(cdc[comp][k]*LS) << (per-6))
-                  : (int32_t)((cdc[comp][k]*LS + (1 << (5-per))) >> (6-per));
+                  ? (int32_t)((uint32_t)cdc[comp][k]*(uint32_t)LS << (per-6))
+                  : (int32_t)(((int32_t)((uint32_t)cdc[comp][k]*(uint32_t)LS)
+                        + (1 << (5-per))) >> (6-per));
             else
-               cdc[comp][k]=(int32_t)((uint32_t)(cdc[comp][k]*LS)<<per)>>5;
+               cdc[comp][k]=(int32_t)((uint32_t)cdc[comp][k]*(uint32_t)LS<<per)>>5;
          }
       }
    }
@@ -1610,7 +1648,10 @@ static void rh264_filter_luma_edge(uint8_t *e,int s,int bS,int a,int be,int tc0v
       int tc=tc0v, ap=RH264_ABS(p2-p0), aq=RH264_ABS(q2-q0), d;
       if(ap<be) tc++;
       if(aq<be) tc++;
-      d=(((q0-p0)<<2)+(p1-q1)+4)>>3;
+      /* q0-p0 is a difference of two samples and so may be negative;
+       * shifting that left is undefined, and this is the scalar path a
+       * target without vector support takes (8.7.2.3). */
+      d=(((q0-p0)*4)+(p1-q1)+4)>>3;
       if(d<-tc)d=-tc; else if(d>tc)d=tc;
       e[-1*s]=(uint8_t)RH264_CLIP(p0+d);
       e[0]   =(uint8_t)RH264_CLIP(q0-d);
@@ -2423,6 +2464,7 @@ static int rh264_decode_intra_mb_cavlc(rh264_bits *b, rh264_frame *f,
    int nb_ul = rh264_mb_addr(mbx-1,mby-1,f->mbw,f->mbaff);
    int have_up=(mby>0) && nb_up >= slice_first && nb_up < mbaddr;
    int have_left=(mbx>0) && nb_lf >= slice_first && nb_lf < mbaddr;
+
    int have_ur=(mby>0) && (mbx+1<f->mbw)
       && nb_ur >= slice_first && nb_ur < mbaddr;
    int have_ul=(mby>0) && (mbx>0)
@@ -2431,6 +2473,17 @@ static int rh264_decode_intra_mb_cavlc(rh264_bits *b, rh264_frame *f,
    uint8_t *y=f->Y+(mby*16)*f->ystride+mbx*16;
    uint8_t *u=f->U+(mby*f->cmbh)*f->cstride+mbx*8;
    uint8_t *v=f->V+(mby*f->cmbh)*f->cstride+mbx*8;
+
+   /* where the picture forbids predicting from inter samples, an
+    * inter-coded neighbour is not available to predict from at all
+    * (8.3.1.2).  0xff in the mode grid marks an inter macroblock. */
+   if (f->constrained_intra)
+   {
+      if (have_up   && f->i4mode[(mby*4-1)*(f->mbw*4)+mbx*4] == 0xff)
+         have_up = 0;
+      if (have_left && f->i4mode[(mby*4)*(f->mbw*4)+mbx*4-1] == 0xff)
+         have_left = 0;
+   }
    (void)cgw;
       if(mb_type==0 && t8ena && rh264_u1(b)){
          /* I_NxN with the 8x8 transform: four 8x8 predictions, CAVLC
@@ -2454,7 +2507,7 @@ static int rh264_decode_intra_mb_cavlc(rh264_bits *b, rh264_frame *f,
                  f->i4mode[(cgy+cy)*gw+cgx+cx]=(uint8_t)predm; }
          }
          chroma_mode=rh264_ue(b);
-         cbp=rh264_ue(b); if(cbp>=48)return -3; cbp=rh264_cbp_intra[cbp];
+         cbp=rh264_ue(b); if((unsigned)cbp>=48)return -3; cbp=rh264_cbp_intra[cbp];
          cbp_luma=cbp&15; cbp_chroma=cbp>>4;
          if(cbp_luma||cbp_chroma){ int d=rh264_se(b);
             if(rh264_qp_apply_delta(f,d)) return -1; }
@@ -2496,19 +2549,21 @@ static int rh264_decode_intra_mb_cavlc(rh264_bits *b, rh264_frame *f,
             int la= (bx>0||have_left)? f->i4mode[gy*gw+(gx-1)] : -1;
             int ta= (by>0||have_up)?   f->i4mode[(gy-1)*gw+gx] : -1;
             int mpm;
-            /* 0xff marks an inter-coded neighbour: per 8.3.1.1 (with
-             * constrained_intra_pred_flag == 0) it contributes Intra_4x4 mode
-             * 2 (DC) to the most-probable-mode derivation, whereas a neighbour
-             * off the frame/slice edge is unavailable (-1 -> forces DC). */
-            if(la==0xff) la=2;
-            if(ta==0xff) ta=2;
+            /* 0xff marks an inter-coded neighbour.  It contributes
+             * Intra_4x4 mode 2 (DC) to the most-probable-mode
+             * derivation, unless the picture forbids predicting from
+             * inter samples, when it counts as unavailable instead
+             * (8.3.1.1).  A neighbour off the frame or slice edge is
+             * unavailable either way (-1 -> forces DC). */
+            if(la==0xff) la = f->constrained_intra ? -1 : 2;
+            if(ta==0xff) ta = f->constrained_intra ? -1 : 2;
             if(la<0||ta<0) mpm=2; else mpm=(la<ta?la:ta);
             if(prev) predm=mpm;
             else { int rem=rh264_un(b,3); predm=(rem<mpm)?rem:rem+1; }
             modes[i]=predm; f->i4mode[gy*gw+gx]=(uint8_t)predm;
          }
          chroma_mode=rh264_ue(b);
-         cbp=rh264_ue(b); if(cbp>=48)return -3; cbp=rh264_cbp_intra[cbp];
+         cbp=rh264_ue(b); if((unsigned)cbp>=48)return -3; cbp=rh264_cbp_intra[cbp];
          cbp_luma=cbp&15; cbp_chroma=cbp>>4;
          if(cbp_luma||cbp_chroma){ int d=rh264_se(b);
             if(rh264_qp_apply_delta(f,d)) return -1; }
@@ -2631,6 +2686,16 @@ static int rh264_decode_intra_mb_cavlc(rh264_bits *b, rh264_frame *f,
          rh264_intra_chroma_h(v,f->cstride,chroma_mode,have_up,have_left,f->cmbh);
          if(cbp_chroma){ if(rh264_decode_chroma_residual(b,f,mbx,mby,u,v,
                cbp_chroma,slice_first,0)<0)return -1; }
+         /* an uncoded chroma block still has a coefficient count - zero -
+          * and the neighbouring blocks' nC derivation (9.2.1) reads it.
+          * The other intra branches record it; without this the counts
+          * of whatever macroblock previously occupied this address are
+          * read instead, which after an IDR is the freshly cleared grid
+          * (zero, coincidentally right) but on any later picture is the
+          * previous picture's counts. */
+         if(!cbp_chroma){ int cx,cy; for (cy = 0; cy < f->cmbh/4; cy++)for(cx=0;cx<2;cx++){
+            f->nzC[0][(mby*(f->cmbh/4)+cy)*cgw+mbx*2+cx]=0;
+            f->nzC[1][(mby*(f->cmbh/4)+cy)*cgw+mbx*2+cx]=0; } }
       }
       else if(mb_type==25){
          /* I_PCM: byte-align (pcm_alignment_zero_bit), then the raw
@@ -3850,6 +3915,7 @@ static int rh264_decode_pslice(rh264_bits *b, const rh264_sps *sps,
    int gi;
    f->qp = sh->slice_qp;
    f->chroma_qp_offset = pps->chroma_qp_index_offset;
+   f->constrained_intra = pps->constrained_intra_pred_flag;
    f->chroma_qp_offset2 = pps->chroma_qp_index_offset2;
    (void)sps;
    if (nrefs < 1) return -1;
@@ -3876,8 +3942,8 @@ static int rh264_decode_pslice(rh264_bits *b, const rh264_sps *sps,
    {
       memset(f->nzL, 0, (size_t)gw * f->mbh * 4);
       memset(f->mbt8, 0, (size_t)f->mbw * f->mbh);
-      memset(f->nzC[0], 0, (size_t)cgw * f->mbh * 2);
-      memset(f->nzC[1], 0, (size_t)cgw * f->mbh * 2);
+      memset(f->nzC[0], 0, (size_t)cgw * f->mbh * (f->cmbh/4));
+      memset(f->nzC[1], 0, (size_t)cgw * f->mbh * (f->cmbh/4));
       memset(f->i4mode, 0xff, (size_t)gw * f->mbh * 4);
    }
 
@@ -4023,7 +4089,7 @@ static int rh264_decode_pslice(rh264_bits *b, const rh264_sps *sps,
 
          /* coded_block_pattern */
          cbp = rh264_ue(b);
-         if (cbp >= 48) { return -3; }
+         if ((unsigned)cbp >= 48) { return -3; }
          cbp = rh264_cbp_inter[cbp];
          cbp_luma = cbp & 15; cbp_chroma = cbp >> 4;
          /* transform_size_8x8_flag sits between the cbp and mb_qp_delta
@@ -4605,6 +4671,7 @@ static int rh264_decode_bslice(rh264_bits *b, const rh264_sps *sps,
    int gi;
    f->qp = sh->slice_qp;
    f->chroma_qp_offset = pps->chroma_qp_index_offset;
+   f->constrained_intra = pps->constrained_intra_pred_flag;
    f->chroma_qp_offset2 = pps->chroma_qp_index_offset2;
    (void)sps;
    if (bc->n0 < 1 || bc->n1 < 1) return -1;
@@ -4620,8 +4687,8 @@ static int rh264_decode_bslice(rh264_bits *b, const rh264_sps *sps,
    {
       memset(f->nzL, 0, (size_t)gw * f->mbh * 4);
       memset(f->mbt8, 0, (size_t)f->mbw * f->mbh);
-      memset(f->nzC[0], 0, (size_t)cgw * f->mbh * 2);
-      memset(f->nzC[1], 0, (size_t)cgw * f->mbh * 2);
+      memset(f->nzC[0], 0, (size_t)cgw * f->mbh * (f->cmbh/4));
+      memset(f->nzC[1], 0, (size_t)cgw * f->mbh * (f->cmbh/4));
       memset(f->i4mode, 0xff, (size_t)gw * f->mbh * 4);
    }
 
@@ -4657,6 +4724,12 @@ static int rh264_decode_bslice(rh264_bits *b, const rh264_sps *sps,
          return -1;
       prev_skipped = 0;
       mb_type = rh264_ue(b);
+      /* B mb_type is 0..22 for the inter types and 23..48 for the intra
+       * ones (Table 7-14).  An over-long code returns 0xFFFFFFFF from
+       * rh264_ue, which lands in the int as -1: too small for the intra
+       * branch below, but accepted by the mb_type <= 3 case, where it
+       * indexes rh264_b_pdir16[-1]. */
+      if ((unsigned)mb_type > 48) return -3;
 
       if (mb_type >= 23)
       {
@@ -4754,7 +4827,7 @@ static int rh264_decode_bslice(rh264_bits *b, const rh264_sps *sps,
             for (p = 0; p < 4; p++)
             {
                sub[p] = rh264_ue(b);
-               if (sub[p] > 12) return -3;
+               if ((unsigned)sub[p] > 12) return -3;
                if (rh264_b_sub_pdir[sub[p]] == 3) need_prepare = 1;
             }
             t8ok = 1;
@@ -4865,7 +4938,7 @@ static int rh264_decode_bslice(rh264_bits *b, const rh264_sps *sps,
          }
 
          cbp = rh264_ue(b);
-         if (cbp >= 48) return -3;
+         if ((unsigned)cbp >= 48) return -3;
          cbp = rh264_cbp_inter[cbp];
          cbp_luma = cbp & 15; cbp_chroma = cbp >> 4;
          /* transform_size_8x8_flag sits between the cbp and mb_qp_delta
@@ -5170,6 +5243,22 @@ static int rh264_decode_islice(rh264_bits *b,const rh264_sps *sps,
    f->qp=sh->slice_qp;
    f->chroma_qp_offset=pps->chroma_qp_index_offset;
    f->chroma_qp_offset2=pps->chroma_qp_index_offset2;
+   /* the coefficient/mode context describes the picture being decoded; a
+    * continuation slice must keep what earlier slices of it produced.
+    * The P/B decoders reset it the same way; here the IDR path had it
+    * covered by the caller's frame reset, but a non-IDR I picture
+    * arrives with the previous picture's context - in particular its
+    * 8x8-transform flags, which the intra branches only ever set, and
+    * which steer the deblocking edge set (8.7). */
+   if (sh->first_mb_in_slice == 0)
+   {
+      int gw2=f->mbw*4, cgw2=f->mbw*2;
+      memset(f->nzL, 0, (size_t)gw2 * f->mbh * 4);
+      memset(f->mbt8, 0, (size_t)f->mbw * f->mbh);
+      memset(f->nzC[0], 0, (size_t)cgw2 * f->mbh * (f->cmbh/4));
+      memset(f->nzC[1], 0, (size_t)cgw2 * f->mbh * (f->cmbh/4));
+      memset(f->i4mode, 0xff, (size_t)gw2 * f->mbh * 4);
+   }
    while(mbaddr<total){
       int mbx, mby;
       int mb_type;
@@ -6405,12 +6494,13 @@ static int rh264_cabac_decode_mb_ctx(rh264_cabac *cb, const rh264_sps *sps,
            else mA=-1;
            if (by>0||have_up) mB=f->i4mode[(gy0+by-1)*gw+(gx0+bx)];
            else mB=-1;
-           /* An inter neighbour (0xff) contributes Intra_4x4 DC to the most
-            * probable mode per 8.3.1.1 when constrained_intra_pred_flag is 0.
-            * Only reachable from a P slice; in an I slice every neighbour is
-            * intra. */
-           if (mA==0xff) mA=2;
-           if (mB==0xff) mB=2;
+           /* An inter neighbour (0xff) contributes Intra_4x4 DC to the
+            * most probable mode, or counts as unavailable where the
+            * picture forbids predicting from inter samples (8.3.1.1).
+            * Only reachable from a P slice; in an I slice every
+            * neighbour is intra. */
+           if (mA==0xff) mA = f->constrained_intra ? -1 : 2;
+           if (mB==0xff) mB = f->constrained_intra ? -1 : 2;
            if (mA<0||mB<0) predmode=2; /* DC */
            else predmode=(mA<mB?mA:mB);
          }
@@ -6527,7 +6617,7 @@ static int rh264_cabac_decode_mb_ctx(rh264_cabac *cb, const rh264_sps *sps,
            { int yy,xx; for(yy=0;yy<4;yy++)for(xx=0;xx<4;xx++){
               int val=d[yy*f->cstride+xx]+((r[yy*4+xx]+32)>>6);
               d[yy*f->cstride+xx]=(uint8_t)RH264_CLIP(val);} }
-           f->nzC[comp][(mby*2+by)*cgw+(mbx*2+bx)]=cur->cAC[comp][blk];
+           f->nzC[comp][(mby*(f->cmbh/4)+by)*cgw+(mbx*2+bx)]=cur->cAC[comp][blk];
         }
      }
    }
@@ -6569,6 +6659,7 @@ static int rh264_cabac_decode_islice(rh264_bits *b, const rh264_sps *sps,
    rh264_cabac_init_contexts(&cb, sh->slice_qp, -1);
    f->qp = sh->slice_qp;
    f->chroma_qp_offset = pps->chroma_qp_index_offset;
+   f->constrained_intra = pps->constrained_intra_pred_flag;
    f->chroma_qp_offset2 = pps->chroma_qp_index_offset2;
 
    /* per-MB cbf caches: a full row for 'up', plus 'left' tracking */
@@ -6931,7 +7022,7 @@ static void rh264_cabac_p_residual(rh264_cabac *cb, rh264_frame *f,
               for (k = 0; k < 15; k++) ac[sc[k+1]] = scan[k]; }
          }
          cur->cAC[comp][blk] = nz ? 1 : 0;
-         f->nzC[comp][(mby*2+by)*cgw + mbx*2+bx] = (uint8_t)(nz ? 1 : 0);
+         f->nzC[comp][(mby*(f->cmbh/4)+by)*cgw + mbx*2+bx] = (uint8_t)(nz ? 1 : 0);
          ac[0] = cdc[comp][blk];
          rh264_dequant4x4(ac, rh264_chroma_qp(f->qp,
                comp?f->chroma_qp_offset2:f->chroma_qp_offset), 1,
@@ -6969,6 +7060,7 @@ static int rh264_cabac_decode_pslice(rh264_bits *b, const rh264_sps *sps,
    rh264_cabac_init_contexts(&cb, sh->slice_qp, sh->cabac_init_idc);
    f->qp = sh->slice_qp;
    f->chroma_qp_offset = pps->chroma_qp_index_offset;
+   f->constrained_intra = pps->constrained_intra_pred_flag;
    f->chroma_qp_offset2 = pps->chroma_qp_index_offset2;
    (void)sps;
    if (nrefs < 1) return -1;
@@ -6981,8 +7073,8 @@ static int rh264_cabac_decode_pslice(rh264_bits *b, const rh264_sps *sps,
    if (sh->first_mb_in_slice == 0)
    {
       memset(f->nzL, 0, (size_t)gw * mbh * 4);
-      memset(f->nzC[0], 0, (size_t)cgw * mbh * 2);
-      memset(f->nzC[1], 0, (size_t)cgw * mbh * 2);
+      memset(f->nzC[0], 0, (size_t)cgw * mbh * (f->cmbh/4));
+      memset(f->nzC[1], 0, (size_t)cgw * mbh * (f->cmbh/4));
       memset(f->i4mode, 0xff, (size_t)gw * mbh * 4);
       memset(f->mbt8, 0, (size_t)mbw * mbh);
    }
@@ -7284,7 +7376,9 @@ static int rh264_cabac_decode_pslice(rh264_bits *b, const rh264_sps *sps,
                   prevQpNZ = (dqp != 0);
                }
                else prevQpNZ = 0;
-               if (rh264_qp_apply_delta(f, dqp)) return -1;
+               if (rh264_qp_apply_delta(f, dqp))
+               { free(toprow); free(topskip);
+                 free(row); free(skiprow); free(absmvd); return -1; }
             }
 
             rh264_cabac_p_residual(&cb, f, mbx, mby, cbp_luma, cbp_chroma,
@@ -7426,6 +7520,7 @@ static int rh264_cabac_decode_bslice(rh264_bits *b, const rh264_sps *sps,
    rh264_cabac_init_contexts(&cb, sh->slice_qp, sh->cabac_init_idc);
    f->qp = sh->slice_qp;
    f->chroma_qp_offset = pps->chroma_qp_index_offset;
+   f->constrained_intra = pps->constrained_intra_pred_flag;
    f->chroma_qp_offset2 = pps->chroma_qp_index_offset2;
    (void)sps;
    if (bc->n0 < 1 || bc->n1 < 1) return -1;
@@ -7438,8 +7533,8 @@ static int rh264_cabac_decode_bslice(rh264_bits *b, const rh264_sps *sps,
    if (sh->first_mb_in_slice == 0)
    {
       memset(f->nzL, 0, (size_t)gw * mbh * 4);
-      memset(f->nzC[0], 0, (size_t)cgw * mbh * 2);
-      memset(f->nzC[1], 0, (size_t)cgw * mbh * 2);
+      memset(f->nzC[0], 0, (size_t)cgw * mbh * (f->cmbh/4));
+      memset(f->nzC[1], 0, (size_t)cgw * mbh * (f->cmbh/4));
       memset(f->i4mode, 0xff, (size_t)gw * mbh * 4);
       memset(f->mbt8, 0, (size_t)mbw * mbh);
    }
@@ -7904,7 +7999,10 @@ static int rh264_cabac_decode_bslice(rh264_bits *b, const rh264_sps *sps,
                   prevQpNZ = (dqp != 0);
                }
                else prevQpNZ = 0;
-               if (rh264_qp_apply_delta(f, dqp)) return -1;
+               if (rh264_qp_apply_delta(f, dqp))
+               { free(toprow); free(topskip); free(toptype);
+                 free(row); free(skiprow); free(typerow); free(am0);
+                 free(am1); return -1; }
             }
 
             rh264_cabac_p_residual(&cb, f, mbx, mby, cbp_luma, cbp_chroma,
