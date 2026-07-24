@@ -46,6 +46,14 @@
  * Sergii "iOrange" Kudlai, released into the public domain
  * (MIT / The Unlicense). See https://github.com/iOrange/bcdec .
  *
+ * Uncompressed images are accepted when mask-described (DDPF_RGB or
+ * DDPF_LUMINANCE) at 24 or 32 bits per pixel with arbitrary channel
+ * masks.
+ *
+ * What it does not implement: mip levels beyond 0, cubemap and volume
+ * surfaces, texture arrays, 16-bit-packed and palettised uncompressed
+ * formats, YUV/float non-BC formats, and encoding.
+ *
  * NOTE (endianness): all on-disk block and header fields are read
  * through explicit little-endian accessors, so decoding is byte-for-byte
  * identical on little- and big-endian hosts (verified on ppc/Wii-class
@@ -1515,9 +1523,24 @@ static bool rdds_parse_header(const uint8_t *data, size_t len,
 
    if (out->width == 0 || out->height == 0)
       return false;
-   /* Guard the malloc size (width*height*4) against overflow. */
-   if (out->width  > 0x7fffu || out->height > 0x7fffu)
-      return false;
+   /* Guard the malloc size (width*height*4) against overflow.
+    *
+    * DDS dimensions are 32-bit header fields, so their product times
+    * four can overflow even a 64-bit size_t and has to be checked
+    * rather than merely widened.  Check the product by dividing,
+    * though, rather than capping each side: a per-side ceiling of
+    * 0x7fff refuses a 32768x8192 surface that decodes to only 1 GiB,
+    * while admitting 32767x32767 at 4 GiB - it bounds the wrong
+    * quantity.  Rejecting only what cannot be addressed on this host
+    * lets the allocation decide, and a request malloc cannot satisfy
+    * fails there, which the caller already handles.  On a 32-bit host
+    * this is the same wrap guard the old constant approximated, now
+    * exact. */
+   {
+      size_t max_px = (size_t)-1 / sizeof(uint32_t);
+      if ((size_t)out->width > max_px / (size_t)out->height)
+         return false;
+   }
 
    if (pf_flags & RDDS_DDPF_FOURCC)
    {

@@ -535,6 +535,28 @@ bool image_transfer_is_10bit(void *data, enum image_type_enum type)
    return false;
 }
 
+bool image_transfer_need_more(void *data, enum image_type_enum type)
+{
+   switch (type)
+   {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         return rpng_need_more((const rpng_t*)data);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_JPEG:
+#ifdef HAVE_RJPEG
+         return rjpeg_need_more((const rjpeg_t*)data);
+#else
+         break;
+#endif
+      default:
+         break;
+   }
+   return false;
+}
+
 bool image_transfer_iterate(void *data, enum image_type_enum type)
 {
 
@@ -584,6 +606,16 @@ void image_transfer_set_avail(void *data, enum image_type_enum type,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         rpng_set_avail((rpng_t*)data, avail);
+#endif
+         break;
+      case IMAGE_TYPE_JPEG:
+#ifdef HAVE_RJPEG
+         rjpeg_set_avail((rjpeg_t*)data, avail);
+#endif
+         break;
       case IMAGE_TYPE_WEBM:
 #ifdef HAVE_RWEBM
          rwebm_video_set_avail((rwebm_video_t*)data, avail);
@@ -604,6 +636,11 @@ void image_transfer_anim_stream_set_avail(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         rpng_apng_stream_set_avail((rpng_apng_stream_t*)stream, avail);
+#endif
+         break;
       case IMAGE_TYPE_WEBM:
 #ifdef HAVE_RWEBM
          rwebm_video_stream_set_avail((rwebm_video_stream_t*)stream,
@@ -621,9 +658,58 @@ void image_transfer_anim_stream_set_avail(void *stream,
    }
 }
 
-void image_transfer_anim_stream_complete_scan(void *stream,
-      enum image_type_enum type, const void *buf, size_t len)
+size_t image_transfer_anim_stream_media_floor(void *stream,
+      enum image_type_enum type)
 {
+   switch (type)
+   {
+      case IMAGE_TYPE_WEBM:
+#ifdef HAVE_RWEBM
+         return rwebm_video_stream_media_floor(
+               (rwebm_video_stream_t*)stream);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_MP4:
+#ifdef HAVE_RMP4
+         return rmp4_video_stream_media_floor(
+               (rmp4_video_stream_t*)stream);
+#else
+         break;
+#endif
+      default:
+         break;
+   }
+   return 0;
+}
+
+size_t image_transfer_anim_stream_consumed(void *stream,
+      enum image_type_enum type)
+{
+   switch (type)
+   {
+      case IMAGE_TYPE_WEBM:
+#ifdef HAVE_RWEBM
+         return rwebm_video_stream_consumed(
+               (rwebm_video_stream_t*)stream);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_MP4:
+#ifdef HAVE_RMP4
+         return rmp4_video_stream_consumed(
+               (rmp4_video_stream_t*)stream);
+#else
+         break;
+#endif
+      default:
+         break;
+   }
+   return 0;
+}
+
+void image_transfer_anim_stream_complete_scan(void *stream,
+      enum image_type_enum type, const void *buf, size_t len){
    switch (type)
    {
       case IMAGE_TYPE_WEBM:
@@ -646,6 +732,12 @@ bool image_transfer_anim_stream_set_argb(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         return rpng_apng_stream_set_argb((rpng_apng_stream_t*)stream, argb);
+#else
+         break;
+#endif
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          rwebp_anim_stream_set_argb((rwebp_anim_stream_t*)stream, argb);
@@ -790,6 +882,14 @@ void *image_transfer_anim_stream_new(void *buf, size_t len,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         /* APNG: returns NULL for a still PNG, which the caller reads
+          * as "not animated" and keeps its static path. */
+         return rpng_apng_stream_open((const uint8_t*)buf, len);
+#else
+         break;
+#endif
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          return rwebp_anim_stream_open((const uint8_t*)buf, len);
@@ -814,11 +914,52 @@ void *image_transfer_anim_stream_new(void *buf, size_t len,
    return NULL;
 }
 
-void image_transfer_anim_stream_free(void *stream,
-      enum image_type_enum type)
+void *image_transfer_anim_stream_new_avail(void *buf, size_t len,
+      size_t avail, enum image_type_enum type, int *need_more)
 {
+   if (need_more)
+      *need_more = 0;
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         return rpng_apng_stream_open_avail((const uint8_t*)buf, len,
+               avail, need_more);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_WEBM:
+#ifdef HAVE_RWEBM
+         return rwebm_video_stream_open_avail((const uint8_t*)buf, len,
+               avail, need_more);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_MP4:
+#ifdef HAVE_RMP4
+         return rmp4_video_stream_open_avail((const uint8_t*)buf, len,
+               avail, need_more);
+#else
+         break;
+#endif
+      /* Animated WEBP has no partial-buffer open (and is small enough
+       * that windowing it buys nothing); callers fall back to the
+       * whole-buffer path for it. */
+      default:
+         break;
+   }
+   return NULL;
+}
+
+void image_transfer_anim_stream_free(void *stream,
+      enum image_type_enum type){
+   switch (type)
+   {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         rpng_apng_stream_close((rpng_apng_stream_t*)stream);
+#endif
+         break;
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          rwebp_anim_stream_close((rwebp_anim_stream_t*)stream);
@@ -845,6 +986,12 @@ void image_transfer_anim_stream_get_info(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         rpng_apng_stream_get_info((const rpng_apng_stream_t*)stream,
+               width, height, num_frames, loop_count);
+#endif
+         break;
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          rwebp_anim_stream_get_info((const rwebp_anim_stream_t*)stream,
@@ -873,6 +1020,13 @@ const uint32_t *image_transfer_anim_stream_next(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         return rpng_apng_stream_next((rpng_apng_stream_t*)stream,
+               duration_ms);
+#else
+         break;
+#endif
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          return rwebp_anim_stream_next((rwebp_anim_stream_t*)stream,
@@ -905,6 +1059,11 @@ void image_transfer_anim_stream_rewind(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         rpng_apng_stream_rewind((rpng_apng_stream_t*)stream);
+#endif
+         break;
       case IMAGE_TYPE_WEBP:
 #ifdef HAVE_RWEBP
          rwebp_anim_stream_rewind((rwebp_anim_stream_t*)stream);

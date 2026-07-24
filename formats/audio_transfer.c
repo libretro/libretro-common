@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <file/file_path.h>
 #include <formats/audio.h>
 #include <compat/strcasestr.h>
 #include <string/stdstring.h>
@@ -141,20 +142,33 @@ struct audio_transfer_mod
 
 enum audio_type_enum audio_decode_get_type(const char *path)
 {
-   if (string_is_empty(path))
+   /* The extension, not a substring of the path.
+    *
+    * This searched the whole path for ".flac" and the rest, so a track
+    * living under a directory called ".flac_backups" was decoded as
+    * FLAC whatever it actually was, and "song.ogg.bak" was decoded as
+    * Vorbis.  Both are the sort of path that turns up in a music
+    * folder rather than a contrived one.
+    *
+    * Comparing the extension also removes the ordering dependency the
+    * substring form had, where a path matching two of these took
+    * whichever was tested first rather than whichever it ends with. */
+   const char *ext = path_get_extension(path);
+
+   if (string_is_empty(ext))
       return AUDIO_TYPE_NONE;
-   if (strcasestr(path, ".flac"))
+   if (string_is_equal_noncase(ext, "flac"))
       return AUDIO_TYPE_FLAC;
-   if (strcasestr(path, ".ogg"))
+   if (string_is_equal_noncase(ext, "ogg"))
       return AUDIO_TYPE_VORBIS;
-   if (strcasestr(path, ".mp3"))
+   if (string_is_equal_noncase(ext, "mp3"))
       return AUDIO_TYPE_MP3;
-   if (strcasestr(path, ".wav"))
+   if (string_is_equal_noncase(ext, "wav"))
       return AUDIO_TYPE_WAV;
 #ifdef HAVE_RMODTRACKER
-   if (     strcasestr(path, ".mod")
-         || strcasestr(path, ".s3m")
-         || strcasestr(path, ".xm"))
+   if (     string_is_equal_noncase(ext, "mod")
+         || string_is_equal_noncase(ext, "s3m")
+         || string_is_equal_noncase(ext, "xm"))
       return AUDIO_TYPE_MOD;
 #endif
    return AUDIO_TYPE_NONE;
@@ -190,6 +204,10 @@ struct audio_transfer_opus
    unsigned    seg_count;
    size_t      audio_off;    /* first audio page (for rewind)            */
    int64_t     limit;        /* emission bound from the end granule      */
+   int64_t     end_granule;  /* injected last-page granule (windowed
+                              * mode): >= 0 means use it as the emission
+                              * bound instead of scanning to EOF at open;
+                              * -1 means do the full forward scan. */
    int64_t     emitted;      /* frames handed out so far                 */
    uint8_t     asm_buf[61500]; /* only for packets spanning pages        */
    ropus_t    *handle;
@@ -364,8 +382,9 @@ void audio_transfer_set_buffer_ptr(void *data, enum audio_type_enum type,
          struct audio_transfer_opus *op = (struct audio_transfer_opus*)data;
          if (op)
          {
-            op->buf      = (const uint8_t*)ptr;
-            op->buf_size = len;
+            op->buf         = (const uint8_t*)ptr;
+            op->buf_size    = len;
+            op->end_granule = -1;   /* full scan unless injected */
          }
          break;
       }
@@ -662,6 +681,19 @@ bool audio_transfer_set_demuxed_ptr(void *data, enum audio_type_enum type,
    (void)packets; (void)packets_size; (void)sizes; (void)num_packets;
    return false;
 }
+
+#ifdef HAVE_ROPUS
+/* Windowed Opus: inject the last Ogg page's granule so buffer setup
+ * skips the full-file end-granule scan (see audio_transfer_opus's
+ * end_granule).  No-op for any other type.  Must be called after
+ * set_buffer_ptr and before audio_transfer_start. */
+void audio_transfer_set_end_granule(void *data, enum audio_type_enum type,
+      int64_t end_granule)
+{
+   if (data && type == AUDIO_TYPE_OPUS)
+      ((struct audio_transfer_opus*)data)->end_granule = end_granule;
+}
+#endif
 
 enum audio_type_enum audio_transfer_ogg_audio_type(const void *buf,
       size_t len)
@@ -1007,8 +1039,14 @@ bool audio_transfer_start(void *data, enum audio_type_enum type)
             op->pg_off    = off;
             op->seg_idx   = 0;
             op->body_off  = 0;
-            /* end granule: walk the remaining pages once */
-            while (off < op->buf_size)
+            /* End granule: normally walk the remaining page headers
+             * once to the last granule.  In windowed mode the tail is
+             * not resident, so the feeder injected the last-page
+             * granule (found from a bounded tail peek) - use it and
+             * skip the walk, which would read past the head window. */
+            if (op->end_granule >= 0)
+               last_granule = op->end_granule;
+            else while (off < op->buf_size)
             {
                size_t psz = audio_transfer_ogg_page(op->buf, op->buf_size,
                      off, NULL, NULL);
@@ -1874,6 +1912,20 @@ size_t audio_transfer_buffer_tell(void *data, enum audio_type_enum type)
          return 0;
       }
 #endif
+#ifdef HAVE_RFLAC
+      case AUDIO_TYPE_FLAC:
+      {
+         struct audio_transfer_flac *fl =
+               (struct audio_transfer_flac*)data;
+         /* the raw read cursor runs slightly ahead of the decode
+          * position through bitstream caching, which is the safe
+          * side for a feeder: bytes behind it are never re-read
+          * (the loop jump lands in the kept head) */
+         if (fl->handle)
+            return (size_t)fl->handle->memoryStream.currentReadPos;
+         return 0;
+      }
+#endif
 #ifdef HAVE_RMP3
       case AUDIO_TYPE_MP3:
       {
@@ -1881,6 +1933,38 @@ size_t audio_transfer_buffer_tell(void *data, enum audio_type_enum type)
                (struct audio_transfer_mp3*)data;
          if (m->inited)
             return (size_t)m->handle.readPos;
+         return 0;
+      }
+#endif
+#ifdef HAVE_ROPUS
+      case AUDIO_TYPE_OPUS:
+      {
+         struct audio_transfer_opus *op =
+               (struct audio_transfer_opus*)data;
+         /* Ogg buffer mode walks pages forward from the caller's
+          * buffer; pg_off is the current page's byte offset, the
+          * compressed frontier the feeder needs.  The demuxed (WebM)
+          * and set_demuxed_ptr paths read a packet blob, not the
+          * caller's buffer, so they expose no windowable cursor. */
+         if (op->handle && op->ogg)
+            return op->pg_off;
+         return 0;
+      }
+#endif
+#ifdef HAVE_RAAC
+      case AUDIO_TYPE_AAC:
+      {
+         struct audio_transfer_aac *ac =
+               (struct audio_transfer_aac*)data;
+         /* Only the ADTS buffer path walks the caller's buffer
+          * linearly; adts_pos is the next frame's byte offset, i.e.
+          * the compressed frontier the feeder needs.  The demuxed
+          * (MP4/M4A) and set_demuxed_ptr paths read from the demuxer
+          * or a concatenated packet blob, not the caller's buffer, so
+          * they expose no windowable cursor - return 0, exactly as the
+          * vorbis synth/setup paths do. */
+         if (ac->handle && ac->adts)
+            return ac->adts_pos;
          return 0;
       }
 #endif

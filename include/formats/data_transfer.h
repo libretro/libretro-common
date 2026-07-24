@@ -53,20 +53,27 @@ RETRO_BEGIN_DECLS
 typedef struct data_transfer data_transfer_t;
 
 
-/* A growable buffer on the same reservation machinery as the prefix
- * reader: init reserves 'ceiling' bytes of address space (physical
- * pages only as ensure() commits them), so growth never copies, the
- * base never moves, and the buffer's cost is what it holds - no
- * doubling spikes, no over-allocation tail.  Where the platform
- * cannot reserve (or ceiling is 0), it degrades to realloc doubling,
- * and base may move across ensure(); callers must re-read base after
- * every ensure either way.  release() is idempotent. */
+/* A growable buffer.  ensure() makes at least 'need' bytes usable at
+ * base, growing by doubling; base may move, so callers must re-read it
+ * after every ensure.  The 'ceiling' passed to init is a hint about
+ * the eventual size and is otherwise ignored.  release() is
+ * idempotent.
+ *
+ * This used to reserve 'ceiling' bytes of address space and commit
+ * pages as it grew, on the theory that it avoided copies and kept the
+ * base stable.  Measured against plain doubling it was neither faster
+ * in the steady state (226-244 ms either way filling 64 MiB) nor
+ * lighter (+4288 vs +4292 KiB peak with 4 MiB touched of a 64 MiB
+ * ceiling): untouched pages of a fresh allocation are no more
+ * resident than uncommitted ones.  It cost a page-protection syscall
+ * per step and put VirtualAlloc/mmap/mprotect in a format module, so
+ * it went.  The cyclic window below still reserves, because there the
+ * alternative really is holding the whole file. */
 typedef struct data_transfer_arena
 {
    uint8_t *base;
-   size_t   committed;  /* bytes usable at base                     */
-   size_t   cap;        /* reservation ceiling / current allocation */
-   uint8_t  reserved;   /* 1: address-space reservation, stable base */
+   size_t   committed;  /* bytes usable at base    */
+   size_t   cap;        /* current allocation      */
 } data_transfer_arena_t;
 
 bool data_transfer_arena_init(data_transfer_arena_t *a, size_t ceiling);
@@ -82,12 +89,96 @@ bool data_transfer_arena_init(data_transfer_arena_t *a, size_t ceiling);
  * not memory.  Compile with DT_WINDOW_STRICT to make advanced-past
  * pages fault on touch instead of reading as zeros - the oracle's
  * proof that a consumer honours the sequential contract.  Platforms
- * without reservations fall back to holding the whole file. */
+ * without reservations fall back to holding the whole file.
+ *
+ * SINGLE OWNER, ONE THREAD.  A windowed transfer serves exactly one
+ * consumer, and every call on it - feed/advance/extend/rewind and
+ * every read of window_base() - belongs to that one owner.  This is a
+ * hard contract, not a convention: sharing one window between two
+ * consumers (the obvious way to serve audio and video from a single
+ * transfer) was measured and does not work.
+ *
+ * The reason is page lifetime, which no amount of refcounting fixes.
+ * feed() advances the window behind the consumer, and advancing
+ * decommits: MADV_DONTNEED, or PROT_NONE under DT_WINDOW_STRICT.  A
+ * second consumer trailing the first - audio behind video, the normal
+ * case - reads pages the feeder is releasing underneath it.  Keeping
+ * the struct alive keeps the struct alive; the pages still go.  Under
+ * STRICT that faults.  Without it the read silently returns zeros,
+ * which is worse: measured at 8-58 MB of zero-filled bytes per run,
+ * no crash, decoders consuming them as if they were file content.
+ *
+ * There is deliberately no accessor for the committed frontier (whi).
+ * A second consumer would need it to know which bytes are readable at
+ * all, and exposing it would make sharing look supportable when the
+ * decommit hazard above still stands.  Reading past the frontier hits
+ * reserved PROT_NONE address space and dies immediately - which is
+ * the intended outcome for code that should not be there.
+ *
+ * Two consumers wanting the same bytes should each hold their own
+ * transfer, or one should copy what the other needs.  The copy is
+ * cheap; sharing is a concurrency redesign whose failure mode is
+ * silent corruption. */
+/* A producer-backed transfer: the bytes come from a callback instead
+ * of a file - an archive entry inflating as it is pulled, or any
+ * other decoder producing sequential output.  The total length must
+ * be known up front (a ZIP central directory carries it), so the
+ * buffer is one exact malloc: plain memory the consumer can adopt
+ * and free(), with no reservation machinery - a loaded ROM lives for
+ * the whole session, so there is nothing to discard.  The callback
+ * writes up to the room remaining at dst and returns bytes produced
+ * (n is a pacing hint - producers with chunked granularity may
+ * overshoot it; dst always has room to the declared end), 0 at end
+ * of stream, negative on error.  iterate()'s byte budget and the
+ * completion/ownership surface behave exactly as for files, which is
+ * the point: a decoding producer becomes tick-sliceable the same way
+ * a raw read is. */
+typedef int64_t (*data_transfer_source_read_t)(void *ud, uint8_t *dst,
+      size_t n);
+data_transfer_t *data_transfer_open_source(size_t len,
+      data_transfer_source_read_t read_cb, void *ud);
+/* Detach the filled buffer from a source-mode transfer: returns the
+ * exact-size malloc'd data (caller frees) and frees the transfer.
+ * NULL unless the transfer completed successfully. */
+uint8_t *data_transfer_source_detach(data_transfer_t *dt, size_t *len);
+
 data_transfer_t *data_transfer_open_window(const char *path, size_t keep);
 const uint8_t *data_transfer_window_base(data_transfer_t *dt, size_t *len);
+/* True when the transfer is genuinely windowed - address space was
+ * reserved and only the window is committed.  False when the platform
+ * has no reservation and data_transfer_open_window degraded to holding
+ * the whole file, so a caller can charge admission against the window
+ * in the first case and against the file in the second. */
+bool data_transfer_window_is_reserved(data_transfer_t *dt);
+/* True when this build can reserve address space, i.e. when
+ * data_transfer_open_window will map a window rather than degrading to
+ * reading the whole file.  Lets a caller decide before opening whether
+ * the open is cheap (head only) or is going to slurp - the capability
+ * macro itself is private to data_transfer.c, so testing it outside
+ * would silently take the wrong branch. */
+bool data_transfer_reserve_supported(void);
 bool data_transfer_window_extend(data_transfer_t *dt, size_t hi);
 void data_transfer_window_advance(data_transfer_t *dt, size_t lo);
 void data_transfer_window_rewind(data_transfer_t *dt);
+/* Raise the permanently-resident head.  For codecs whose loop
+ * landing sits past metadata of unpredictable size (FLAC PICTURE
+ * blocks can push the first frame beyond any fixed head), the
+ * feeder grows the head to cover the decoder's start position once
+ * it is known - the loop must land on resident pages, because the
+ * jump happens on the audio thread before any feeder tick. */
+bool data_transfer_window_grow_keep(data_transfer_t *dt, size_t keep);
+/* Positioned read of file bytes into a caller buffer, touching no
+ * window state and committing no pages - for walking container
+ * metadata (FLAC block headers) to learn the layout before deciding
+ * what the head must cover. */
+bool data_transfer_window_peek(data_transfer_t *dt, size_t off,
+      void *dst, size_t n);
+/* Release an inert range inside the head - bytes the consumer will
+ * never revisit (a skipped PICTURE block between the stream info
+ * and the first frame).  Whole pages strictly inside (from, to)
+ * are decommitted; under DT_WINDOW_STRICT they fault on touch. */
+void data_transfer_window_punch(data_transfer_t *dt, size_t from,
+      size_t to);
 /* One-call feeder policy: keep [tell - margin, tell + lookahead)
  * resident, detecting a backwards tell as a loop.  Returns false on
  * an I/O failure (the consumer will hit the end-of-data wall). */

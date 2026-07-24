@@ -192,6 +192,15 @@ bool image_transfer_get_gpu_layout(
 
 bool image_transfer_iterate(void *data, enum image_type_enum type);
 
+/* True when the last image_transfer_iterate stopped because the decoder
+ * reached the resident byte frontier declared by
+ * image_transfer_set_avail, rather than because the image finished.
+ * Both cases return false from iterate, so a caller feeding a growing
+ * read MUST consult this before concluding the transfer is complete -
+ * treating a wall as completion decodes a partially-gathered image and
+ * fails.  Always false for types without an avail wall. */
+bool image_transfer_need_more(void *data, enum image_type_enum type);
+
 /* Video-to-image transfers (WEBM, MP4) keep their decoder stream open
  * after a successful image_transfer_process, positioned just past the
  * first displayed frame.  This takes ownership of that stream so the
@@ -246,6 +255,17 @@ const uint32_t *image_transfer_anim_get_frame(void *anim,
 void *image_transfer_anim_stream_new(void *buf, size_t len,
       enum image_type_enum type);
 
+/* Progressive open over a partially-resident buffer: only the first
+ * 'avail' bytes are guaranteed present.  On success the stream decodes
+ * forward as far as 'avail' allows; raise it with
+ * image_transfer_anim_stream_set_avail as more arrives.  need_more (may
+ * be NULL) is set when the header/index needed to open is not yet
+ * resident and a larger prefix should be retried.  Returns NULL for
+ * types without a partial open (animated WEBP), so the caller keeps
+ * the whole-buffer path for those. */
+void *image_transfer_anim_stream_new_avail(void *buf, size_t len,
+      size_t avail, enum image_type_enum type, int *need_more);
+
 void image_transfer_anim_stream_free(void *stream,
       enum image_type_enum type);
 
@@ -286,6 +306,17 @@ void image_transfer_set_avail(void *data, enum image_type_enum type,
  * No-op for types without a byte wall (animated WEBP). */
 void image_transfer_anim_stream_set_avail(void *stream,
       enum image_type_enum type, size_t avail);
+
+/* Bounded-memory streaming: media_floor is the fixed byte offset
+ * where media data begins; consumed is the monotonic high-water byte
+ * offset the decoder has read to.  A feeder keeps
+ * [media_floor, consumed + lookahead) resident and can free below the
+ * floor.  Both return 0 for a type with no byte cursor (animated
+ * WEBP), which a caller reads as "not windowable - keep whole". */
+size_t image_transfer_anim_stream_media_floor(void *stream,
+      enum image_type_enum type);
+size_t image_transfer_anim_stream_consumed(void *stream,
+      enum image_type_enum type);
 
 /* Companion to the above for WEBM, whose timestamp pre-scan is
  * truncated by the wall (timestamps live in the block headers): once
