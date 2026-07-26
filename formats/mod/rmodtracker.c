@@ -19,6 +19,7 @@
  * formats, stereo or compressed sample data, arbitrary seeking
  * (rewind restarts from the top), and MIDI-style external control.
  */
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -160,10 +161,18 @@ static int log_2( int x ) {
 	return y;
 }
 
+/* Every accessor below clamps the offset at both ends.
+ *
+ * The upper bound was always checked; the lower was not, and a negative
+ * offset sailed straight through "offset < data->length" into a read
+ * before the buffer. Offsets are computed from the file: the XM loader
+ * advances by a self-declared header size, so a module declaring
+ * 0x7FFFFFFF overflows the int and lands somewhere negative. Reject it
+ * here rather than at each of the places one can be produced. */
 static char* data_ascii( struct data *data, int offset, int length, char *dest ) {
 	int idx, chr;
 	memset( dest, 32, length );
-	if( offset > data->length ) {
+	if( offset < 0 || offset > data->length ) {
 		offset = data->length;
 	}
 	if( ( unsigned int ) offset + length > ( unsigned int ) data->length ) {
@@ -180,7 +189,7 @@ static char* data_ascii( struct data *data, int offset, int length, char *dest )
 
 static int data_s8( struct data *data, int offset ) {
 	int value = 0;
-	if( offset < data->length ) {
+	if( offset >= 0 && offset < data->length ) {
 		value = data->buffer[ offset ];
 		value = ( value & 0x7F ) - ( value & 0x80 );
 	}
@@ -189,7 +198,7 @@ static int data_s8( struct data *data, int offset ) {
 
 static int data_u8( struct data *data, int offset ) {
 	int value = 0;
-	if( offset < data->length ) {
+	if( offset >= 0 && offset < data->length ) {
 		value = data->buffer[ offset ] & 0xFF;
 	}
 	return value;
@@ -197,7 +206,7 @@ static int data_u8( struct data *data, int offset ) {
 
 static int data_u16be( struct data *data, int offset ) {
 	int value = 0;
-	if( offset + 1 < data->length ) {
+	if( offset >= 0 && offset + 1 < data->length ) {
 		value = ( ( data->buffer[ offset ] & 0xFF ) << 8 )
 			| ( data->buffer[ offset + 1 ] & 0xFF );
 	}
@@ -206,7 +215,7 @@ static int data_u16be( struct data *data, int offset ) {
 
 static int data_u16le( struct data *data, int offset ) {
 	int value = 0;
-	if( offset + 1 < data->length ) {
+	if( offset >= 0 && offset + 1 < data->length ) {
 		value = ( data->buffer[ offset ] & 0xFF )
 			| ( ( data->buffer[ offset + 1 ] & 0xFF ) << 8 );
 	}
@@ -215,7 +224,7 @@ static int data_u16le( struct data *data, int offset ) {
 
 static unsigned int data_u32le( struct data *data, int offset ) {
 	unsigned int value = 0;
-	if( offset + 3 < data->length ) {
+	if( offset >= 0 && offset + 3 < data->length ) {
 		value = ( data->buffer[ offset ] & 0xFF )
 			| ( ( data->buffer[ offset + 1 ] & 0xFF ) << 8 )
 			| ( ( data->buffer[ offset + 2 ] & 0xFF ) << 16 )
@@ -227,7 +236,7 @@ static unsigned int data_u32le( struct data *data, int offset ) {
 static void data_sam_s8( struct data *data, int offset, int count, short *dest ) {
 	int idx, amp, length = data->length;
 	char *buffer = data->buffer;
-	if( offset > length ) {
+	if( offset < 0 || offset > length ) {
 		offset = length;
 	}
 	if( offset + count > length ) {
@@ -242,7 +251,7 @@ static void data_sam_s8( struct data *data, int offset, int count, short *dest )
 static void data_sam_s16le( struct data *data, int offset, int count, short *dest ) {
 	int idx, amp, length = data->length;
 	char *buffer = data->buffer;
-	if( offset > length ) {
+	if( offset < 0 || offset > length ) {
 		offset = length;
 	}
 	if( offset + count * 2 > length ) {
@@ -982,7 +991,10 @@ static void channel_init( struct channel *channel, struct replay *replay, int id
 	channel->panning = replay->module->default_panning[ idx ];
 	channel->instrument = &replay->module->instruments[ 0 ];
 	channel->sample = &channel->instrument->samples[ 0 ];
-	channel->random_seed = ( idx + 1 ) * 0xABCDEF;
+	/* Unsigned: the channel count comes from the file and is not
+	 * clamped, and this overflows a signed int from 191 channels up.
+	 * It is a seed, so wrapping is fine - being undefined is not. */
+	channel->random_seed = ( int ) ( ( ( unsigned int ) idx + 1u ) * 0xABCDEFu );
 }
 
 static void channel_volume_slide( struct channel *channel ) {
@@ -1094,7 +1106,11 @@ static int channel_waveform( struct channel *channel, int phase, int type ) {
 			break;
 		case 3: case 8: /* Random. */
 			amplitude = ( channel->random_seed >> 20 ) - 255;
-			channel->random_seed = ( channel->random_seed * 65 + 17 ) & 0x1FFFFFFF;
+			/* Masked to 0x1FFFFFFF, so the multiply below overflows a
+			 * signed int before the mask ever runs. Wrapping is the
+			 * intent of an LCG; undefined behaviour is not. */
+			channel->random_seed = ( int ) ( ( ( unsigned int )
+					channel->random_seed * 65u + 17u ) & 0x1FFFFFFFu );
 			break;
 	}
 	return amplitude;
@@ -1297,13 +1313,19 @@ static void channel_calculate_freq( struct channel *channel ) {
 		if( per < 28 || per > 7680 ) {
 			per = 7680;
 		}
+		/* FP_ONE is 1 << FP_SHIFT, so this is the same value for a
+		 * non-negative operand and defined for a negative one - and
+		 * 4608 - per is negative for any period above 4608. */
 		channel->freq = ( ( channel->replay->module->c2_rate >> 4 )
-			* exp_2( ( ( 4608 - per ) << FP_SHIFT ) / 768 ) ) >> ( FP_SHIFT - 4 );
+			* exp_2( ( ( 4608 - per ) * FP_ONE ) / 768 ) ) >> ( FP_SHIFT - 4 );
 	} else {
 		if( per > 29021 ) {
 			per = 29021;
 		}
-		per = ( per << FP_SHIFT ) / exp_2( ( channel->arpeggio_add << FP_SHIFT ) / 12 );
+		/* per is only clamped from above here; vibrato can carry it
+		 * below zero, and the "per < 28" guard underneath runs after
+		 * this line rather than before it. */
+		per = ( per * FP_ONE ) / exp_2( ( channel->arpeggio_add * FP_ONE ) / 12 );
 		if( per < 28 ) {
 			per = 29021;
 		}
@@ -1950,11 +1972,48 @@ static int calculate_mix_buf_len( int sample_rate ) {
 }
 
 /* Returns the song duration in samples at the current sampling rate. */
+/* Advance the sequencer to sample_pos without mixing, returning the
+ * position actually reached - the last tick boundary at or before it.
+ * A tracker has no seek table and no keyframes: where it is at a given
+ * moment is the result of every row that came before, so the only way
+ * to arrive somewhere is to go through the song.  What can be skipped
+ * is the mixing, which is nearly all of the cost; the sequencer walk is
+ * the same one replay_calculate_duration makes, and each channel's
+ * sample position is carried forward by the same helper the mixer uses
+ * for a channel it is not rendering. */
+static int replay_seek( struct replay *replay, int sample_pos ) {
+	int idx, tick_len, current_pos = 0;
+	replay_set_sequence_pos( replay, 0 );
+	tick_len = calculate_tick_len( replay->tempo, replay->sample_rate );
+	while( ( sample_pos - current_pos ) >= tick_len ) {
+		for( idx = 0; idx < replay->module->num_channels; idx++ ) {
+			channel_update_sample_idx( &replay->channels[ idx ],
+				tick_len * 2, replay->sample_rate * 2 );
+		}
+		current_pos += tick_len;
+		replay_tick( replay );
+		tick_len = calculate_tick_len( replay->tempo, replay->sample_rate );
+	}
+	return current_pos;
+}
+
 static int replay_calculate_duration( struct replay *replay ) {
 	int count = 0, duration = 0;
 	replay_set_sequence_pos( replay, 0 );
 	while( count < 1 ) {
-		duration += calculate_tick_len( replay->tempo, replay->sample_rate );
+		int tick = calculate_tick_len( replay->tempo, replay->sample_rate );
+		/* An S3M order count is a u16, and order bytes that fall past the
+		 * end of the file read back as 0 - a valid pattern index, so the
+		 * trim in the loader does not shorten the sequence. A long enough
+		 * one overflows this accumulator, which is undefined, and leaves
+		 * rmodtracker_seek comparing frames against a negative duration.
+		 * Saturate and stop: at INT_MAX frames the answer is already
+		 * meaningless, and the walk is what costs. */
+		if( duration > INT_MAX - tick ) {
+			duration = INT_MAX;
+			break;
+		}
+		duration += tick;
 		count = replay_tick( replay );
 	}
 	replay_set_sequence_pos( replay, 0 );
@@ -2170,22 +2229,38 @@ static void rmt_clamp_s16( int16_t * RMT_RESTRICT dst,
 struct rmodtracker {
 	struct module *module;
 	struct replay *replay;
+	/* One tick of mixing, per domain. Allocated on first use rather
+	 * than at open: a caller reaches for one getter and keeps using it,
+	 * so the other domain's buffer was being paid for and never
+	 * touched - about 60 KB at 48 kHz, for the life of every voice. */
 	int   *mix_i;         /* one tick, integer pipeline                 */
 	float *mix_f;         /* one tick, float pipeline                   */
 	float *ramp_f;        /* float twin of replay->ramp_buf             */
+	int    buf_len;       /* entries in mix_i / mix_f when allocated     */
 	int    carry_len;     /* frames left over from the last tick        */
 	int    carry_pos;
 	int    carry_domain;  /* 0 = none, 1 = int, 2 = float               */
 	int    ended;
+	int    duration;      /* one pass, measured once at open            */
+	int    rate;          /* mix rate chosen at open                    */
 };
 
 rmodtracker *rmodtracker_open_memory( const void *data, size_t size )
+{
+	return rmodtracker_open_memory_rate( data, size, RMODTRACKER_RATE );
+}
+
+rmodtracker *rmodtracker_open_memory_rate( const void *data, size_t size,
+		int sample_rate )
 {
 	struct rmodtracker *rmt;
 	struct data d;
 	char msg[ 64 ];
 	int buf_len;
 	if( !data || size < 4 )
+		return NULL;
+	if( sample_rate < RMODTRACKER_RATE_MIN
+		|| sample_rate > RMODTRACKER_RATE_MAX )
 		return NULL;
 	rmt = ( struct rmodtracker * ) calloc( 1, sizeof( struct rmodtracker ) );
 	if( !rmt )
@@ -2198,20 +2273,23 @@ rmodtracker *rmodtracker_open_memory( const void *data, size_t size )
 		free( rmt );
 		return NULL;
 	}
-	rmt->replay = new_replay( rmt->module, RMODTRACKER_RATE, 1 );
+	rmt->rate = sample_rate;
+	rmt->replay = new_replay( rmt->module, sample_rate, 1 );
 	if( !rmt->replay ) {
 		dispose_module( rmt->module );
 		free( rmt );
 		return NULL;
 	}
-	buf_len = calculate_mix_buf_len( RMODTRACKER_RATE );
-	rmt->mix_i  = ( int * )   calloc( buf_len, sizeof( int ) );
-	rmt->mix_f  = ( float * ) calloc( buf_len, sizeof( float ) );
-	rmt->ramp_f = ( float * ) calloc( 128, sizeof( float ) );
-	if( !rmt->mix_i || !rmt->mix_f || !rmt->ramp_f ) {
+	buf_len = calculate_mix_buf_len( sample_rate );
+	if( buf_len <= 0 ) {
 		rmodtracker_close( rmt );
 		return NULL;
 	}
+	rmt->buf_len = buf_len;
+	/* Measured here rather than on demand: the walk that measures it
+	 * rewinds the sequencer, which would be a surprising thing for a
+	 * query to do to a module that is already playing. */
+	rmt->duration = replay_calculate_duration( rmt->replay );
 	return rmt;
 }
 
@@ -2231,22 +2309,92 @@ void rmodtracker_close( rmodtracker *rmt )
 
 int rmodtracker_sample_rate( rmodtracker *rmt )
 {
-	( void ) rmt;
-	return RMODTRACKER_RATE;
+	return rmt ? rmt->rate : 0;
+}
+
+/* Voices the module itself has - four in a classic MOD, up to
+ * thirty-two in an XM or S3M.
+ *
+ * Not the channel count a caller mixes at.  The replayer sums these
+ * into interleaved stereo, so two is what comes out however many the
+ * module writes for, and that is what the audio_transfer arm reports;
+ * this is the module's own figure, for a caller that wants to say
+ * something about the file rather than about its output. */
+int rmodtracker_voices( rmodtracker *rmt )
+{
+	return ( rmt && rmt->module ) ? rmt->module->num_channels : 0;
 }
 
 /* Duration of one pass through the sequence, in frames at the mix rate. */
 int rmodtracker_duration_frames( rmodtracker *rmt )
 {
-	return replay_calculate_duration( rmt->replay );
+	return rmt ? rmt->duration : 0;
 }
 
 void rmodtracker_rewind( rmodtracker *rmt )
 {
 	replay_set_sequence_pos( rmt->replay, 0 );
-	memset( rmt->ramp_f, 0, 128 * sizeof( float ) );
+	if( rmt->ramp_f )
+		memset( rmt->ramp_f, 0, 128 * sizeof( float ) );
 	rmt->carry_len = rmt->carry_pos = rmt->carry_domain = 0;
 	rmt->ended = 0;
+}
+
+int rmodtracker_seek( rmodtracker *rmt, int frame )
+{
+	int16_t scratch[ 256 * 2 ];
+	int reached;
+	if( !rmt || frame < 0 )
+		return 0;
+	/* A module loops, so any frame at all is a position somewhere in the
+	 * stream and the walk below would dutifully grind its way there.
+	 * Stop at one pass: past that the caller has almost certainly asked
+	 * for something it did not mean, and the alternative is a walk whose
+	 * length it chose by accident, on this thread. */
+	if( frame > rmt->duration )
+		frame = rmt->duration;
+	rmodtracker_rewind( rmt );
+	if( frame == 0 )
+		return 0;
+	reached = replay_seek( rmt->replay, frame );
+	/* The walk lands on a tick boundary, so render the rest of the way
+	 * and throw it away - under one tick, some twenty milliseconds, and
+	 * it puts the caller exactly where it asked to be rather than
+	 * somewhere nearby. */
+	while( reached < frame ) {
+		int want = frame - reached;
+		int got;
+		if( want > 256 )
+			want = 256;
+		got = ( int ) rmodtracker_get_samples_s16_interleaved( rmt,
+				scratch, ( size_t ) want );
+		if( got <= 0 )
+			break;          /* ran off the end of the song */
+		reached += got;
+	}
+	return reached;
+}
+
+/* Make the buffers a domain needs, the first time that domain is asked
+ * for. Returns 0 if the allocation fails, in which case the caller ends
+ * the stream rather than spinning on a getter that can never produce
+ * anything. */
+static int rmt_need_i( struct rmodtracker *rmt )
+{
+	if( !rmt->mix_i )
+		rmt->mix_i = ( int * ) calloc( ( size_t ) rmt->buf_len,
+				sizeof( int ) );
+	return rmt->mix_i != NULL;
+}
+
+static int rmt_need_f( struct rmodtracker *rmt )
+{
+	if( !rmt->mix_f )
+		rmt->mix_f = ( float * ) calloc( ( size_t ) rmt->buf_len,
+				sizeof( float ) );
+	if( !rmt->ramp_f )
+		rmt->ramp_f = ( float * ) calloc( 128, sizeof( float ) );
+	return rmt->mix_f != NULL && rmt->ramp_f != NULL;
 }
 
 /* Switching getters mid-carry converts the few carried frames once;
@@ -2254,7 +2402,13 @@ void rmodtracker_rewind( rmodtracker *rmt )
 static void rmt_carry_to_domain( struct rmodtracker *rmt, int domain )
 {
 	int i;
-	if( rmt->carry_domain && rmt->carry_domain != domain && rmt->carry_pos < rmt->carry_len ) {
+	/* Both buffers have to exist for a conversion to mean anything. With
+	 * lazy allocation the source one may never have been made - which is
+	 * the normal case, a caller that only ever uses one getter, and then
+	 * there is nothing carried in the other domain to convert. */
+	if( rmt->carry_domain && rmt->carry_domain != domain
+			&& rmt->carry_pos < rmt->carry_len
+			&& rmt->mix_i && rmt->mix_f ) {
 		int n   = ( rmt->carry_len - rmt->carry_pos ) * 2;
 		int off = rmt->carry_pos * 2;
 		if( domain == 2 ) {
@@ -2274,6 +2428,11 @@ size_t rmodtracker_get_samples_s16_interleaved( rmodtracker *rmt,
 	size_t done = 0;
 	if( !rmt || rmt->ended )
 		return 0;
+	/* Before carry_to_domain, which converts *into* this buffer. */
+	if( !rmt_need_i( rmt ) ) {
+		rmt->ended = 1;
+		return 0;
+	}
 	rmt_carry_to_domain( rmt, 1 );
 	{
 		int *mix = rmt->mix_i;
@@ -2310,6 +2469,10 @@ size_t rmodtracker_get_samples_float_interleaved( rmodtracker *rmt,
 	size_t done = 0;
 	if( !rmt || rmt->ended )
 		return 0;
+	if( !rmt_need_f( rmt ) ) {
+		rmt->ended = 1;
+		return 0;
+	}
 	rmt_carry_to_domain( rmt, 2 );
 	{
 		float *mix = rmt->mix_f;

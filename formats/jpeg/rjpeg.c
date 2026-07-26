@@ -168,6 +168,14 @@ struct rjpeg
    uint8_t                *iter_output;       /* RGBA8888 output buffer        */
    unsigned                iter_out_row;      /* next output row to resample   */
    int                     iter_resample_ready; /* 1 = resample state inited   */
+   bool                    iter_rgba_used;    /* byte order the fused resample
+                                               * emitted with: supports_rgba is
+                                               * latched by rjpeg_process_image,
+                                               * which the task pipeline only
+                                               * calls after iteration, so the
+                                               * fusion runs with the default
+                                               * (BGRA) and the flag's real
+                                               * value arrives later          */
 
    /* Output byte order selector. Latched from the rjpeg_process_image
     * parameter and consulted by the resample+colorconvert callsites.
@@ -285,6 +293,11 @@ struct rjpeg_jpeg_s
       int dc_pred;
 
       int x,y,w2,h2;
+      int ring_h2;         /* plane rows actually allocated: equals h2
+                            * normally; smaller when the iterative
+                            * fused decode rings the planes (3 MCU-row
+                            * spans).  Every plane-row address is taken
+                            * modulo this, an identity at full size. */
       int      coeff_w;          /* number of 8x8 coefficient blocks */
       int      coeff_h;          /* number of 8x8 coefficient blocks */
    } img_comp[4];
@@ -292,6 +305,10 @@ struct rjpeg_jpeg_s
    /* Single arena allocation for all component buffers.
     * When non-NULL, raw_data/raw_coeff/linebuf point into this
     * arena and must NOT be individually freed. */
+   int    plane_ring;   /* 1 = component planes may be ring-sized (set
+                         * by the iterative driver before SOF; the
+                         * monolithic path always decodes whole images
+                         * ahead of resampling and needs full planes) */
    void  *comp_arena;
    size_t comp_arena_size;
 
@@ -2743,6 +2760,7 @@ static int rjpeg_process_frame_header(rjpeg_jpeg *z, int scan)
          z->img_comp[i].y        = (s->img_y * z->img_comp[i].v + v_max-1) / v_max;
          z->img_comp[i].w2       = z->img_mcu_x * z->img_comp[i].h * 8;
          z->img_comp[i].h2       = z->img_mcu_y * z->img_comp[i].v * 8;
+         z->img_comp[i].ring_h2  = z->img_comp[i].h2;
          z->img_comp[i].coeff_w  = (z->img_comp[i].w2 + 7) >> 3;
          z->img_comp[i].coeff_h  = (z->img_comp[i].h2 + 7) >> 3;
 
@@ -2796,8 +2814,22 @@ static int rjpeg_process_frame_header(rjpeg_jpeg *z, int scan)
          z->img_comp[i].w2       = z->img_mcu_x * z->img_comp[i].h * 8;
          z->img_comp[i].h2       = z->img_mcu_y * z->img_comp[i].v * 8;
 
+         /* Fused iterative decode: only three MCU-row spans of a
+          * plane are ever live (the span being written, the span
+          * pending resample, and the previous span's last row for
+          * the vertical resampler's continuity), so the plane can be
+          * a recycling window of that many rows.  See
+          * rjpeg_plane_ring_undo() for the cases that revert this. */
+         z->img_comp[i].ring_h2  = z->img_comp[i].h2;
+         if (z->plane_ring)
+         {
+            int span = z->img_comp[i].v * 8 * 3;
+            if (span < z->img_comp[i].ring_h2)
+               z->img_comp[i].ring_h2 = span;
+         }
+
          offsets_data[i] = arena_size;
-         arena_size += (size_t)z->img_comp[i].w2 * z->img_comp[i].h2 + 15;
+         arena_size += (size_t)z->img_comp[i].w2 * z->img_comp[i].ring_h2 + 15;
          arena_size = (arena_size + 15) & ~(size_t)15;
 
          /* linebuf: img_x + 3 bytes (resample scratch, used later) */
@@ -4052,6 +4084,7 @@ static int rjpeg_parse_entropy_one_mcu_row_interleaved(
          int comp_ha      = z->img_comp[n].ha;
          int comp_hd      = z->img_comp[n].hd;
          int comp_w2      = z->img_comp[n].w2;
+         int comp_rh2     = z->img_comp[n].ring_h2;
          uint8_t *comp_data = z->img_comp[n].data;
          rjpeg_huffman *hdc = z->huff_dc + comp_hd;
          rjpeg_huffman *hac = z->huff_ac + comp_ha;
@@ -4060,7 +4093,7 @@ static int rjpeg_parse_entropy_one_mcu_row_interleaved(
 
          for (y = 0; y < comp_v; ++y)
          {
-            int y2 = (mcu_row * comp_v + y) * 8;
+            int y2 = ((mcu_row * comp_v + y) * 8) % comp_rh2;
             for (x = 0; x < comp_h; ++x)
             {
                int x2 = (i * comp_h + x) * 8;
@@ -4119,6 +4152,7 @@ bool rjpeg_start(rjpeg_t *rjpeg)
    j->marker = RJPEG_MARKER_NONE;
    j->restart_interval = 0; j->todo = 0;
    j->comp_arena = NULL; j->comp_arena_size = 0;
+   j->plane_ring = 1;   /* iterative: fused decode may ring the planes */
    j->img_n = 0;
 
    /* Context fields embedded in j */
@@ -4294,7 +4328,9 @@ static void rjpeg_output_rows(rjpeg_jpeg *z, rjpeg_resample *res,
             r->ystep = 0;
             r->line0 = r->line1;
             if (++r->ypos < z->img_comp[k].y)
-               r->line1 += z->img_comp[k].w2;
+               r->line1 = z->img_comp[k].data
+                  + (size_t)(r->ypos % (unsigned)z->img_comp[k].ring_h2)
+                  * z->img_comp[k].w2;
          }
       }
 
@@ -4341,6 +4377,55 @@ static void rjpeg_output_rows(rjpeg_jpeg *z, rjpeg_resample *res,
    }
 }
 
+/* Revert ring-sized baseline planes to full size.  Called before any
+ * entropy data has been decoded, when a condition incompatible with
+ * the fused ring shows up only at SOS time: a non-interleaved scan
+ * (scan_n != img_n decodes one component's whole plane per scan), or
+ * the fused resample failing to initialise.  Geometry (x, y, w2, h2)
+ * survives from the frame header; only the arena is re-cut. */
+static int rjpeg_plane_ring_undo(rjpeg_jpeg *z)
+{
+   size_t arena_size = 0;
+   size_t offsets_data[4], offsets_linebuf[4];
+   uint8_t *arena;
+   int i;
+
+   if (!z->plane_ring)
+      return 1;
+
+   for (i = 0; i < z->img_n; ++i)
+   {
+      z->img_comp[i].ring_h2 = z->img_comp[i].h2;
+      offsets_data[i] = arena_size;
+      arena_size += (size_t)z->img_comp[i].w2 * z->img_comp[i].h2 + 15;
+      arena_size = (arena_size + 15) & ~(size_t)15;
+      offsets_linebuf[i] = arena_size;
+      arena_size += (size_t)z->img_x + 3;
+      arena_size = (arena_size + 15) & ~(size_t)15;
+   }
+
+   arena = (uint8_t*)malloc(arena_size);
+   if (!arena)
+      return 0;
+
+   if (z->comp_arena)
+      free(z->comp_arena);
+   z->comp_arena      = arena;
+   z->comp_arena_size = arena_size;
+
+   for (i = 0; i < z->img_n; ++i)
+   {
+      z->img_comp[i].raw_data  = arena + offsets_data[i];
+      z->img_comp[i].data      = (uint8_t*)(((size_t)(arena + offsets_data[i]) + 15) & ~(size_t)15);
+      z->img_comp[i].linebuf   = arena + offsets_linebuf[i];
+      z->img_comp[i].coeff     = 0;
+      z->img_comp[i].raw_coeff = 0;
+   }
+
+   z->plane_ring = 0;
+   return 1;
+}
+
 /* Initialize the fused iterate+resample state after the header is parsed.
  * Sets up resample contexts and allocates the output buffer. */
 static int rjpeg_iterate_init_resample(rjpeg_t *rjpeg)
@@ -4359,7 +4444,17 @@ static int rjpeg_iterate_init_resample(rjpeg_t *rjpeg)
       return 0;
 
    rjpeg->iter_out_row = 0;
-   rjpeg->iter_resample_ready = 0; /* TODO: fix ystep state bug */
+   /* The fusion originally emitted right up to the boundary of the
+    * just-decoded MCU row.  The vertical resampler's in_far pointer
+    * (line1) crosses that boundary for the last output rows of the
+    * span - for 4:2:0, output row 16m+15 interpolates chroma from
+    * plane row 8m+8, the first row of the NEXT, not-yet-decoded MCU
+    * row - producing wrong pixels on every interior MCU-row seam
+    * (the "ystep state bug" this flag was parked over).  Emission now
+    * lags one MCU row behind decode, so every plane row the
+    * resampler can touch is already written; the final row is
+    * flushed when the last MCU row commits. */
+   rjpeg->iter_resample_ready = 1;
    return 1;
 }
 
@@ -4444,9 +4539,20 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
          rjpeg->iter_mcu_row = 0;
 
          /* For non-interleaved single-component scans, fall back
-          * to the monolithic path (same rationale as progressive). */
+          * to the monolithic path (same rationale as progressive).
+          * Grayscale lands here too: a single-component scan uses the
+          * non-interleaved MCU geometry (one block per MCU) that the
+          * per-MCU-row driver does not speak.  The monolithic parser
+          * writes whole-plane addresses, so the fusion must stand
+          * down and any plane ring must be reverted first. */
          if (j->scan_n == 1)
          {
+            rjpeg->iter_resample_ready = 0;
+            if (j->plane_ring && !rjpeg_plane_ring_undo(j))
+            {
+               rjpeg->iter_state = RJPEG_ITER_ERROR;
+               return false;
+            }
             /* The monolithic entropy path has no resident-frontier
              * awareness.  If a prefix caller set avail below the full
              * length, the buffer is still partial: yield need_more so
@@ -4470,7 +4576,13 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
                {
                   if (mx == JPEG_MARKER_SOS)
                   {
-                     /* Multi-scan baseline is unusual but handle it */
+                     /* Multi-scan baseline is unusual but handle it.
+                      * Not under a plane ring though: earlier spans
+                      * have been recycled and a further scan cannot
+                      * be decoded over them (the fused output is
+                      * already complete at this point). */
+                     if (j->plane_ring)
+                        break;
                      if (!rjpeg_process_scan_header(j))
                         break;
                      if (!rjpeg_parse_entropy_coded_data(j))
@@ -4491,9 +4603,31 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
          rjpeg->iter_state = RJPEG_ITER_ENTROPY_ROWS;
 
          /* Initialize fused resample so we can process output rows
-          * as MCU-rows complete, overlapping entropy+resample. */
-         if (!rjpeg->iter_resample_ready)
+          * as MCU-rows complete, overlapping entropy+resample.
+          * Progressive never enters ENTROPY_ROWS (scans go through
+          * PROG_SCAN / FINISH_PROG and need full coefficient planes),
+          * so arming it there would only allocate the output buffer
+          * early for nothing.  The fusion (and with it the plane
+          * ring) also requires the single interleaved scan: a
+          * non-interleaved scan decodes one component's whole plane
+          * before the others exist, which neither the per-MCU-row
+          * emitter nor a three-span ring can serve. */
+         if (      !rjpeg->iter_resample_ready
+               &&  !j->progressive
+               &&   j->img_n > 1
+               &&   j->scan_n == j->img_n)
             rjpeg_iterate_init_resample(rjpeg);
+         if (!rjpeg->iter_resample_ready && j->plane_ring)
+         {
+            /* Fusion is not running (unsupported scan layout, or its
+             * setup failed): the sequential fallback needs whole
+             * planes. */
+            if (!rjpeg_plane_ring_undo(j))
+            {
+               rjpeg->iter_state = RJPEG_ITER_ERROR;
+               return false;
+            }
+         }
 
          return true; /* more work to do */
       }
@@ -4651,13 +4785,25 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
          rjpeg->stall_at    = 0;   /* row committed: no pending stall */
          rjpeg->iter_mcu_row++;
 
-         /* Fused resample: the MCU-row we just decoded produced up to
-          * v_max*8 rows of component data.  Resample them now while
-          * the data is hot in cache, overlapping with the next
-          * entropy decode on the next iterate call. */
+         /* Fused resample, one MCU row behind decode: the vertical
+          * resampler's in_far row for the tail of a span is the first
+          * plane row of the FOLLOWING MCU row, so a span is only
+          * emitted once the row after it has been decoded.  The data
+          * read is then at worst one MCU row old - still
+          * cache-resident - and every plane row touched is valid.
+          * When the LAST MCU row commits there is no following row to
+          * wait for and the remainder is flushed to img_y (in_far's
+          * advance is bounded by comp.y at the image edge). */
          if (rjpeg->iter_resample_ready && rjpeg->iter_output)
          {
-            unsigned max_row = rjpeg->iter_mcu_row * j->img_v_max * 8;
+            unsigned max_row;
+            rjpeg->iter_rgba_used = rjpeg->supports_rgba;
+            if (rjpeg->iter_mcu_row >= j->img_mcu_y)
+               max_row = j->img_y;
+            else if (rjpeg->iter_mcu_row > 0)
+               max_row = (rjpeg->iter_mcu_row - 1) * j->img_v_max * 8;
+            else
+               max_row = 0;
             if (max_row > j->img_y)
                max_row = j->img_y;
             rjpeg_output_rows(rjpeg->iter_j, rjpeg->iter_res, rjpeg->iter_output,
@@ -4892,6 +5038,21 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
          if (rjpeg->iter_resample_ready && rjpeg->iter_output
                && rjpeg->iter_out_row >= j->img_y)
          {
+            /* The fusion ran before this call latched supports_rgba,
+             * so it emitted with the default order.  If the caller
+             * wants the other one, swap R and B in place - one warm
+             * pass, and only on the mismatching configuration. */
+            if (rjpeg->iter_rgba_used != supports_rgba)
+            {
+               uint8_t *p   = rjpeg->iter_output;
+               uint8_t *end = p + (size_t)4 * j->img_x * j->img_y;
+               for (; p < end; p += 4)
+               {
+                  uint8_t t = p[0];
+                  p[0]      = p[2];
+                  p[2]      = t;
+               }
+            }
             *buf_data = rjpeg->iter_output;
             *width  = j->img_x;
             *height = j->img_y;
@@ -4942,11 +5103,21 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
          j->marker = RJPEG_MARKER_NONE;
          j->restart_interval = 0; j->todo = 0;
          j->comp_arena = NULL; j->comp_arena_size = 0;
+         j->plane_ring = 0;   /* monolithic: full planes required */
 
          /* Context fields embedded in j */
          j->img_buffer          = (uint8_t*)rjpeg->buff_data;
          j->img_buffer_original = (uint8_t*)rjpeg->buff_data;
          j->img_buffer_end      = (uint8_t*)rjpeg->buff_data + size;
+         /* The prefix-decoding fields were only ever initialised on
+          * the iterative path; this malloc-init list predates them.
+          * Uninitialised hit_wall read in every entropy block decode
+          * (flagged by valgrind on the pre-change code too) - benign
+          * or fatal purely by heap-layout luck.  The monolithic path
+          * runs over a fully resident buffer, so the frontier is the
+          * end and no wall is ever hit. */
+         j->img_buffer_true_end = j->img_buffer_end;
+         j->hit_wall            = 0;
 
          rjpeg_setup_jpeg(j);
 
@@ -5031,6 +5202,19 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
    }
 
    return IMAGE_PROCESS_ERROR;
+}
+
+/* Declare the output byte order before iteration starts.  The fused
+ * iterate+resample emits final pixels during rjpeg_iterate_image,
+ * long before rjpeg_process_image latches supports_rgba from its
+ * caller; without this the fusion emits the default (BGRA) and a
+ * caller wanting RGBA pays a full cold repair pass over the output.
+ * The task pipeline knows the video driver's preference at setup, so
+ * it can hand it over here. */
+void rjpeg_set_out_rgba(rjpeg_t *rjpeg, bool rgba)
+{
+   if (rjpeg)
+      rjpeg->supports_rgba = rgba;
 }
 
 bool rjpeg_set_buf_ptr(rjpeg_t *rjpeg, void *data, size_t len)

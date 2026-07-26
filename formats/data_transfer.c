@@ -20,6 +20,144 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+/* What this file implements, and what it deliberately does not.
+ *
+ * IMPLEMENTED
+ *
+ * One handle (data_transfer_t) with three ways to fill it, sharing
+ * one tick-sliced surface: iterate() with a byte budget, ptr() and
+ * avail() for the buffer and how much of it is real, and the
+ * complete()/failed()/capped() terminals.
+ *
+ *  - prefix (data_transfer_open_prefix): a file whose length is known
+ *    at open.  Address space for the whole length is reserved up
+ *    front so the base never moves, and physical pages are committed
+ *    DT_COMMIT_STEP at a time as the fill advances, in DT_READ_CHUNK
+ *    reads.  commit_cap bounds the committed bytes and turns overrun
+ *    into the capped() terminal, distinct from complete and failed.
+ *    discard()/refill() trade residency for a re-read, so a
+ *    sequential consumer holds a constant window over a file of any
+ *    size.
+ *
+ *  - window (data_transfer_open_window): the same reservation used
+ *    cyclically, for sequential consumers that loop.  A permanent
+ *    head of 'keep' bytes plus a moving [wlo, whi) that feed()
+ *    advances behind the consumer and extends ahead of it;
+ *    rewind() on a backwards tell, grow_keep() to raise the head once
+ *    the loop landing is known, peek() for positioned metadata reads
+ *    that commit nothing, punch() to release inert ranges inside the
+ *    head.  A short read while extending settles the handle into the
+ *    same terminal the fill uses - failed() true, complete() never -
+ *    and freezes the whole window surface, because two of the live
+ *    call sites discard the return value.
+ *
+ *  - source (data_transfer_open_source): bytes from a producer
+ *    callback instead of a file, into one exact malloc that
+ *    source_detach() hands to the caller to free().
+ *
+ * Plus data_transfer_arena_*, an independent realloc-doubling
+ * growable buffer that shares this file and header but touches no
+ * data_transfer_t and no page machinery.
+ *
+ * File access goes through filestream/VFS throughout, so 64-bit
+ * offsets and VFS-only paths work.  Where the platform cannot reserve
+ * address space, every mode degrades to a plain allocation of
+ * min(len, commit_cap) - or DT_FALLBACK_WINDOW when there is no cap -
+ * and a window simply holds the whole file; reserve_supported() and
+ * window_is_reserved() say which happened.
+ *
+ * NOT IMPLEMENTED
+ *
+ *  - Asynchrony.  Every read is a synchronous filestream_read on the
+ *    calling thread: iterate() blocks for the length of its budget,
+ *    and there is nothing in flight for free() to cancel.  Pacing is
+ *    by byte budget and the caller does the time-slicing.  The module
+ *    began as a wrapper over nbio, which is where its vocabulary came
+ *    from; no nbio strategy exists here, nbio is no longer part of
+ *    the RetroArch build, and the nbio_ names surviving in the task
+ *    layer are historical only.
+ *
+ *  - Locking.  Nothing is synchronised.  The window contract is
+ *    single owner, single thread by construction (see the header);
+ *    prefix and source handles are merely unguarded, so one owner
+ *    iterates and any other reader of ptr() is ordered by the caller.
+ *
+ *  - Writing, in any form: no create, no append, no truncate.
+ *
+ *  - Length changes.  len is fixed at open.  A file that grows is
+ *    never noticed; a file that shrinks under the fill freezes the
+ *    transfer into failed() with an honest avail(), and complete()
+ *    never becomes true.
+ *
+ *  - Empty inputs.  open_prefix rejects a zero or unknown size and
+ *    open_source rejects len == 0, both returning NULL rather than a
+ *    handle that is complete on arrival.
+ *
+ *  - Random access.  avail() is monotonic and the consumer reads the
+ *    front of the buffer: no seek, no consumer-visible positioned
+ *    read outside window_peek(), and deliberately no accessor for the
+ *    window's committed frontier.
+ *
+ *  - Meaningful prefix behaviour on a window.  iterate(), discard()
+ *    and refill() are declined on a window handle rather than run
+ *    against it - see the note above iterate() for what they used to
+ *    do - so mixing the surfaces is inert rather than corrupting.
+ *    What is still absent is any use for them there: avail() is the
+ *    full length from open, and complete() reports whole-file
+ *    residency, so it stays false on a reserved window and is true on
+ *    the no-reservation fallback.  Drive a window with feed/extend/
+ *    advance/rewind.
+ *
+ *  - Restoration of the exact state a failed extension found.  What
+ *    settling does instead is release everything above the frontier,
+ *    which is not the same thing but is the part that matters: it is
+ *    the invariant keep <= wlo <= whi that makes [whi, map_len) out
+ *    of contract, so taking it back is exact for extend() and
+ *    grow_keep() alike and needs no record of what was resident
+ *    before.  Pages below the frontier keep whatever they hold, and
+ *    a settled window is terminal anyway; free it.
+ *
+ *  - Cancellation and progress reporting.  No cancel token, no
+ *    progress callback, no time budget.  A producer can only stop
+ *    itself by returning negative, an abandoned handle is freed
+ *    rather than aborted, and a source transfer that stopped short
+ *    cannot be adopted at all: detach() returns NULL unless the fill
+ *    completed.
+ *
+ *  - A promise from reserve_supported().  It answers a build
+ *    question - whether this build can reserve at all - not an
+ *    allocation one.  memreserve() can still fail for a particular
+ *    length, and only window_is_reserved() on an open handle reports
+ *    that it did.
+ *
+ *  - Arithmetic hardening beyond the caller-supplied ranges.  The two
+ *    entry points that take a range from the caller - window_peek()
+ *    and window_punch() - bound it, and the arena's doubling no
+ *    longer wraps, but the rest still trusts its inputs: every
+ *    rounding here assumes a power-of-two page, and window_feed()'s
+ *    tell + lookahead can still wrap.  That last one is left alone
+ *    deliberately - a wrapped lookahead loses read-ahead, whereas
+ *    clamping it to the length would turn an absurd argument into a
+ *    whole-file commit, which is the worse of the two.
+ *
+ *  - A reason to pass NULL.  Every entry point tolerates it - bool
+ *    returns false, pointer returns NULL, void does nothing - so the
+ *    surface is uniform, but nothing here treats a NULL handle as
+ *    meaningful.  It is an accepted mistake, not an idiom.
+ *
+ *  - A runtime choice of strictness.  DT_STRICT (DT_WINDOW_STRICT is
+ *    an alias) is build-time.  It now covers discard() as well as the
+ *    window decommits, so the prefix streaming path gets the same
+ *    fault-instead-of-zeros diagnostic under a strict build, which is
+ *    what makes a consumer's look-back margin testable rather than
+ *    assumed.  The release in the settle path is strict in every
+ *    build and does not depend on it.
+ *
+ *  - Anything about the bytes themselves: no hashing, no validation,
+ *    no decompression (source mode's producer does that), and nothing
+ *    to do with a network, the name notwithstanding.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -37,9 +175,10 @@
  * the caller gave no cap. */
 #define DT_FALLBACK_WINDOW  (32 * 1024 * 1024)
 
+
 struct data_transfer
 {
-   /* strategy 2: internal prefix reader (open_prefix)               */
+   /* file-backed reader (open_prefix, and open_window over it)      */
    RFILE  *f;
    uint8_t *map;     /* reserved (or fallback-allocated) buffer      */
    size_t  map_len;  /* reserved bytes (page-rounded), 0 = fallback  */
@@ -90,7 +229,18 @@ bool data_transfer_arena_ensure(data_transfer_arena_t *a, size_t need)
 
    nc = a->cap ? a->cap : (256 * 1024);
    while (nc < need)
-      nc *= 2;
+   {
+      size_t nx = nc * 2;
+      /* No power of two at or above 'need' fits in a size_t: ask for
+       * exactly what was wanted and let realloc refuse it.  Left
+       * unchecked the doubling reaches 0 and the loop never ends. */
+      if (nx <= nc)
+      {
+         nc = need;
+         break;
+      }
+      nc = nx;
+   }
    if (!(nb = (uint8_t*)realloc(a->base, nc)))
       return false;
    a->base      = nb;
@@ -112,6 +262,11 @@ void data_transfer_arena_release(data_transfer_arena_t *a)
 
 static int data_transfer_read_at(data_transfer_t *dt, size_t off,
       uint8_t *dst, size_t n);
+/* The fill proper.  data_transfer_iterate() refuses to run it on a
+ * window; open_window's no-reservation path genuinely needs it and
+ * calls it here directly. */
+static size_t data_transfer_prefix_iterate(data_transfer_t *dt,
+      size_t max_bytes, data_transfer_continue_t cb, void *ud);
 
 /* Release whole pages from the decommit frontier up to (not
  * including) the page containing 'to'.  The frontier survives calls,
@@ -123,11 +278,58 @@ static void data_transfer_wdecommit_to(data_transfer_t *dt, size_t to)
    if (to <= from || !dt->map_len)
       return;
    dt->wfreed = to;
-#ifdef DT_WINDOW_STRICT
+#ifdef DT_STRICT
    memdecommit(dt->map + from, to - from, true);
 #else
    memdecommit(dt->map + from, to - from, false);
 #endif
+}
+
+/* Settle a window into the same terminal the fill uses: failed() true,
+ * complete() never, and every window mutator inert from here.
+ *
+ * The freeze is the point.  Two of the live call sites discard the
+ * return - the audio mixer raises the head to cover the decoder's loop
+ * landing and feeds the window each tick without looking - so the
+ * value alone was never going to be noticed.  A settled handle stops
+ * committing pages it cannot fill, stops moving wlo/whi/wfreed away
+ * from what is actually resident, and answers failed() to anyone who
+ * asks later.
+ *
+ * What it does not do is undo the commit that just failed.  Rolling
+ * one back is exact for extend(), whose range is always above the
+ * frontier, but not for grow_keep(), whose range can overlap both the
+ * live window and the span advance() already released - the state
+ * kept here cannot say which pages were resident before the call.  A
+ * rollback that is right in one case and wrong in the other is worse
+ * than none, so the pages keep whatever they hold and the handle is
+ * terminal: free it. */
+static void data_transfer_wfail(data_transfer_t *dt)
+{
+   dt->done   = 1;
+   dt->failed = 1;
+   /* Take back everything above the frontier.  The failed call had
+    * already committed its range, and committed-but-unfilled pages
+    * read as zeros where every other byte past the frontier faults -
+    * a hole in the one guarantee the mode rests on.
+    *
+    * Restoring the exact pre-call state is not expressible from what
+    * is kept here, but that is the wrong target.  The invariant is
+    * simply that nothing above whi is readable: the head is
+    * [0, keep), the window is [wlo, whi), and keep <= wlo <= whi
+    * always, so [whi, map_len) is out of contract by construction.
+    * Releasing it is a no-op on a healthy window and a repair on a
+    * failed one, in both the extend() and grow_keep() cases.
+    *
+    * Strict unconditionally, not just under DT_STRICT: the handle is
+    * terminal, so a fault here is a caller reading what it was told
+    * not to, and that is worth surfacing in any build. */
+   if (dt->map_len)
+   {
+      size_t f = (dt->whi + dt->page - 1) & ~(dt->page - 1);
+      if (f < dt->map_len)
+         memdecommit(dt->map + f, dt->map_len - f, true);
+   }
 }
 
 static int data_transfer_wcommit(data_transfer_t *dt,
@@ -205,8 +407,10 @@ data_transfer_t *data_transfer_open_window(const char *path, size_t keep)
    {
       /* no reservation on this platform: the fallback path of
        * open_prefix holds a plain buffer - fill it all; the window
-       * calls become no-ops and the file is simply resident */
-      data_transfer_iterate(dt, 0);
+       * calls become no-ops and the file is simply resident.  The
+       * fill is invoked directly because dt->window is already set
+       * and the public iterate() declines windows. */
+      data_transfer_prefix_iterate(dt, 0, NULL, NULL);
       if (!data_transfer_complete(dt))
       {
          data_transfer_free(dt);
@@ -229,6 +433,12 @@ bool data_transfer_window_is_reserved(data_transfer_t *dt)
 
 const uint8_t *data_transfer_window_base(data_transfer_t *dt, size_t *len)
 {
+   if (!dt)
+   {
+      if (len)
+         *len = 0;
+      return NULL;
+   }
    if (len)
       *len = dt->len;
    return dt->map;
@@ -236,7 +446,7 @@ const uint8_t *data_transfer_window_base(data_transfer_t *dt, size_t *len)
 
 bool data_transfer_window_extend(data_transfer_t *dt, size_t hi)
 {
-   if (!dt->window)
+   if (!dt || !dt->window || dt->failed)
       return false;
    if (hi > dt->len)
       hi = dt->len;
@@ -244,18 +454,28 @@ bool data_transfer_window_extend(data_transfer_t *dt, size_t hi)
       return true;
    if (!dt->map_len)
       return true;               /* fallback: already whole */
+   /* A refused commit settles too.  The fill has a capped() terminal
+    * for it because a prefix has a ceiling to reach; a window has
+    * none, so running out of pages to commit is simply the window
+    * failing. */
    if (!data_transfer_wcommit(dt, dt->whi, hi))
+   {
+      data_transfer_wfail(dt);
       return false;
+   }
    if (!data_transfer_read_at(dt, dt->whi, dt->map + dt->whi,
          hi - dt->whi))
+   {
+      data_transfer_wfail(dt);
       return false;
+   }
    dt->whi = hi;
    return true;
 }
 
 void data_transfer_window_advance(data_transfer_t *dt, size_t lo)
 {
-   if (!dt->window || !dt->map_len)
+   if (!dt || !dt->window || !dt->map_len || dt->failed)
       return;
    if (lo > dt->whi)
       lo = dt->whi;
@@ -267,7 +487,7 @@ void data_transfer_window_advance(data_transfer_t *dt, size_t lo)
 
 void data_transfer_window_rewind(data_transfer_t *dt)
 {
-   if (!dt->window || !dt->map_len)
+   if (!dt || !dt->window || !dt->map_len || dt->failed)
       return;
    /* drop the old window entirely (frontier through its end; the
     * partial last page goes with the round-up), then restart the
@@ -281,7 +501,7 @@ void data_transfer_window_rewind(data_transfer_t *dt)
 
 bool data_transfer_window_grow_keep(data_transfer_t *dt, size_t keep)
 {
-   if (!dt->window)
+   if (!dt || !dt->window || dt->failed)
       return false;
    if (keep > dt->len)
       keep = dt->len;
@@ -292,10 +512,16 @@ bool data_transfer_window_grow_keep(data_transfer_t *dt, size_t keep)
       /* commit and read the extension; pages already inside the
        * window are re-read harmlessly */
       if (!data_transfer_wcommit(dt, dt->keep, keep))
+      {
+         data_transfer_wfail(dt);
          return false;
+      }
       if (!data_transfer_read_at(dt, dt->keep, dt->map + dt->keep,
             keep - dt->keep))
+      {
+         data_transfer_wfail(dt);
          return false;
+      }
    }
    dt->keep = keep;
    if (dt->wlo < keep)
@@ -310,7 +536,10 @@ bool data_transfer_window_grow_keep(data_transfer_t *dt, size_t keep)
 bool data_transfer_window_peek(data_transfer_t *dt, size_t off,
       void *dst, size_t n)
 {
-   if (!dt->window || off + n > dt->len)
+   /* off + n is computed as a subtraction: the sum can wrap, and a
+    * wrapped sum reads as comfortably in range. */
+   if (!dt || !dt->window || dt->failed
+         || off > dt->len || n > dt->len - off)
       return false;
    if (!dt->map_len)
    {
@@ -325,13 +554,24 @@ void data_transfer_window_punch(data_transfer_t *dt, size_t from,
       size_t to)
 {
    size_t f, t;
-   if (!dt->window || !dt->map_len)
+   if (!dt || !dt->window || !dt->map_len || dt->failed)
       return;
+   /* Bound the range to the reservation before rounding it.  'to' is
+    * caller-supplied and unclamped everywhere else here, and a
+    * non-strict decommit is madvise(MADV_DONTNEED): it does not fail
+    * politely on a range running off the end of the mapping, it
+    * zeroes whatever anonymous pages it does cover, which past this
+    * reservation is somebody else's heap.  The round-up of 'from' is
+    * only safe once from is bounded too. */
+   if (from > dt->map_len)
+      return;
+   if (to > dt->map_len)
+      to = dt->map_len;
    f = (from + dt->page - 1) & ~(dt->page - 1);
    t = (to / dt->page) * dt->page;
    if (t <= f)
       return;
-#ifdef DT_WINDOW_STRICT
+#ifdef DT_STRICT
    memdecommit(dt->map + f, t - f, true);
 #else
    memdecommit(dt->map + f, t - f, false);
@@ -341,7 +581,7 @@ void data_transfer_window_punch(data_transfer_t *dt, size_t from,
 bool data_transfer_window_feed(data_transfer_t *dt, size_t tell,
       size_t lookahead, size_t margin)
 {
-   if (!dt->window)
+   if (!dt || !dt->window || dt->failed)
       return false;
    if (tell < dt->wtell)
       data_transfer_window_rewind(dt);   /* the consumer looped */
@@ -443,7 +683,7 @@ static int data_transfer_commit(data_transfer_t *dt, size_t need)
 }
 
 static size_t data_transfer_prefix_iterate(data_transfer_t *dt,
-      size_t max_bytes)
+      size_t max_bytes, data_transfer_continue_t cb, void *ud)
 {
    size_t start = dt->avail;
    while (!dt->done && !dt->capped)
@@ -459,6 +699,12 @@ static size_t data_transfer_prefix_iterate(data_transfer_t *dt,
          dt->capped = 1;
          break;
       }
+      /* Asked before each read, the first one included: a caller
+       * already out of budget does no work at all.  A stop here
+       * settles nothing - the fill simply pauses and the next
+       * iterate carries on from the same place. */
+      if (cb && !cb(ud, dt->avail, dt->len))
+         break;
       if (chunk > dt->len - dt->avail)
          chunk = dt->len - dt->avail;
       if (dt->cap && chunk > dt->cap - dt->avail)
@@ -543,13 +789,19 @@ void data_transfer_discard(data_transfer_t *dt, size_t up_to)
 {
    size_t lo;
    if (!dt || !dt->f || !dt->map_len || !dt->page)
-      return;                     /* nbio or fallback: bytes stay */
+      return;                     /* source or fallback: bytes stay */
+   if (dt->window)
+      return;                     /* not this surface - see below */
    if (up_to > dt->avail)
       up_to = dt->avail;
    lo = (up_to / dt->page) * dt->page;
    if (lo <= dt->low)
       return;
+#ifdef DT_STRICT
+   memdecommit(dt->map + dt->low, lo - dt->low, true);
+#else
    memdecommit(dt->map + dt->low, lo - dt->low, false);
+#endif
    dt->low = lo;
 }
 
@@ -558,15 +810,17 @@ bool data_transfer_refill(data_transfer_t *dt, size_t from)
    size_t lo, end;
    if (!dt)
       return false;
-   if (!dt->f || !dt->map_len || from >= dt->low)
+   if (!dt->f || !dt->map_len || dt->window || from >= dt->low)
       return !dt->failed;         /* nothing was released there */
    lo  = (from / dt->page) * dt->page;
    end = dt->low;
    if (end > dt->avail)
       end = dt->avail;
-   /* Windows needs the range committing again; on POSIX
-    * MADV_DONTNEED left the pages committed and they refault as
-    * zeros, so memcommit() is a cheap no-op there. */
+   /* Windows needs the range committing again, and so does any build
+    * where discard() released strictly, which leaves the pages
+    * unreadable.  Only on POSIX without DT_STRICT is this a cheap
+    * no-op: MADV_DONTNEED alone leaves them committed to refault as
+    * zeros. */
    if (!memcommit(dt->map + lo, end - lo))
       return false;
    if (end > lo && !data_transfer_read_at(dt, lo, dt->map + lo, end - lo))
@@ -581,13 +835,38 @@ bool data_transfer_refill(data_transfer_t *dt, size_t from)
    return true;
 }
 
-size_t data_transfer_iterate(data_transfer_t *dt, size_t max_bytes)
+/* The prefix surface is inert on a window handle.
+ *
+ * A window keeps a live RFILE and a reservation, so these three would
+ * otherwise pass their own guards on one and then disagree with the
+ * window's bookkeeping.  discard() is the dangerous one: its 'low'
+ * frontier knows nothing of keep/wlo/whi/wfreed, so it releases from
+ * offset 0 through the permanently resident head, non-strictly - the
+ * head comes back as zeros rather than faulting, which is silent
+ * corruption of exactly the bytes a loop lands on.  iterate() merely
+ * finds avail == len and settles done, making complete() answer yes
+ * about a file that was never read.
+ *
+ * Declining is the whole fix.  A window's bytes are managed by
+ * feed/extend/advance/rewind and its length is known from open, so
+ * there is nothing these can usefully do that the window surface does
+ * not already do correctly. */
+size_t data_transfer_iterate_while(data_transfer_t *dt, size_t max_bytes,
+      data_transfer_continue_t should_continue, void *ud)
 {
    if (!dt)
       return 0;
+   if (dt->window)
+      return dt->avail;           /* not this surface - see above */
    if (dt->f || dt->src_cb)
-      return data_transfer_prefix_iterate(dt, max_bytes);
+      return data_transfer_prefix_iterate(dt, max_bytes,
+            should_continue, ud);
    return dt->avail;
+}
+
+size_t data_transfer_iterate(data_transfer_t *dt, size_t max_bytes)
+{
+   return data_transfer_iterate_while(dt, max_bytes, NULL, NULL);
 }
 
 const uint8_t *data_transfer_ptr(data_transfer_t *dt, size_t *len)

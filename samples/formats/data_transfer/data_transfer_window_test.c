@@ -214,6 +214,496 @@ static int ahead_of_frontier_check(void)
 }
 #endif
 
+/* The prefix surface must be inert on a window handle.
+ *
+ * A window keeps a live RFILE and a reservation, so discard(),
+ * refill() and iterate() all pass their own guards on one.  Left
+ * unguarded they do not merely misbehave, they disagree with the
+ * window's bookkeeping: discard() walks a 'low' frontier that knows
+ * nothing of keep/wlo/whi/wfreed and releases from offset 0 - through
+ * the permanently resident head - and the release is non-strict, so
+ * the head returns as zeros rather than faulting.  That is silent
+ * corruption of exactly the bytes a loop lands on.  iterate() is the
+ * milder sibling: it finds avail == len, settles done, and complete()
+ * starts answering yes about a file that was never read.
+ *
+ * No caller mixes the two surfaces today - gfx_thumbnail keeps its
+ * windowed and read-pending states mutually exclusive by hand, and
+ * the webm core only discards a handle it opened as a prefix - so
+ * both hazards are held off by discipline rather than by the module.
+ * This pins the module's own guard, so the next consumer cannot reach
+ * them by accident. */
+static int surface_mixing_check(void)
+{
+   const char *path = "/tmp/dtwin_mix.bin";
+   size_t n = 4u << 20, i, blen = 0, avail_before;
+   uint8_t *ref = (uint8_t*)malloc(n);
+   data_transfer_t *dt;
+   const uint8_t *base;
+   FILE *f;
+   int rv = 0;
+
+   if (!ref)
+      return 0;
+   for (i = 0; i < n; i++)
+      ref[i] = (uint8_t)(i * 97 + 5);
+   f = fopen(path, "wb"); fwrite(ref, 1, n, f); fclose(f);
+
+   if (!(dt = data_transfer_open_window(path, KEEP)))
+   {
+      printf("[FAIL] open_window for the mixing check\n");
+      free(ref); remove(path);
+      return 1;
+   }
+
+   base         = data_transfer_window_base(dt, &blen);
+   avail_before = data_transfer_avail(dt);
+
+   /* discard() must not release the head it knows nothing about */
+   data_transfer_discard(dt, KEEP + (512u * 1024));
+   if (memcmp(base, ref, KEEP))
+   {
+      printf("[FAIL] discard() on a window released the resident head\n");
+      rv = 1;
+   }
+   else
+      ok("discard() on a window is inert: head still intact");
+
+   /* refill() is a no-op here, but must not report failure */
+   if (!data_transfer_refill(dt, 0))
+   {
+      printf("[FAIL] refill() on a window reported failure\n");
+      rv = 1;
+   }
+   else
+      ok("refill() on a window is inert and reports success");
+
+   /* iterate() must not settle a handle that has no fill to run */
+   data_transfer_iterate(dt, 64u * 1024);
+   if (data_transfer_avail(dt) != avail_before)
+   {
+      printf("[FAIL] iterate() on a window moved avail\n");
+      rv = 1;
+   }
+   else if (   data_transfer_window_is_reserved(dt)
+            && data_transfer_complete(dt))
+   {
+      printf("[FAIL] iterate() on a window settled complete()\n");
+      rv = 1;
+   }
+   else
+      ok("iterate() on a window is inert: nothing settled");
+
+   /* and the window must still work afterwards */
+   if (!data_transfer_window_feed(dt, KEEP, LOOKAHD, MARGIN))
+   {
+      printf("[FAIL] feed after the mixing attempts\n");
+      rv = 1;
+   }
+   else if (memcmp(base + KEEP, ref + KEEP, 65536))
+   {
+      printf("[FAIL] window contents wrong after the mixing attempts\n");
+      rv = 1;
+   }
+   else
+      ok("window still plays correctly after the mixing attempts");
+
+   data_transfer_free(dt);
+   free(ref); remove(path);
+   return rv;
+}
+
+/* Ranges that arrive from the caller must be bounded before use.
+ *
+ * The two differ sharply in how badly, and it is worth saying which
+ * is which.
+ *
+ * window_punch() was the dangerous one.  It rounds (from, to) and
+ * hands memdecommit map + f for t - f bytes, unclamped, and a
+ * non-strict decommit is madvise(MADV_DONTNEED) - which does not fail
+ * politely on a range that runs off the end of the reservation.  It
+ * zeroes whatever anonymous pages it does cover, and past a 4 MiB
+ * reservation a 64 MiB overrun reliably covers live heap.  Against
+ * the unfixed module the first punch below takes the process down
+ * with SIGSEGV inside the call, before it can return.
+ *
+ * window_peek() is the mild one: it tested off + n against the
+ * length, which a wrapping sum passes, but the oversized read then
+ * fails at the I/O layer and peek returns false anyway.  That check
+ * pins the contract rather than catching a fault. */
+static int range_bounds_check(void)
+{
+   const char *path = "/tmp/dtwin_bounds.bin";
+   size_t n = 4u << 20, i, blen = 0;
+   uint8_t *ref = (uint8_t*)malloc(n);
+   uint8_t tmp[64];
+   data_transfer_t *dt;
+   const uint8_t *base;
+   FILE *f;
+   int rv = 0;
+
+   if (!ref)
+      return 0;
+   for (i = 0; i < n; i++)
+      ref[i] = (uint8_t)(i * 31 + 7);
+   f = fopen(path, "wb"); fwrite(ref, 1, n, f); fclose(f);
+
+   if (!(dt = data_transfer_open_window(path, KEEP)))
+   {
+      printf("[FAIL] open_window for the bounds check\n");
+      free(ref); remove(path);
+      return 1;
+   }
+   base = data_transfer_window_base(dt, &blen);
+
+   /* an (off, n) whose sum wraps to zero must not read as in range */
+   if (data_transfer_window_peek(dt, n - 16, tmp,
+            (size_t)0 - (n - 16)))
+   {
+      printf("[FAIL] peek accepted a wrapping (off, n)\n");
+      rv = 1;
+   }
+   else if (data_transfer_window_peek(dt, n - 16, tmp, 64))
+   {
+      printf("[FAIL] peek accepted a range past the end\n");
+      rv = 1;
+   }
+   else if (!data_transfer_window_peek(dt, n - 64, tmp, 64))
+   {
+      printf("[FAIL] peek refused the last 64 bytes of the file\n");
+      rv = 1;
+   }
+   else if (memcmp(tmp, ref + n - 64, 64))
+   {
+      printf("[FAIL] peek returned the wrong bytes at the end\n");
+      rv = 1;
+   }
+   else
+      ok("peek bounds its range and still reads the last bytes");
+
+   /* a punch running far past the mapping must not be taken at its
+    * word, and must leave the head alone either way */
+   data_transfer_window_punch(dt, n - 4096, n + (64u << 20));
+   data_transfer_window_punch(dt, n + (64u << 20), n + (128u << 20));
+   if (memcmp(base, ref, KEEP))
+   {
+      printf("[FAIL] an out-of-range punch damaged the head\n");
+      rv = 1;
+   }
+   else if (!data_transfer_window_feed(dt, KEEP, LOOKAHD, MARGIN))
+   {
+      printf("[FAIL] feed after an out-of-range punch\n");
+      rv = 1;
+   }
+   else if (memcmp(base + KEEP, ref + KEEP, 65536))
+   {
+      printf("[FAIL] window contents wrong after an out-of-range punch\n");
+      rv = 1;
+   }
+   else
+      ok("out-of-range punch is bounded, window unaffected");
+
+   data_transfer_free(dt);
+   free(ref); remove(path);
+   return rv;
+}
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+
+/* A short read while extending must settle the handle.
+ *
+ * extend() and grow_keep() used to report an I/O failure by returning
+ * false and nothing else: the handle still looked healthy, and whi
+ * stayed put while the pages the call had already committed sat there
+ * unfilled.  Two live call sites discard the return - the audio mixer
+ * raises the head to cover the decoder's loop landing, and feeds the
+ * window each tick, without looking at either answer - so the value
+ * alone was never going to be noticed.  The loop landing is read on
+ * the audio thread before any feeder tick, which makes a silent
+ * failure there audible and untraceable.
+ *
+ * Truncating the file underneath an open window produces the short
+ * read: len was fixed at open, so extending into what is now past the
+ * end reads fewer bytes than asked for. */
+static int extend_settles_check(void)
+{
+   const char *path = "/tmp/dtwin_settle.bin";
+   size_t n = 4u << 20, i, blen = 0;
+   uint8_t *ref = (uint8_t*)malloc(n);
+   data_transfer_t *dt;
+   FILE *f;
+   int rv = 0;
+
+   if (!ref)
+      return 0;
+   for (i = 0; i < n; i++)
+      ref[i] = (uint8_t)(i * 53 + 11);
+   f = fopen(path, "wb"); fwrite(ref, 1, n, f); fclose(f);
+
+   if (!(dt = data_transfer_open_window(path, KEEP)))
+   {
+      printf("[FAIL] open_window for the settle check\n");
+      free(ref); remove(path);
+      return 1;
+   }
+   data_transfer_window_base(dt, &blen);
+
+   if (!data_transfer_reserve_supported())
+   {
+      /* the fallback holds the whole file and extend never reads */
+      printf("[skip] extend settles: no reservations on this build\n");
+      data_transfer_free(dt); free(ref); remove(path);
+      return 0;
+   }
+
+   if (!data_transfer_window_feed(dt, KEEP, LOOKAHD, MARGIN))
+      { printf("[FAIL] feed before the truncation\n"); rv = 1; }
+   else if (data_transfer_failed(dt))
+   { printf("[FAIL] handle already failed before the truncation\n"); rv = 1; }
+
+   /* the file shrinks under the open transfer */
+   if (!rv && truncate(path, (off_t)(KEEP + LOOKAHD)) != 0)
+   {
+      printf("[skip] extend settles: truncate unavailable\n");
+      data_transfer_free(dt); free(ref); remove(path);
+      return 0;
+   }
+
+   if (!rv)
+   {
+      if (data_transfer_window_extend(dt, n))
+      {
+         printf("[FAIL] extend past a truncation reported success\n");
+         rv = 1;
+      }
+      else if (!data_transfer_failed(dt))
+      {
+         printf("[FAIL] a short read in extend did not settle the "
+                "handle\n");
+         rv = 1;
+      }
+      else if (data_transfer_complete(dt))
+      {
+         printf("[FAIL] a settled window reports complete()\n");
+         rv = 1;
+      }
+      else
+         ok("a short read in extend settles the handle");
+   }
+
+   /* and the surface is frozen: a caller that ignores the return must
+    * not be able to drive it further */
+   if (!rv)
+   {
+      if (   data_transfer_window_extend(dt, n)
+          || data_transfer_window_grow_keep(dt, KEEP * 4)
+          || data_transfer_window_feed(dt, 0, LOOKAHD, MARGIN)
+          || data_transfer_window_peek(dt, 0, ref, 16))
+      {
+         printf("[FAIL] a settled window still accepts work\n");
+         rv = 1;
+      }
+      else
+         ok("a settled window refuses every further call");
+   }
+
+   data_transfer_free(dt);
+   free(ref); remove(path);
+   return rv;
+}
+#else
+static int extend_settles_check(void)
+{
+   printf("[skip] extend settles: needs truncate()\n");
+   return 0;
+}
+#endif
+
+/* Every entry point must tolerate a NULL handle.
+ *
+ * Most of the surface already did, and window_is_reserved() did, but
+ * its immediate neighbour window_base() dereferenced without looking
+ * - despite having an exact NULL-safe twin in data_transfer_ptr().
+ * A caller cannot infer a rule from a surface that is split like
+ * that, so the rule is now: bool returns false, pointer returns NULL,
+ * void does nothing.
+ *
+ * This runs in a child because the failure is a segfault, not a
+ * wrong answer. */
+#if defined(__unix__) || defined(__APPLE__)
+static int null_handle_check(void)
+{
+   pid_t pid = fork();
+   int   status = 0;
+
+   if (pid < 0)
+   {
+      printf("[skip] NULL handles: fork unavailable\n");
+      return 0;
+   }
+   if (pid == 0)
+   {
+      uint8_t buf[16];
+      size_t  len = 12345;
+      int     bad = 0;
+
+      /* window surface */
+      if (data_transfer_window_is_reserved(NULL))          bad = 1;
+      if (data_transfer_window_base(NULL, &len))           bad = 1;
+      if (len != 0)                                        bad = 1;
+      if (data_transfer_window_base(NULL, NULL))           bad = 1;
+      if (data_transfer_window_extend(NULL, 4096))         bad = 1;
+      if (data_transfer_window_grow_keep(NULL, 4096))      bad = 1;
+      if (data_transfer_window_peek(NULL, 0, buf, 16))     bad = 1;
+      if (data_transfer_window_feed(NULL, 0, 4096, 4096))  bad = 1;
+      data_transfer_window_advance(NULL, 4096);
+      data_transfer_window_rewind(NULL);
+      data_transfer_window_punch(NULL, 0, 4096);
+
+      /* shared surface */
+      if (data_transfer_iterate(NULL, 4096))               bad = 1;
+      len = 12345;
+      if (data_transfer_ptr(NULL, &len))                   bad = 1;
+      if (len != 0)                                        bad = 1;
+      if (data_transfer_avail(NULL))                       bad = 1;
+      if (data_transfer_complete(NULL))                    bad = 1;
+      if (data_transfer_capped(NULL))                      bad = 1;
+      if (data_transfer_failed(NULL))                      bad = 1;
+      if (data_transfer_refill(NULL, 0))                   bad = 1;
+      data_transfer_discard(NULL, 4096);
+      data_transfer_free(NULL);
+
+      _exit(bad ? 61 : 60);
+   }
+   waitpid(pid, &status, 0);
+
+   if (WIFSIGNALED(status))
+   {
+      printf("[FAIL] a NULL handle killed the process (signal %d)\n",
+            WTERMSIG(status));
+      return 1;
+   }
+   if (WIFEXITED(status) && WEXITSTATUS(status) == 61)
+   {
+      printf("[FAIL] a NULL handle produced a non-empty answer\n");
+      return 1;
+   }
+   if (WIFEXITED(status) && WEXITSTATUS(status) == 60)
+   {
+      printf("[ok]   every entry point tolerates a NULL handle\n");
+      return 0;
+   }
+   printf("[FAIL] the NULL-handle child ended unexpectedly\n");
+   return 1;
+}
+#else
+static int null_handle_check(void)
+{
+   printf("[skip] NULL handles: needs fork()\n");
+   return 0;
+}
+#endif
+
+#if defined(__unix__) || defined(__APPLE__)
+/* Settling must take back everything above the frontier.
+ *
+ * A failed extend() has already committed the range it was about to
+ * fill, so without the release those pages read as zeros - in the one
+ * place the mode guarantees a fault.  The check forces the failure by
+ * truncating, then reads far above the last good frontier in a child:
+ * the child must die.  Against a module that settles without
+ * releasing, it survives and reads zeros instead.
+ *
+ * The release is strict in every build, so this does not need
+ * DT_STRICT. */
+static int settle_releases_check(void)
+{
+   const char *path = "/tmp/dtwin_release.bin";
+   size_t n = 8u << 20, i;
+   uint8_t *ref = (uint8_t*)malloc(n);
+   FILE *f;
+   pid_t pid;
+   int status = 0;
+
+   if (!ref)
+      return 0;
+   for (i = 0; i < n; i++)
+      ref[i] = (uint8_t)(i * 17 + 3);
+   f = fopen(path, "wb"); fwrite(ref, 1, n, f); fclose(f);
+   free(ref);
+
+   if (!data_transfer_reserve_supported())
+   {
+      printf("[skip] settle releases: no reservations on this build\n");
+      remove(path);
+      return 0;
+   }
+#if defined(__SANITIZE_ADDRESS__)
+   printf("[skip] settle releases: the sanitizer intercepts it\n");
+   remove(path);
+   return 0;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+   printf("[skip] settle releases: the sanitizer intercepts it\n");
+   remove(path);
+   return 0;
+#endif
+#endif
+
+   if ((pid = fork()) == 0)
+   {
+      data_transfer_t *dt = data_transfer_open_window(path, KEEP);
+      const uint8_t *base;
+      size_t blen = 0;
+      volatile uint8_t v;
+
+      if (!dt)
+         _exit(3);
+      base = data_transfer_window_base(dt, &blen);
+      if (!data_transfer_window_feed(dt, KEEP, LOOKAHD, MARGIN))
+         _exit(4);
+      /* cut the file just above the frontier, then ask for the rest:
+       * the extend commits far ahead and then reads short */
+      if (truncate(path, (off_t)(KEEP + LOOKAHD)) != 0)
+         _exit(5);
+      if (data_transfer_window_extend(dt, n))
+         _exit(6);                /* it was supposed to fail */
+      if (!data_transfer_failed(dt))
+         _exit(7);
+      v = base[n - 4096];         /* deep inside the failed commit */
+      _exit(42);                  /* reached only if it did not fault */
+      (void)v;
+   }
+   waitpid(pid, &status, 0);
+   remove(path);
+
+   if (WIFEXITED(status) && WEXITSTATUS(status) == 42)
+   {
+      printf("[FAIL] a settled window still reads zeros above the "
+             "frontier instead of faulting\n");
+      return 1;
+   }
+   if (WIFEXITED(status) && WEXITSTATUS(status) >= 3
+         && WEXITSTATUS(status) <= 7)
+   {
+      printf("[FAIL] the settle-release child bailed at setup (%d)\n",
+            WEXITSTATUS(status));
+      return 1;
+   }
+   /* Anything else is the fault: a signal normally, or the sanitizer
+    * ending the process its own way with its own exit code. */
+   printf("[ok]   settling releases above the frontier: it faults\n");
+   return 0;
+}
+#else
+static int settle_releases_check(void)
+{
+   printf("[skip] settle releases: needs fork()\n");
+   return 0;
+}
+#endif
+
 int main(void)
 {
    const char *path = "/tmp/dtwin.bin";
@@ -296,6 +786,11 @@ int main(void)
 #endif
 
    bad |= ahead_of_frontier_check();
+   bad |= surface_mixing_check();
+   bad |= range_bounds_check();
+   bad |= extend_settles_check();
+   bad |= null_handle_check();
+   bad |= settle_releases_check();
 
    printf("%s\n", bad ? "FAILED" : "PASS");
    return bad;

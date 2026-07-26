@@ -50,8 +50,16 @@
 #include <encodings/deflate.h>
 #endif
 
-#ifdef HAVE_ZSTD
+/* Either decoder will do for a member stored with Zstandard; rzstd is
+ * preferred where a build has it, and the reference remains available
+ * until every platform has moved. */
+#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
+#define ZIP_HAVE_ZSTD 1
+#ifdef HAVE_RZSTD
+#include <encodings/rzstd.h>
+#else
 #include <zstd.h>
+#endif
 #endif
 
 #ifndef CENTRAL_FILE_HEADER_SIGNATURE
@@ -146,7 +154,19 @@ static bool zlib_stream_decompress_data_to_file_init(
    /* seek past most of the local directory header */
 #ifdef HAVE_MMAP
    if (state->archive_mmap_data)
+   {
+      /* cdata is a file offset taken from the central directory and is
+       * not otherwise validated, so bound the 30-byte local header
+       * (26 skipped + 4 read here) against the mapping before reading
+       * it - a crafted offset near the end of the archive would
+       * otherwise read past the mmap. */
+      if ((int64_t)(size_t)cdata + 26 + 4 > state->archive_size)
+      {
+         zip_context_free_stream(zip_context, false);
+         return false;
+      }
       local_header = state->archive_mmap_data + (size_t)cdata + 26;
+   }
    else
 #endif
    {
@@ -162,6 +182,32 @@ static bool zlib_stream_decompress_data_to_file_init(
    offsetNL = read_le(local_header,     2); /* file name length */
    offsetEL = read_le(local_header + 2, 2); /* extra field length */
    offsetData = (int64_t)(size_t)cdata + 26 + 4 + offsetNL + offsetEL;
+
+   /* offsetData and the member sizes come from the archive and drive
+    * the mmap reads in the iterate step below (memcpy of usize bytes
+    * for STORED, csize-bounded chunks for DEFLATED).  Reject a member
+    * whose data would extend past the mapping now, rather than reading
+    * out of bounds later.  The non-mmap path is naturally bounded - a
+    * seek past EOF followed by a read simply returns short - so this
+    * only needs to hold for the mapped case, but checking it always is
+    * harmless and keeps the two paths consistent.
+    *
+    * Only csize describes the member's on-disk extent; size is the
+    * decompressed length and bounds the output heap buffer, not the
+    * archive.  For any compressed mode size is routinely far larger
+    * than the whole archive, so it must not be bounded against
+    * archive_size - doing so rejects every normally-compressed member.
+    * STORED is the one mode that reads usize bytes straight out of the
+    * archive, and there it is bounded below. */
+   if (       offsetData < 0
+         ||   offsetData          > state->archive_size
+         || (int64_t)csize        > state->archive_size - offsetData
+         || (      cmode == ZIP_MODE_STORED
+               && (int64_t)size   > state->archive_size - offsetData))
+   {
+      zip_context_free_stream(zip_context, false);
+      return false;
+   }
 
    zip_context->fdoffset              = offsetData;
    zip_context->usize                 = size;
@@ -234,7 +280,7 @@ static bool zlib_stream_decompress_data_to_file_init(
       }
 #endif
    }
-#ifdef HAVE_ZSTD
+#ifdef ZIP_HAVE_ZSTD
    else if (cmode == ZIP_MODE_ZSTD)
    {
       /* Allocate a buffer to read compressed data into;
@@ -361,18 +407,27 @@ static int zlib_stream_decompress_data_to_file_iterate(
 
       return 0;   /* still more data to process */
    }
-#ifdef HAVE_ZSTD
+#ifdef ZIP_HAVE_ZSTD
    else if (zip_context->cmode == ZIP_MODE_ZSTD)
    {
       size_t result;
+      int    zerr;
 
 #ifdef HAVE_MMAP
       if (state->archive_mmap_data)
       {
+#ifdef HAVE_RZSTD
+         zerr = (rzstd_decode(
+               zip_context->decompressed_data, zip_context->usize,
+               state->archive_mmap_data + (size_t)zip_context->fdoffset,
+               zip_context->csize, &result) != RZSTD_PROCESS_END);
+#else
          result = ZSTD_decompress(
                zip_context->decompressed_data, zip_context->usize,
                state->archive_mmap_data + (size_t)zip_context->fdoffset,
                zip_context->csize);
+         zerr   = ZSTD_isError(result);
+#endif
       }
       else
 #endif
@@ -385,12 +440,20 @@ static int zlib_stream_decompress_data_to_file_iterate(
                   zip_context->tmpbuf, zip_context->csize) < 0)
             return -1;
 
+#ifdef HAVE_RZSTD
+         zerr = (rzstd_decode(
+               zip_context->decompressed_data, zip_context->usize,
+               zip_context->tmpbuf, zip_context->csize, &result)
+               != RZSTD_PROCESS_END);
+#else
          result = ZSTD_decompress(
                zip_context->decompressed_data, zip_context->usize,
                zip_context->tmpbuf, zip_context->csize);
+         zerr   = ZSTD_isError(result);
+#endif
       }
 
-      if (ZSTD_isError(result))
+      if (zerr)
          return -1;
 
       free(zip_context->tmpbuf);
