@@ -50,7 +50,6 @@ static int file_archive_get_file_list_cb(
       struct archive_extract_userdata *userdata)
 {
    union string_list_elem_attr attr;
-   attr.i = RARCH_COMPRESSED_FILE_IN_ARCHIVE;
 
    if (valid_exts)
    {
@@ -85,6 +84,7 @@ static int file_archive_get_file_list_cb(
       string_list_deinitialize(&ext_list);
    }
 
+   attr.i = RARCH_COMPRESSED_FILE_IN_ARCHIVE;
    return string_list_append(userdata->list, path, attr);
 }
 
@@ -160,10 +160,16 @@ static int file_archive_parse_file_init(file_archive_transfer_t *state,
    state->archive_size = filestream_get_size(state->archive_file);
 
 #ifdef HAVE_MMAP
-   if (state->archive_size <= (256*1024*1024))
+   /* mmap needs a real host fd. Skip VFS URL schemes (smb://, cdrom://,
+    * saf://, ...) where POSIX open() cannot work, and require fd >= 0 —
+    * open() returns -1 on failure, which is truthy and previously slipped
+    * into mmap(). */
+   if (     state->archive_size > 0
+         && state->archive_size <= (256 * 1024 * 1024)
+         && !strstr(path, "://"))
    {
       state->archive_mmap_fd = open(path, O_RDONLY);
-      if (state->archive_mmap_fd)
+      if (state->archive_mmap_fd >= 0)
       {
          state->archive_mmap_data = (uint8_t*)mmap(NULL,
                (size_t)state->archive_size,
@@ -221,7 +227,10 @@ int file_archive_parse_file_iterate(
             state->type = ARCHIVE_TRANSFER_ITERATE;
          }
          else
+         {
             state->type = ARCHIVE_TRANSFER_DEINIT_ERROR;
+            goto deinit_error;
+         }
          break;
       case ARCHIVE_TRANSFER_ITERATE:
          if (state->backend)
@@ -296,7 +305,9 @@ int file_archive_parse_file_iterate(
          }
          return -1;
       case ARCHIVE_TRANSFER_DEINIT_ERROR:
-         *returnerr = false;
+deinit_error:
+         if (returnerr)
+            *returnerr = false;
       case ARCHIVE_TRANSFER_DEINIT:
          if (state->context)
          {
@@ -771,6 +782,7 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
    file_archive_transfer_t state;
    struct archive_extract_userdata userdata        = {0};
    bool returnerr                                  = false;
+   bool found                                      = true;
    const char *archive_path                        = NULL;
    bool contains_compressed = path_contains_compressed_file(path);
 
@@ -797,11 +809,22 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
 
    for (;;)
    {
+      /* Nothing left to look at.  Without this the loop spins: the
+       * iterate call is skipped once the transfer leaves ITERATE, and
+       * the two tests below then read a current_file_path that can no
+       * longer change.  A member that is not in the archive - or an
+       * archive that failed to open at all - hung here rather than
+       * returning. */
+      if (state.type != ARCHIVE_TRANSFER_ITERATE)
+      {
+         found = false;
+         break;
+      }
+
       /* Now find the first file in the archive. */
-      if (state.type == ARCHIVE_TRANSFER_ITERATE)
-         file_archive_parse_file_iterate(&state,
-                  &returnerr, path, NULL, NULL,
-                  &userdata);
+      file_archive_parse_file_iterate(&state,
+               &returnerr, path, NULL, NULL,
+               &userdata);
 
       /* If no path specified within archive, stop after
        * finding the first file.
@@ -820,6 +843,16 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
    }
 
    file_archive_parse_file_iterate_stop(&state);
+
+   /* Report nothing rather than whichever entry the walk stopped on:
+    * the caller cannot tell a real checksum from a leftover one, and
+    * the scanner would match content against the wrong record. */
+   if (!found)
+   {
+      *size = 0;
+      return 0;
+   }
+
    *size = userdata.size;
    return userdata.crc;
 }

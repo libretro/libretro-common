@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <encodings/crc32.h>
 #include <formats/rmp4.h>
 #include <formats/rmp4_audio.h>
 
@@ -100,7 +101,9 @@ static int rmp4_pcm_reserve(rmp4_pcm_acc *a, size_t add_frames)
 
 #ifdef HAVE_ROPUS
 /* Maximum frames one Opus packet can produce: 120 ms at 48 kHz. */
-#define RMP4_OPUS_MAX_FRAMES 5760
+/* The reserve above and the room passed to the decoder are the
+ * same number; take it from ropus rather than restating it. */
+#define RMP4_OPUS_MAX_FRAMES ROPUS_MAX_FRAME
 
 static int rmp4_audio_decode_opus(rmp4_t *m, const rmp4_track *t,
       int track_idx, rmp4_pcm_acc *a, unsigned *rate)
@@ -128,10 +131,12 @@ static int rmp4_audio_decode_opus(rmp4_t *m, const rmp4_track *t,
        * of one another */
       if (a->elem == sizeof(float))
          produced = ropus_decode_f32(o, pkt.data, pkt.size,
-               (float*)RMP4_ACC_AT(a, a->frames));
+               (float*)RMP4_ACC_AT(a, a->frames),
+               (size_t)RMP4_OPUS_MAX_FRAMES * a->channels);
       else
          produced = ropus_decode_s16(o, pkt.data, pkt.size,
-               (int16_t*)RMP4_ACC_AT(a, a->frames));
+               (int16_t*)RMP4_ACC_AT(a, a->frames),
+               (size_t)RMP4_OPUS_MAX_FRAMES * a->channels);
       if (produced < 0)
          break;                    /* malformed packet: keep what we have */
       if (skip)
@@ -219,24 +224,6 @@ static int rmp4_audio_decode_aac(rmp4_t *m, const rmp4_track *t,
 /* ==================================================================== */
 
 #ifdef HAVE_RVORBIS
-static uint32_t rmp4_ogg_crc_table[256];
-static int      rmp4_ogg_crc_ready = 0;
-
-static void rmp4_ogg_crc_init(void)
-{
-   unsigned i, j;
-   if (rmp4_ogg_crc_ready)
-      return;
-   for (i = 0; i < 256; i++)
-   {
-      uint32_t r = (uint32_t)i << 24;
-      for (j = 0; j < 8; j++)
-         r = (r << 1) ^ ((r & 0x80000000u) ? 0x04c11db7u : 0);
-      rmp4_ogg_crc_table[i] = r;
-   }
-   rmp4_ogg_crc_ready = 1;
-}
-
 typedef struct
 {
    uint8_t *data;
@@ -300,8 +287,7 @@ static int rmp4_ogg_page(rmp4_ogg *g, const uint8_t *pkt, size_t len,
    g->size += head + len;
    g->seq++;
 
-   for (k = 0; k < head + len; k++)
-      crc = (crc << 8) ^ rmp4_ogg_crc_table[(uint8_t)(crc >> 24) ^ p[k]];
+   crc = encoding_crc32_ogg(crc, p, head + len);
    for (k = 0; k < 4; k++)
       p[22 + k] = (uint8_t)(crc >> (8 * k));
    return 1;
@@ -360,7 +346,6 @@ static int rmp4_audio_decode_vorbis(rmp4_t *m, const rmp4_track *t,
          hdr, hdr_len))
       return 0;
 
-   rmp4_ogg_crc_init();
    memset(&g, 0, sizeof(g));
    g.serial = 0x52415741;   /* arbitrary but fixed */
 
