@@ -730,6 +730,79 @@ void *rinflate_new(int window_bits)
 
 void rinflate_free(void *data) { free(data); }
 
+void rinflate_reset(void *data, int window_bits)
+{
+   struct rinflate *s = (struct rinflate*)data;
+   if (!s)
+      return;
+
+   /* Restore the state rinflate_new hands back, without re-zeroing the
+    * 32 KiB back-reference window or the ~9 KiB of huffman tables.
+    *
+    * The window is safe to leave dirty because whave is cleared here:
+    * a back-reference is only resolved out of the ring after a bounds
+    * check against out_pos + whave, so with whave 0 no stale byte is
+    * reachable, exactly as for a fresh instance whose window happens
+    * to be zeroed. The tables are safe because have_tables and
+    * fixed_loaded are cleared, so any stream must rebuild them before
+    * a symbol is decoded, and rinf_build clears each table's fast
+    * lookup as it goes.
+    *
+    * Everything else is set to the same value calloc would have
+    * produced. Fields are listed rather than memset in bulk so that
+    * adding one to the struct without touching this function is a
+    * compile-time-visible omission rather than a silent stale value. */
+   s->phase            = (window_bits >= 0) ? RINF_ZHEADER : RINF_BLOCK_HDR;
+   s->wrapped          = (window_bits >= 0);
+
+   s->in               = NULL;
+   s->in_size          = 0;
+   s->in_pos           = 0;
+   s->out              = NULL;
+   s->out_size         = 0;
+   s->out_pos          = 0;
+
+   s->bitbuf           = 0;
+   s->bitcnt           = 0;
+
+   s->whave            = 0;
+   s->wnext            = 0;
+
+   s->bfinal           = 0;
+   s->btype            = 0;
+   s->stored_len       = 0;
+
+   s->fixed_loaded     = 0;
+   s->have_tables      = 0;
+
+   s->hlit             = 0;
+   s->hdist            = 0;
+   s->hclen            = 0;
+   memset(s->cl_lengths, 0, sizeof(s->cl_lengths));
+   memset(s->lengths,    0, sizeof(s->lengths));
+   s->lengths_have     = 0;
+   s->clcodes_read     = 0;
+   s->clcode_built     = 0;
+   s->cl_pending_sym   = 0;
+
+   s->copy_len         = 0;
+   s->copy_dist        = 0;
+   s->copy_active      = 0;
+
+   s->ld_step          = 0;
+   s->ld_lensym        = 0;
+   s->ld_length        = 0;
+   s->ld_distsym       = 0;
+   s->pending_lit      = 0;
+   s->have_pending_lit = 0;
+
+   s->adler            = 1;
+   s->adler_read       = 0;
+   s->adler_have       = 0;
+
+   s->error            = 0;
+}
+
 void rinflate_set_in(void *data, const uint8_t *in, size_t size)
 {
    struct rinflate *s = (struct rinflate*)data;
@@ -1628,6 +1701,21 @@ struct rdeflate
    uint8_t  dyn_rle[288 + 30];    /* RLE'd (lit+dist) code lengths           */
    uint8_t  dyn_rle_extra[288 + 30];
    int      dyn_rle_n;
+
+   /* Huffman length-generation scratch.  These were locals in
+    * rd_gen_lengths(), which made that a 12768-byte frame - the
+    * two-queue tree needs 2*288 nodes of weight, left, right and
+    * depth, on top of the 288-entry sort arrays.  A frame that size
+    * does not belong on a stack whatever the target: it sits under
+    * whatever called it, and the state struct here is calloc'd once
+    * per stream, so the arrays cost nothing extra to keep. */
+   int      gl_idx[288];
+   uint32_t gl_fr[288];
+   int      gl_lc[288];
+   uint32_t gl_wt[2 * 288];
+   int      gl_left[2 * 288];
+   int      gl_right[2 * 288];
+   int      gl_depth[2 * 288];
 };
 
 /* ------- bit writer (LSB-first) -------
@@ -2455,12 +2543,13 @@ static int rd_emit_block_stored(struct rdeflate *s)
  * always yielding a complete (Kraft-exact) code.  Builds a Huffman tree by
  * repeated lowest-weight sibling merges, reads off depths, then repairs any
  * over-long codes with a Kraft-sum redistribution. */
-static void rd_gen_lengths(const uint32_t *freq, int n, int max_bits,
+static void rd_gen_lengths(struct rdeflate *s,
+      const uint32_t *freq, int n, int max_bits,
       uint8_t *lengths_out)
 {
-   int      idx[288];
-   uint32_t fr[288];
-   int      lc[288];
+   int      *idx = s->gl_idx;
+   uint32_t *fr  = s->gl_fr;
+   int      *lc  = s->gl_lc;
    int      m = 0;
    int      i;
 
@@ -2511,10 +2600,10 @@ static void rd_gen_lengths(const uint32_t *freq, int n, int max_bits,
     * once assigns every depth without the per-leaf parent-chain
     * walk the old code did. */
    {
-      uint32_t wt[2 * 288];
-      int      left[2 * 288];
-      int      right[2 * 288];
-      int      depth[2 * 288];
+      uint32_t *wt    = s->gl_wt;
+      int      *left  = s->gl_left;
+      int      *right = s->gl_right;
+      int      *depth = s->gl_depth;
       int      lq = 0;   /* front of the leaf queue                   */
       int      iq = 288; /* front of the internal queue (base 288)    */
       int      node_used;
@@ -2685,8 +2774,8 @@ static uint32_t rd_build_dynamic(struct rdeflate *s)
    /* the end-of-block symbol (256) always occurs once */
    s->freq_lit[256]++;
 
-   rd_gen_lengths(s->freq_lit, 286, 15, s->dyn_lit_len);
-   rd_gen_lengths(s->freq_dist, 30, 15, s->dyn_dist_len);
+   rd_gen_lengths(s, s->freq_lit, 286, 15, s->dyn_lit_len);
+   rd_gen_lengths(s, s->freq_dist, 30, 15, s->dyn_dist_len);
 
    /* hlit: number of lit/len codes (257..286); hdist: dist codes (1..30) */
    maxlit = 285;
@@ -2704,7 +2793,7 @@ static uint32_t rd_build_dynamic(struct rdeflate *s)
    rd_codes_from_lengths(s->dyn_dist_len, 30, s->dyn_dist_code);
 
    rd_rle_lengths(s, cl_freq);
-   rd_gen_lengths(cl_freq, 19, 7, s->dyn_cl_len);
+   rd_gen_lengths(s, cl_freq, 19, 7, s->dyn_cl_len);
    rd_codes_from_lengths(s->dyn_cl_len, 19, s->dyn_cl_code);
 
    /* hclen: number of CL code lengths present (in clc_order), min 4 */

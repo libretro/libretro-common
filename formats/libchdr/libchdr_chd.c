@@ -1380,18 +1380,30 @@ CHD_EXPORT const chd_header *chd_get_header(chd_file *chd)
 CHD_EXPORT chd_error chd_read_header_core_file(core_file *file, chd_header *header)
 {
 	chd_error err;
-	chd_file fake;
+	chd_file *fake;
 
 	/* punt if NULL */
 	if (file == NULL || header == NULL)
 		return CHDERR_INVALID_PARAMETER;
 
 	/* header_read only touches ->file, but hand it a fully zeroed
-	 * struct so that stays true by inspection. */
-	memset(&fake, 0, sizeof(fake));
-	fake.file = file;
+	 * struct so that stays true by inspection.
+	 *
+	 * Heap rather than a local: chd_file embeds the working state of
+	 * every codec it can use - huff, zlib, cdzl, lzma - so as
+	 * 'chd_file fake;' this was a 57504-byte frame, zeroed in full,
+	 * to read a header that reads one member of it. No target with a
+	 * small thread stack builds CHD, so this was not a crash, but a
+	 * frame that size does not belong on any stack: it sits under
+	 * whatever called it, and nothing about "read this file's header"
+	 * suggests it costs 56 KiB to do. */
+	fake = (chd_file *)calloc(1, sizeof(*fake));
+	if (fake == NULL)
+		return CHDERR_OUT_OF_MEMORY;
+	fake->file = file;
 
-	err = header_read(&fake, header);
+	err = header_read(fake, header);
+	free(fake);
 	if (err != CHDERR_NONE)
 		return err;
 
@@ -2110,17 +2122,27 @@ static chd_error hunk_read_into_memory(chd_file *chd, uint32_t hunknum, uint8_t 
 static chd_error map_read(chd_file *chd)
 {
 	uint32_t entrysize = (chd->header.version < 3) ? OLD_MAP_ENTRY_SIZE : MAP_ENTRY_SIZE;
-	uint8_t raw_map_entries[MAP_STACK_ENTRIES * MAP_ENTRY_SIZE];
+	/* 8 KiB chunk buffer: heap-allocated because a v3/v4 open can run
+	 * on threads with 8 KiB stacks on some targets, which a local of
+	 * this size overruns on entry. One allocation per open. */
+	uint8_t *raw_map_entries;
 	uint64_t fileoffset, maxoffset = 0;
 	uint8_t cookie[MAP_ENTRY_SIZE];
 	uint32_t count;
 	chd_error err;
 	uint32_t i;
 
+	raw_map_entries = (uint8_t *)malloc(MAP_STACK_ENTRIES * MAP_ENTRY_SIZE);
+	if (!raw_map_entries)
+		return CHDERR_OUT_OF_MEMORY;
+
 	/* first allocate memory */
 	chd->map = (map_entry *)malloc(sizeof(chd->map[0]) * chd->header.totalhunks);
 	if (!chd->map)
+	{
+		free(raw_map_entries);
 		return CHDERR_OUT_OF_MEMORY;
+	}
 
 	/* read the map entries in in chunks and extract to the map list */
 	fileoffset = chd->header.length;
@@ -2175,9 +2197,11 @@ static chd_error map_read(chd_file *chd)
 		err = CHDERR_INVALID_FILE;
 		goto cleanup;
 	}
+	free(raw_map_entries);
 	return CHDERR_NONE;
 
 cleanup:
+	free(raw_map_entries);
 	if (chd->map)
 		free(chd->map);
 	chd->map = NULL;

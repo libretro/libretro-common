@@ -27,6 +27,7 @@
 #include <queues/task_queue.h>
 
 #include <features/features_cpu.h>
+#include <retro_atomic.h>
 
 #if defined(HAVE_GCD) && !defined(HAVE_THREADS)
 #error "gcd uses threads, what are you doing"
@@ -35,7 +36,7 @@
 #ifdef HAVE_THREADS
 #include <rthreads/rthreads.h>
 #endif
-#if defined(EMSCRIPTEN) || defined(_3DS)
+#if defined(__EMSCRIPTEN__) || defined(_3DS)
 #include <retro_timers.h>
 #endif
 #ifdef HAVE_GCD
@@ -196,13 +197,25 @@ static retro_task_t *task_queue_get(task_queue_t *queue)
    return task;
 }
 
-static void retro_task_internal_retire_body(retro_task_t *task)
+/* Split in two so the threaded gather can run the callback while the
+ * task is still findable (callers rely on find() staying truthful
+ * until a task is fully retired) but defer the teardown until after
+ * it has been pruned from the retiring list.
+ *
+ * cleanup() is where a task releases task->state, and finders
+ * dereference task->state -- tasks/task_http.c's does.  Running
+ * cleanup while the task is still reachable from tasks_retiring, and
+ * with neither lock held, races any concurrent find(). */
+static void retro_task_internal_retire_callback(retro_task_t *task)
 {
    task_queue_push_progress(task);
 
    if (task->callback)
       task->callback(task, task->task_data, task->user_data, task->error);
+}
 
+static void retro_task_internal_retire_cleanup(retro_task_t *task)
+{
    if (task->cleanup)
        task->cleanup(task);
 
@@ -230,7 +243,10 @@ static void retro_task_internal_gather(void)
    retro_task_t *task = NULL;
    while ((task = task_queue_get(&tasks_finished)))
    {
-      retro_task_internal_retire_body(task);
+      /* Already popped off the queue, so it is unreachable either way
+       * and the split is unobservable here. */
+      retro_task_internal_retire_callback(task);
+      retro_task_internal_retire_cleanup(task);
       free(task);
    }
 }
@@ -503,11 +519,18 @@ static void retro_task_threaded_gather(void)
          if (!task)
             break;
 
-         retro_task_internal_retire_body(task);
+         /* Callback first, while the task is still findable: it may
+          * push follow-up tasks (taking running_lock), so it cannot
+          * run under finished_lock. */
+         retro_task_internal_retire_callback(task);
 
          slock_lock(finished_lock);
          task_queue_remove(&tasks_retiring, task);
          slock_unlock(finished_lock);
+
+         /* Only now is the task unreachable from find(), so this is
+          * the first point at which releasing task->state is safe. */
+         retro_task_internal_retire_cleanup(task);
 
          free(task);
       }
@@ -661,7 +684,7 @@ static void threaded_worker(void *userdata)
 
       slock_unlock(running_lock);
       task->handler(task);
-#if defined(EMSCRIPTEN) || defined(_3DS)
+#if defined(__EMSCRIPTEN__) || defined(_3DS)
       /* Workaround emscripten pthread bug where not parking the
          thread will prevent other important stuff from
          happening. Maybe due to lack of signals implementation in
@@ -1247,8 +1270,21 @@ char* task_get_title(retro_task_t *task)
 
 retro_task_t *task_init(void)
 {
-   /* TODO/FIXME - static local global */
-   static uint32_t task_count = 0;
+   /* TODO/FIXME - static local global
+    *
+    * Tasks are pushed from whatever thread happens to want one - the
+    * main thread, the menu, netplay, a core's own worker - so this
+    * counter is incremented concurrently.  A plain read-modify-write
+    * is a data race, and hands out duplicate idents when two pushes
+    * interleave.  An acq_rel fetch_add serialises the handout and
+    * gives every task a distinct value.
+    *
+    * int rather than uint32_t because that is the width retro_atomic
+    * offers; ident is an opaque tag, so the eventual wrap at INT_MAX
+    * (2.1 billion task creations) is of no consequence, and the cast
+    * back to uint32_t is well defined for the non-negative values
+    * this can produce before then. */
+   static retro_atomic_int_t task_count;
    retro_task_t *task         = (retro_task_t*)malloc(sizeof(*task));
 
    if (!task)
@@ -1267,7 +1303,8 @@ retro_task_t *task_init(void)
    task->title             = NULL;
    task->type              = TASK_TYPE_NONE;
    task->style             = TASK_STYLE_NONE;
-   task->ident             = task_count++;
+   task->ident             = (uint32_t)
+      retro_atomic_fetch_add_int(&task_count, 1);
    task->frontend_userdata = NULL;
    task->next              = NULL;
    task->when              = 0;

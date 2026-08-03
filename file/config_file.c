@@ -831,7 +831,10 @@ static int config_file_load_internal(
       struct config_file *conf,
       const char *path, unsigned depth, config_file_cb_t *cb)
 {
-   const config_file_io_t *io = config_file_io_default;
+   /* The config's own interface wins over the process default, so a
+    * caller can serve one config (and its includes) from somewhere
+    * else without touching global state other threads share. */
+   const config_file_io_t *io = conf->io ? conf->io : config_file_io_default;
    int64_t   length    = 0;
    char     *buf       = NULL;
    char     *new_path;
@@ -936,6 +939,8 @@ static bool config_file_parse_line(config_file_t *conf,
          config_file_add_sub_conf(conf, path,
             real_path, sizeof(real_path), cb);
          config_file_initialize(&sub_conf);
+         /* Includes are fetched the same way their parent was. */
+         sub_conf.io = conf->io;
          switch (config_file_load_internal(&sub_conf, real_path,
             conf->include_depth + 1, cb))
          {
@@ -1221,8 +1226,40 @@ config_file_t *config_file_new_from_string(char *from_string,
    return NULL;
 }
 
-config_file_t *config_file_new_take_string(char *from_string,
-      size_t s_len, const char *path)
+static config_file_t *config_file_new_take_string_internal(
+      char *from_string, size_t s_len, const char *path,
+      const config_file_io_t *io);
+
+config_file_t *config_file_new_with_io(const char *path,
+      const config_file_io_t *io)
+{
+   struct config_file *conf;
+   if (!io)
+      return NULL;
+   if (!(conf = config_file_new_alloc()))
+      return NULL;
+   conf->io = io;
+   if (!path || !*path)
+      return conf;
+   if (config_file_load_file(conf, path, NULL) != 0)
+   {
+      config_file_free(conf);
+      return NULL;
+   }
+   return conf;
+}
+
+config_file_t *config_file_new_take_string_with_io(char *from_string,
+      size_t s_len, const char *path, const config_file_io_t *io)
+{
+   config_file_t *conf = config_file_new_take_string_internal(from_string,
+         s_len, path, io);
+   return conf;
+}
+
+static config_file_t *config_file_new_take_string_internal(
+      char *from_string, size_t s_len, const char *path,
+      const config_file_io_t *io)
 {
    struct config_file *conf = config_file_new_alloc();
    if (!conf)
@@ -1230,6 +1267,7 @@ config_file_t *config_file_new_take_string(char *from_string,
       free(from_string);
       return NULL;
    }
+   conf->io = io;
    if (path && *path)
       conf->path = strdup(path);
    if (from_string && *from_string)
@@ -1262,6 +1300,13 @@ config_file_t *config_file_new_take_string(char *from_string,
    else
       free(from_string);
    return conf;
+}
+
+config_file_t *config_file_new_take_string(char *from_string,
+      size_t s_len, const char *path)
+{
+   return config_file_new_take_string_internal(from_string, s_len, path,
+         NULL);
 }
 
 /* Streaming (push) parser - see the contract in config_file.h.
@@ -1475,6 +1520,7 @@ void config_file_initialize(struct config_file *conf)
 
    conf->path                     = NULL;
    conf->owned_bufs               = NULL;
+   conf->io                       = NULL;
    conf->entry_pool               = NULL;
    conf->entries_map              = NULL;
    conf->entries                  = NULL;
@@ -2083,18 +2129,24 @@ static void config_file_dump_line(struct config_file_dump_buf *b,
 
 void config_file_dump(config_file_t *conf, FILE *file, bool sort)
 {
-   struct config_file_dump_buf buf;
+   /* The dump buffer carries 4 KiB of data inline; heap-held because
+    * dumps run from task handlers -- the same lesson config_file_write
+    * already learned with its stdio buffer. */
+   struct config_file_dump_buf *buf =
+      (struct config_file_dump_buf*)malloc(sizeof(*buf));
    struct config_entry_list       *list = NULL;
    struct config_include_list *includes = conf->includes;
    struct path_linked_list *ref_tmp = conf->references;
 
-   buf.file = file;
-   buf.fill = 0;
+   if (!buf)
+      return;
+   buf->file = file;
+   buf->fill = 0;
 
    while (ref_tmp)
    {
       pathname_make_slashes_portable(ref_tmp->path);
-      config_file_dump_line(&buf,
+      config_file_dump_line(buf,
             "#reference \"", STRLEN_CONST("#reference \""),
             ref_tmp->path, strlen(ref_tmp->path),
             "\"\n", STRLEN_CONST("\"\n"));
@@ -2116,12 +2168,12 @@ void config_file_dump(config_file_t *conf, FILE *file, bool sort)
       {
          /* Lengths were cached when the strings were parsed or set;
           * zero means unknown and falls back to measuring. */
-         config_file_dump_put(&buf, list->key,
+         config_file_dump_put(buf, list->key,
                list->key_len ? list->key_len : strlen(list->key));
-         config_file_dump_put(&buf, " = \"", STRLEN_CONST(" = \""));
-         config_file_dump_put(&buf, list->value,
+         config_file_dump_put(buf, " = \"", STRLEN_CONST(" = \""));
+         config_file_dump_put(buf, list->value,
                list->value_len ? list->value_len : strlen(list->value));
-         config_file_dump_put(&buf, "\"\n", STRLEN_CONST("\"\n"));
+         config_file_dump_put(buf, "\"\n", STRLEN_CONST("\"\n"));
       }
       list = list->next;
    }
@@ -2134,15 +2186,17 @@ void config_file_dump(config_file_t *conf, FILE *file, bool sort)
     * any custom-set values */
    while (includes)
    {
-      config_file_dump_line(&buf,
+      config_file_dump_line(buf,
             "#include \"", STRLEN_CONST("#include \""),
             includes->path, strlen(includes->path),
             "\"\n", STRLEN_CONST("\"\n"));
       includes = includes->next;
    }
 
-   config_file_dump_flush(&buf);
+   config_file_dump_flush(buf);
+   free(buf);
 }
+
 
 /**
  * config_get_entry_list_head:
