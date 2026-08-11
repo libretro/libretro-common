@@ -31,26 +31,18 @@ struct smb_settings {
 
 typedef struct smb_settings smb_settings_t;
 
+#define RETRO_SMB_DIRENT_FILE 0
+#define RETRO_SMB_DIRENT_DIR  1
+
 struct smbc_dirent {
    char name[256];
-   int  type;     /* file vs directory */
+   int  type;     /* RETRO_SMB_DIRENT_* */
    int64_t size;  /* file size */
 };
 
 typedef struct {
-   /* Checked by the generic VFS layer; non-NULL on success. */
+   struct smb2_context *ctx;
    struct smb2dir *dir;
-   /* Pool slot the directory was opened on, plus the slot generation
-    * at open time. Operations resolve these to a context under the
-    * slot lock and fail closed when the generation no longer matches
-    * (context healed or shut down), instead of caching a context
-    * pointer that dangles once the context is destroyed. */
-   unsigned slot;
-   unsigned gen;
-   /* Storage for the entry returned by retro_vfs_readdir_smb(). Was a
-    * function-local static, which two threads reading different
-    * directories would race on regardless of any pool locking. */
-   struct smbc_dirent ent;
 } smb_dir_handle;
 
 bool smb_init_cfg(const struct smb_settings *new_cfg);
@@ -80,19 +72,6 @@ int retro_vfs_file_error_smb(libretro_vfs_implementation_file *stream);
 
 /* Context management */
 void smb_shutdown(void);
-
-struct smb2_context;
-
-/* Pool access for other in-process SMB consumers (cloud sync).
- * acquire returns a connected context with its slot lock held; all
- * libsmb2 calls on it must happen before the matching release.
- * heal_if_dead replaces a dead-transport context in place under the
- * held slot; on success the returned context replaces the old one for
- * the remainder of the hold. */
-bool smb_pool_acquire(unsigned *slot, struct smb2_context **ctx);
-void smb_pool_release(unsigned slot);
-struct smb2_context *smb_pool_heal_if_dead(unsigned slot,
-      struct smb2_context *ctx);
 
 #ifdef __cplusplus
 }
