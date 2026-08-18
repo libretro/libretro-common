@@ -339,8 +339,22 @@ static uint64_t xgetbv_x86(uint32_t idx)
 }
 #endif
 
-#if defined(__ARM_NEON__)
-#if defined(__arm__)
+/* RunFast mode is a 32-bit VFP control, and this writes FPSCR - so it
+ * needs both an ARM32 target and an FPU worth configuring.  NEON
+ * implies VFP, which is why its presence is the proxy used here; a
+ * VFP-less core such as the armv5te arm926ej-s would fault on the
+ * write.
+ *
+ * CPU_ARM_RUNFAST is the single condition for the definition AND
+ * every call.  They were separate conditions and drifted: the calls
+ * ended up reachable where the definition was not, which is a link
+ * error on exactly the targets with no NEON - Miyoo armv5te and
+ * armv7 builds without an FPU selected. */
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(__arm__)
+#define CPU_ARM_RUNFAST 1
+#endif
+
+#ifdef CPU_ARM_RUNFAST
 static void arm_enable_runfast_mode(void)
 {
    /* RunFast mode. Enables flush-to-zero and some
@@ -357,8 +371,7 @@ static void arm_enable_runfast_mode(void)
          : "r"(x), "r"(y)
         );
 }
-#endif
-#endif
+#endif /* CPU_ARM_RUNFAST */
 
 #if defined(__linux__) && !defined(CPU_X86)
 static unsigned char check_arm_cpu_feature(const char* feature)
@@ -868,7 +881,7 @@ static uint64_t cpu_features_probe(void)
    if (check_arm_cpu_feature("neon"))
    {
       cpu |= RETRO_SIMD_NEON;
-#if defined(__ARM_NEON__) && defined(__arm__)
+#ifdef CPU_ARM_RUNFAST
       arm_enable_runfast_mode();
 #endif
    }
@@ -886,16 +899,30 @@ static uint64_t cpu_features_probe(void)
    if (check_arm_cpu_feature("asimd"))
    {
       cpu |= RETRO_SIMD_ASIMD;
-#ifdef __ARM_NEON__
+
+      /* ASIMD *is* NEON: Advanced SIMD is what aarch64 kernels call
+       * it in the Features: line, where 32-bit ARM says "neon".  It
+       * is architecturally mandatory in ARMv8-A, so a CPU reporting
+       * asimd has NEON by definition and callers testing
+       * RETRO_SIMD_NEON must see it.
+       *
+       * This used to be gated on __ARM_NEON__, which is the LEGACY
+       * 32-bit spelling.  aarch64 toolchains define __ARM_NEON (no
+       * trailing underscores) instead - verified against the NDK's
+       * own compiler, which reports __ARM_NEON 1 and no __ARM_NEON__
+       * for aarch64-linux-android - so the guard was false on every
+       * 64-bit build and NEON was never reported there.  That is why
+       * System Information listed ASIMD alone on a device whose CPU
+       * has had NEON since it was designed. */
       cpu |= RETRO_SIMD_NEON;
-#if defined(__arm__)
+
+#ifdef CPU_ARM_RUNFAST
       arm_enable_runfast_mode();
 #endif
-#endif
    }
-#elif defined(__ARM_NEON__)
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
    cpu |= RETRO_SIMD_NEON;
-#if defined(__arm__)
+#ifdef CPU_ARM_RUNFAST
    arm_enable_runfast_mode();
 #endif
 #elif defined(__ALTIVEC__)
