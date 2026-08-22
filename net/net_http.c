@@ -758,8 +758,16 @@ static void net_http_conn_pool_free(struct conn_pool_entry *entry)
 #ifdef HAVE_SSL
    if (entry->ssl && entry->ssl_ctx)
    {
+      /* ssl_socket_close() closes the underlying descriptor itself
+       * (net_ctx.fd in net_socket_ssl_mbed.c, state->fd in
+       * net_socket_ssl_bear.c -- both hold the descriptor in
+       * entry->fd), so mark the fd consumed: a second close below
+       * would race descriptor reuse and close an fd owned by another
+       * thread -- on Android, fdsan aborts when Binder wins that
+       * race. */
       ssl_socket_close(entry->ssl_ctx);
       ssl_socket_free(entry->ssl_ctx);
+      entry->fd = -1;
    }
 #endif
    if (entry->fd >= 0)
