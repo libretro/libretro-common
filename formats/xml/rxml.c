@@ -437,6 +437,11 @@ RXML_COLD static int rxml_ref_emit(struct rxml_parser *ps, const unsigned char *
 
    if (ch <= 0x7F)
       return rxml_acc_ch(ps, (unsigned char)ch);
+   /* The multi-byte forms below write ps->acc directly, so they carry
+    * the accumulator's invariant themselves: a deferred run has to be
+    * folded in before anything can land after it. */
+   if (ps->txt_direct && !rxml_acc_promote(ps))
+      return 0;
    if (!rxml_acc_reserve(ps, 4))
       return 0;
    if (ch <= 0x7FF)
