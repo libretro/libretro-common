@@ -1843,14 +1843,25 @@ rxml_document_t *rxml_load_document_string_opts(const char *str,
    return rxml_parse_owned(buf, len, opts, err);
 }
 
-rxml_document_t *rxml_load_document_owned(char *buf, size_t len)
+rxml_document_t *rxml_load_document_owned_opts(char *buf, size_t len,
+      unsigned opts, rxml_parse_error_t *err)
 {
+   if (err)
+   {
+      err->offset = 0;
+      err->line   = err->col = 0;
+   }
    if (!buf)
       return NULL;
    /* The contract mirrors the tail of rxml_load_document: the caller
     * hands over a NUL-terminated heap buffer and rxml_parse_owned
     * either gives it to the document or frees it on failure. */
-   return rxml_parse_owned(buf, len, 0, NULL);
+   return rxml_parse_owned(buf, len, opts, err);
+}
+
+rxml_document_t *rxml_load_document_owned(char *buf, size_t len)
+{
+   return rxml_load_document_owned_opts(buf, len, 0, NULL);
 }
 
 rxml_document_t *rxml_load_document_string(const char *str)
