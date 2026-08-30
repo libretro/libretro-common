@@ -73,6 +73,10 @@
 #define SSL_MBED_LEGACY_RNG 1
 #endif
 
+#if defined(VITA)
+#include <psp2/kernel/rng.h>
+#endif
+
 /* Not part of the mbedtls upstream source */
 #include "cacert.h"
 
@@ -102,10 +106,32 @@ static void ssl_debug(void *ctx, int level,
 }
 
 #if defined(_3DS) && SSL_MBED_LEGACY_RNG
-int ctr_entropy_func(void *data, unsigned char *s, size_t len)
+static int platform_entropy_func(void *data, unsigned char *s, size_t len)
 {
    (void)data;
    PS_GenerateRandomBytes(s, len);
+   return 0;
+}
+#elif defined(VITA) && SSL_MBED_LEGACY_RNG
+/* The Vita has no platform entropy source mbedtls can poll (see
+ * MBEDTLS_NO_PLATFORM_ENTROPY in deps/mbedtls/mbedtls/config.h), so
+ * seed CTR_DRBG straight from the kernel RNG.  A single
+ * sceKernelGetRandomNumber() call is limited to 64 bytes. */
+static int platform_entropy_func(void *data, unsigned char *s, size_t len)
+{
+   size_t off = 0;
+   (void)data;
+
+   while (off < len)
+   {
+      SceSize chunk = (SceSize)((len - off) > 64 ? 64 : (len - off));
+
+      if (sceKernelGetRandomNumber(s + off, chunk) < 0)
+         return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
+
+      off += chunk;
+   }
+
    return 0;
 }
 #endif
@@ -145,8 +171,8 @@ void* ssl_socket_init(int fd, const char *domain)
 
 #if SSL_MBED_LEGACY_RNG
    if (mbedtls_ctr_drbg_seed(&state->ctr_drbg,
-#ifdef _3DS
-      ctr_entropy_func,
+#if defined(_3DS) || defined(VITA)
+      platform_entropy_func,
 #else
       mbedtls_entropy_func,
 #endif

@@ -223,6 +223,12 @@
 
 #define RFILE_HINT_UNBUFFERED (1 << 8)
 
+/* Largest count handed to one fread/fwrite/read/write call.  bionic's
+ * stdio routes counts through an int-typed callback (aborting via
+ * FORTIFY above INT_MAX) and one Linux read()/write() syscall moves at
+ * most MAX_RW_COUNT; both fit comfortably under 1 GiB. */
+#define VFS_STDIO_IO_CHUNK_MAX (1024 * 1024 * 1024)
+
 /* 64-bit seek on the descriptor path.
  *
  * The buffered path seeks with _fseeki64/fseeko.  The descriptor path
@@ -1152,6 +1158,17 @@ typedef struct _RETRO_FILE_ZERO_DATA_INFORMATION
 #endif
 #endif
 
+#if defined(_WIN32) && !defined(_XBOX)
+/* FILE_NAME_NORMALIZED came in with the Vista SDK, the same generation as
+ * GetFinalPathNameByHandleW itself.  The function is resolved by name at
+ * run time below precisely so that older toolchains still build this
+ * file; the flag has to clear the same bar, so supply the documented
+ * value when the SDK does not. */
+#ifndef FILE_NAME_NORMALIZED
+#define FILE_NAME_NORMALIZED 0x0
+#endif
+#endif
+
 /* Allocation unit of the filesystem holding this file: the smallest span
  * retro_vfs_file_punch_hole_impl can actually free. 0 when unknown.
  *
@@ -1450,6 +1467,15 @@ int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream,
    if (!stream || !s)
       return -1;
 
+   /* A length with the top bit set is a negative int64 that arrived
+    * through the unsigned parameter - no legitimate caller reads 8EiB.
+    * The stdio path below hands len to fread() unclamped, where bionic
+    * FORTIFY turns it into a process abort (observed in the field);
+    * fail the read instead, like the mapped path's clamp below already
+    * does for its overflow case. */
+   if (len > (uint64_t)INT64_MAX)
+      return -1;
+
    if ((stream->hints & RFILE_HINT_UNBUFFERED) == 0)
    {
 #ifdef HAVE_CDROM
@@ -1460,7 +1486,28 @@ int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream,
       if (stream->scheme == VFS_SCHEME_SMB)
          return retro_vfs_file_read_smb(stream, s, len);
 #endif
-      return fread(s, 1, (size_t)len, stream->fp);
+      /* bionic's stdio dispatches fread through the FILE's int-typed
+       * read callback: a single count above INT_MAX truncates to a
+       * negative int inside libc, __sread sign-extends it back into
+       * read(), and FORTIFY aborts the process ("read: count ... >
+       * SSIZE_MAX").  Chunk the transfer so no single libc call sees
+       * a count any stdio cannot take. */
+      {
+         uint8_t *p     = (uint8_t*)s;
+         uint64_t total = 0;
+         while (len != 0)
+         {
+            size_t _chunk = (len > VFS_STDIO_IO_CHUNK_MAX)
+                  ? (size_t)VFS_STDIO_IO_CHUNK_MAX : (size_t)len;
+            size_t _got   = fread(p, 1, _chunk, stream->fp);
+            total        += _got;
+            if (_got < _chunk)
+               break;
+            p            += _got;
+            len          -= _got;
+         }
+         return (int64_t)total;
+      }
    }
 #ifdef VFS_HAVE_FILE_MAPPING
    if (stream->hints & RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS)
@@ -1493,7 +1540,27 @@ int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream,
    }
 #endif
 
-   return read(stream->fd, s, (size_t)len);
+   /* One read() moves at most MAX_RW_COUNT (INT_MAX & PAGE_MASK) on
+    * Linux and returns short past it, so a large request needs the
+    * same chunk loop as the stdio path to honor the full count. */
+   {
+      uint8_t *p     = (uint8_t*)s;
+      uint64_t total = 0;
+      while (len != 0)
+      {
+         size_t  _chunk = (len > VFS_STDIO_IO_CHUNK_MAX)
+               ? (size_t)VFS_STDIO_IO_CHUNK_MAX : (size_t)len;
+         ssize_t _got   = read(stream->fd, p, _chunk);
+         if (_got < 0)
+            return (total != 0) ? (int64_t)total : -1;
+         total += (uint64_t)_got;
+         if ((size_t)_got < _chunk)
+            break;
+         p     += _got;
+         len   -= (uint64_t)_got;
+      }
+      return (int64_t)total;
+   }
 }
 
 int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, const void *s, uint64_t len)
@@ -1517,7 +1584,24 @@ int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, cons
       }
 #endif
       pos = retro_vfs_file_tell_impl(stream);
-      ret = fwrite(s, 1, (size_t)len, stream->fp);
+      /* Same int-typed stdio callback contract as the read side:
+       * chunk so no single fwrite count exceeds what bionic takes. */
+      {
+         const uint8_t *p = (const uint8_t*)s;
+         uint64_t total   = 0;
+         while (len != 0)
+         {
+            size_t _chunk = (len > VFS_STDIO_IO_CHUNK_MAX)
+                  ? (size_t)VFS_STDIO_IO_CHUNK_MAX : (size_t)len;
+            size_t _put   = fwrite(p, 1, _chunk, stream->fp);
+            total        += _put;
+            if (_put < _chunk)
+               break;
+            p            += _put;
+            len          -= _put;
+         }
+         ret = (ssize_t)total;
+      }
 
       if (ret > 0 && pos + ret > stream->size)
          stream->size = pos + ret;
@@ -1530,7 +1614,30 @@ int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, cons
 #endif
 
    pos = retro_vfs_file_tell_impl(stream);
-   ret = write(stream->fd, s, (size_t)len);
+   /* write() shares read()'s MAX_RW_COUNT clamp; loop for the full
+    * count. */
+   {
+      const uint8_t *p = (const uint8_t*)s;
+      uint64_t total   = 0;
+      while (len != 0)
+      {
+         size_t  _chunk = (len > VFS_STDIO_IO_CHUNK_MAX)
+               ? (size_t)VFS_STDIO_IO_CHUNK_MAX : (size_t)len;
+         ssize_t _put   = write(stream->fd, p, _chunk);
+         if (_put < 0)
+         {
+            if (total == 0)
+               return -1;
+            break;
+         }
+         total += (uint64_t)_put;
+         if ((size_t)_put < _chunk)
+            break;
+         p     += _put;
+         len   -= (uint64_t)_put;
+      }
+      ret = (ssize_t)total;
+   }
 
    if (ret != -1 && pos + ret > stream->size)
       stream->size = pos + ret;
