@@ -1825,6 +1825,46 @@ int retro_vfs_file_remove_impl(const char *path)
    return -1;
 }
 
+#if defined(_WIN32) && !defined(_XBOX) && (defined(LEGACY_WIN32_RUNTIME) || defined(LEGACY_WIN32))
+/* Replace @new_local with @old_local where MoveFileEx() is not
+ * available (Windows 9x): a destination in the way is moved aside,
+ * the source renamed into place, and the moved-aside copy removed
+ * only then - or put back if the second rename fails.  Both paths
+ * are in the local code page. */
+static int win32_rename_replace_local(const char *old_local,
+      const char *new_local)
+{
+   size_t _len;
+   char *aside;
+   int ret;
+
+   if (rename(old_local, new_local) == 0)
+      return 0;
+
+   _len  = strlen(new_local);
+   if (!(aside = (char*)malloc(_len + sizeof(".old"))))
+      return -1;
+   memcpy(aside, new_local, _len);
+   memcpy(aside + _len, ".old", sizeof(".old"));
+
+   ret = -1;
+   remove(aside);                      /* a leftover from an earlier run */
+   if (rename(new_local, aside) == 0)
+   {
+      if (rename(old_local, new_local) == 0)
+      {
+         remove(aside);
+         ret = 0;
+      }
+      else
+         rename(aside, new_local);
+   }
+
+   free(aside);
+   return ret;
+}
+#endif
+
 int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
 {
 #if defined(ANDROID) && defined(HAVE_SAF)
@@ -1860,8 +1900,8 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
     * destination on Windows, which breaks writing to a temporary and
     * renaming it over the original.  MoveFileExW with
     * MOVEFILE_REPLACE_EXISTING gives the POSIX overwrite behaviour.
-    * It is unsupported on 9x, so the local-encoding path replaces by
-    * removing the destination, and only after a plain rename fails. */
+    * It is unsupported on 9x, so the local-encoding path moves the
+    * destination aside and renames into its place. */
 #if defined(LEGACY_WIN32_RUNTIME)
    if (win32_needs_local_encoding())
    {
@@ -1873,11 +1913,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
 
          if (new_path_local)
          {
-            if (rename(old_path_local, new_path_local) == 0)
-               ret = 0;
-            else if (remove(new_path_local) == 0 &&
-                  rename(old_path_local, new_path_local) == 0)
-               ret = 0;
+            ret = win32_rename_replace_local(old_path_local, new_path_local);
             free(new_path_local);
          }
 
@@ -1913,11 +1949,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
 
          if (new_path_local)
          {
-            if (rename(old_path_local, new_path_local) == 0)
-               ret = 0;
-            else if (remove(new_path_local) == 0 &&
-                  rename(old_path_local, new_path_local) == 0)
-               ret = 0;
+            ret = win32_rename_replace_local(old_path_local, new_path_local);
             free(new_path_local);
          }
 
@@ -1946,13 +1978,53 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
 #endif
    return ret;
 
-#elif defined(VITA)
+#elif defined(_XBOX)
+   /* MoveFileEx() is not in the XDK and the CRT rename() refuses an
+    * existing destination, so a destination in the way is moved
+    * aside with MoveFile(), the source moved into place, and the
+    * moved-aside copy deleted only then - or put back if the second
+    * move fails. */
+   {
+      size_t _len;
+      char *aside;
+      int ret;
+
+      if (!old_path || !*old_path || !new_path || !*new_path)
+         return -1;
+
+      if (GetFileAttributes(new_path) == INVALID_FILE_ATTRIBUTES)
+         return MoveFile(old_path, new_path) ? 0 : -1;
+
+      _len  = strlen(new_path);
+      if (!(aside = (char*)malloc(_len + sizeof(".old"))))
+         return -1;
+      memcpy(aside, new_path, _len);
+      memcpy(aside + _len, ".old", sizeof(".old"));
+
+      ret = -1;
+      DeleteFile(aside);               /* a leftover from an earlier run */
+      if (MoveFile(new_path, aside))
+      {
+         if (MoveFile(old_path, new_path))
+         {
+            DeleteFile(aside);
+            ret = 0;
+         }
+         else
+            MoveFile(aside, new_path);
+      }
+
+      free(aside);
+      return ret;
+   }
+#elif defined(VITA) || defined(PSP)
    /* rename() here means "replace": the Win32 branch above says so
     * with MOVEFILE_REPLACE_EXISTING and POSIX says so by definition,
     * and the write-to-temporary-then-rename pattern - playlists, the
     * config file, core info - is built on it.  The kernel's own
-    * sceIoRename() refuses an existing destination, and newlib's
-    * rename() bridges that gap by sceIoRemove()ing the destination
+    * sceIoRename() refuses an existing destination on both PSP and
+    * Vita.  pspsdk's rename() passes that refusal through; Vita's
+    * newlib bridges the gap by sceIoRemove()ing the destination
     * first and renaming after.  Between those two calls nothing is
     * on disk, and if the rename then fails the caller's temporary
     * is discarded on top: the file that was being replaced is
@@ -1995,6 +2067,51 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
          }
          else
             sceIoRename(aside, new_path);
+      }
+
+      free(aside);
+      return ret;
+   }
+#elif defined(_3DS) || defined(PS2) || defined(WIIU) || defined(GEKKO) || defined(__PSL1GHT__) || defined(__PS3__) || (defined(SWITCH) && defined(HAVE_LIBNX))
+   /* The filesystems here refuse to rename onto an existing entry -
+    * FS on 3DS and Switch, FatFs behind bdmfs_fatfs on PS2, libfat
+    * on Wii and GameCube, LV2's sys_fs_rename on PS3 - and libnx,
+    * ps2sdk, libfat and PSL1GHT pass that refusal through, while libctru
+    * clears the way by deleting the destination first, leaving
+    * nothing on disk until the rename lands.  Wii U's FSRename()
+    * is taken to behave the same way.  So when a destination is in
+    * the way, move it aside before calling rename() at all: it is
+    * removed only once its replacement is in place, and put back
+    * if the replacement cannot be. */
+   {
+      struct stat st;
+      size_t _len;
+      char *aside;
+      int ret;
+
+      if (!old_path || !*old_path || !new_path || !*new_path)
+         return -1;
+
+      if (stat(new_path, &st) != 0)
+         return rename(old_path, new_path) == 0 ? 0 : -1;
+
+      _len  = strlen(new_path);
+      if (!(aside = (char*)malloc(_len + sizeof(".old"))))
+         return -1;
+      memcpy(aside, new_path, _len);
+      memcpy(aside + _len, ".old", sizeof(".old"));
+
+      ret = -1;
+      remove(aside);                   /* a leftover from an earlier run */
+      if (rename(new_path, aside) == 0)
+      {
+         if (rename(old_path, new_path) == 0)
+         {
+            remove(aside);
+            ret = 0;
+         }
+         else
+            rename(aside, new_path);
       }
 
       free(aside);

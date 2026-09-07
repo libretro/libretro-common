@@ -36,6 +36,44 @@
 slock_t *rtime_localtime_lock = NULL;
 #endif
 
+#if defined(__APPLE__) && defined(__MACH__)
+#include <mach/mach_time.h>
+#include <sched.h>
+#include <stdint.h>
+
+/* Darwin: the sleep is an absolute deadline on the Mach clock, the
+ * same clock cpu_features_get_time_usec() reads there, so the time
+ * spent between reading it and entering the kernel is not added to the
+ * wait as it is by a relative nanosleep(). mach_wait_until() and the
+ * timebase have been in libSystem since 10.0. The kernel may still
+ * hold a normal-priority thread past the deadline by its timer leeway;
+ * what returns is never early, and a caller that needs the deadline
+ * itself sleeps short and spins the rest. */
+static mach_timebase_info_data_t rtime_mach_tb;
+
+void retro_sleep_us(unsigned usec)
+{
+   uint64_t ticks;
+
+   /* A zero duration means "yield the rest of this time slice". */
+   if (!usec)
+   {
+      sched_yield();
+      return;
+   }
+
+   /* The timebase is a constant; a racing first read fills it with
+    * the same values, so no guard is needed. */
+   if (!rtime_mach_tb.denom)
+      mach_timebase_info(&rtime_mach_tb);
+
+   /* Nanoseconds to Mach ticks; the ratio is 1:1 on Intel and
+    * 125:3 on Apple silicon, so the product fits for any usec. */
+   ticks = (uint64_t)usec * 1000 * rtime_mach_tb.denom / rtime_mach_tb.numer;
+   mach_wait_until(mach_absolute_time() + ticks);
+}
+#endif
+
 #if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -246,7 +284,13 @@ static void rtime_sleep_init(void)
 
 /* The timer object must not be shared between threads: SetWaitableTimer()
  * on a handle that another thread is already waiting on reschedules that
- * thread's wait. One handle per thread, created on first use. */
+ * thread's wait. One handle per thread, created on first use.
+ *
+ * Handles are process objects, so a thread that exits leaves its timer
+ * open until the process does. That is one kernel object per thread
+ * that ever slept, which is nothing for a fixed set of worker threads
+ * and something to be aware of for a thread created per event: sleep
+ * from a persistent thread instead. */
 static HANDLE rtime_sleep_timer_get(void)
 {
    HANDLE timer = (HANDLE)TlsGetValue(rtime_sleep_tls);
@@ -336,8 +380,9 @@ void retro_sleep(unsigned msec)
 
 /* Called from rtime_deinit(), i.e. main thread only, at program or
  * core termination - by which point no other thread may still be
- * calling retro_sleep(). Timer handles belonging to threads that have
- * already exited are reclaimed by the OS. */
+ * calling retro_sleep(). Only the calling thread's own timer can be
+ * closed here: the TLS slot is per thread, so other threads' handles
+ * cannot be reached, and they stay open until the process exits. */
 static void rtime_sleep_deinit(void)
 {
    HANDLE timer;

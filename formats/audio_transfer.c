@@ -4224,8 +4224,8 @@ static int audio_transfer_aac_fill(struct audio_transfer_aac *ac)
 {
    while (ac->pend_frames == 0)
    {
-      const uint8_t *pdata;
-      uint32_t plen;
+      const uint8_t *pdata = NULL;
+      uint32_t plen        = 0;
       int r;
       uint64_t skip;
       r = audio_transfer_aac_pull(ac, &pdata, &plen);
