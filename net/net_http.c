@@ -180,6 +180,13 @@ struct http_t
    struct conn_pool_entry *conn;
    bool ssl;
    bool request_sent;
+   /* conn came out of the pool rather than being opened for this
+    * request; such a connection may have been closed by the peer
+    * while idle. */
+   bool conn_reused;
+   /* The request has already been replayed once on a fresh
+    * connection; it will not be replayed again. */
+   bool retried;
 
    request_t request;
    response_t response;
@@ -1241,6 +1248,43 @@ static bool net_http_connect(struct http_t *state)
    }
 }
 
+/**
+ * net_http_retry_fresh:
+ *
+ * A pooled connection that the peer closed while it sat idle fails
+ * either on the first send or on the first recv, before a single
+ * byte of the response has arrived.  Replay the request once on a
+ * fresh connection in that case.  Nothing is retried once any
+ * response byte has been seen, and a connection opened for this
+ * request is never retried at all.
+ *
+ * @return true if the request has been rearmed and net_http_update()
+ * should keep going, false if the failure stands.
+ **/
+static bool net_http_retry_fresh(struct http_t *state)
+{
+   if (!state->conn_reused || state->retried || state->response.pos)
+      return false;
+
+   net_http_log_transport_state(state, "retry_on_fresh_connection", -1);
+
+   if (state->conn)
+      net_http_conn_pool_remove(state->conn);
+
+   state->conn            = NULL;
+   state->conn_reused     = false;
+   state->retried         = true;
+   state->err             = false;
+   state->request_sent    = false;
+   state->fail_stage      = NULL;
+   state->fail_code       = 0;
+   state->response.part   = P_HEADER_TOP;
+   state->response.pos    = 0;
+   state->response.len    = 0;
+   state->response.status = -1;
+   return true;
+}
+
 static void net_http_send_str(
       struct http_t *state, const char *text, size_t text_size)
 {
@@ -1271,6 +1315,18 @@ static void net_http_send_str(
 static bool net_http_send_request(struct http_t *state)
 {
    struct request *request = (struct request*)&state->request;
+
+   if (     request->method
+         && request->method[0] == 'P'
+         && request->method[1] == 'O' /* POST, not PUT */
+         && !request->postdata
+         && request->contentlength > 0)
+   {
+      state->err = true;
+      net_http_log_transport_state(state, "post_without_payload", -1);
+      return true;
+   }
+
    /* This is a bit lazy, but it works. */
    if (request->method)
    {
@@ -1307,14 +1363,6 @@ static bool net_http_send_request(struct http_t *state)
    {
       size_t _len;
       int    len;
-      if (     !request->postdata
-            && request->method[1] == 'O' /* POST, not PUT */
-            && request->contentlength > 0)
-      {
-         state->err = true;
-         net_http_log_transport_state(state, "post_without_payload", -1);
-         return true;
-      }
       if (!request->headers && !request->contenttype)
          net_http_send_str(state,
                "Content-Type: application/x-www-form-urlencoded\r\n",
@@ -1988,6 +2036,7 @@ static bool net_http_redirect(struct http_t *state, const char *location)
       }
    }
    state->request_sent       = false;
+   state->retried            = false;
    state->response.part      = P_HEADER_TOP;
    state->response.status    = -1;
    /* Start with larger buffer to reduce reallocations */
@@ -2125,7 +2174,11 @@ bool net_http_update(struct http_t *state, size_t* progress, size_t* total)
 
    if (!state->conn)
    {
-      state->conn = net_http_conn_pool_find(state->request.domain, state->request.port);
+      /* A replayed request goes out on a connection of its own;
+       * the pool is what it is recovering from. */
+      if (!state->retried)
+         state->conn = net_http_conn_pool_find(state->request.domain, state->request.port);
+      state->conn_reused = (state->conn != NULL);
       if (!state->conn)
       {
          if (!net_http_new_socket(state))
@@ -2142,7 +2195,11 @@ bool net_http_update(struct http_t *state, size_t* progress, size_t* total)
    }
 
    if (!state->request_sent)
-      return net_http_send_request(state);
+   {
+      if (net_http_send_request(state) && net_http_retry_fresh(state))
+         return false;
+      return state->err;
+   }
 
    response = (struct response*)&state->response;
 
@@ -2255,6 +2312,8 @@ bool net_http_update(struct http_t *state, size_t* progress, size_t* total)
             {
                net_http_log_transport_state(state,
                      "receive_header_failed", _len);
+               if (net_http_retry_fresh(state))
+                  return false;
                net_http_conn_pool_remove(state->conn);
                state->conn      = NULL;
                state->err       = true;

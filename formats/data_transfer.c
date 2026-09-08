@@ -556,6 +556,17 @@ data_transfer_t *data_transfer_open_window(const char *path, size_t keep)
 
 bool data_transfer_reserve_supported(void)
 {
+#if defined(MEMMAP_TEST_NO_RESERVE)
+   /* The test hook that makes memreserve() refuse (see memmap.c) has
+    * to be visible here too: a caller asks this BEFORE opening so it
+    * can refuse a file too large to hold whole - with the answer
+    * still "yes", the gate was skipped and data_transfer_open_window
+    * fell back to malloc(file length) for a 7.8 GB fixture, which the
+    * sanitizers' allocators either refuse (TSan aborts the test) or
+    * grant and then page in. */
+   if (getenv("MEMMAP_NO_RESERVE"))
+      return false;
+#endif
    return mempagesize() != 0;
 }
 

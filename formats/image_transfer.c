@@ -130,13 +130,14 @@
  * - animation splits two ways.  Animated WEBP is the only type with
  *   the whole-buffer anim_* handle (decode everything, then index
  *   frames); APNG, animated WEBP, WEBM and MP4 all have the streaming
- *   form.  Of those, only WEBM and MP4 carry a byte cursor, so only
- *   they can be windowed (media_floor / consumed) or adopted from a
- *   still whose read is still in flight (detach_anim_stream).
- *   Animated WEBP additionally has no partial open, so
- *   anim_stream_new_avail() returns NULL for it and the caller keeps
- *   the whole-buffer path.  complete_scan() is WEBM only because only
- *   its timestamp pre-scan can be truncated by the wall.
+ *   form, and all four have the partial open (anim_stream_new_avail),
+ *   the byte wall (anim_stream_set_avail) and the byte cursor
+ *   (media_floor / consumed), so all four can be windowed.  APNG and
+ *   WEBP index frames and can also name the next frame's byte span
+ *   (next_span) for a feeder; the video types report 0/0 there.  Only
+ *   WEBM and MP4 can be adopted from a still whose read is still in
+ *   flight (detach_anim_stream).  complete_scan() is WEBM only because
+ *   only its timestamp pre-scan can be truncated by the wall.
  *
  * Deliberately not dispatched here:
  *
@@ -808,6 +809,11 @@ void image_transfer_anim_stream_set_avail(void *stream,
          rpng_apng_stream_set_avail((rpng_apng_stream_t*)stream, avail);
 #endif
          break;
+      case IMAGE_TYPE_WEBP:
+#ifdef HAVE_RWEBP
+         rwebp_anim_stream_set_avail((rwebp_anim_stream_t*)stream, avail);
+#endif
+         break;
       case IMAGE_TYPE_WEBM:
 #ifdef HAVE_RWEBM
          rwebm_video_stream_set_avail((rwebm_video_stream_t*)stream,
@@ -830,6 +836,20 @@ size_t image_transfer_anim_stream_media_floor(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         return rpng_apng_stream_media_floor(
+               (const rpng_apng_stream_t*)stream);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_WEBP:
+#ifdef HAVE_RWEBP
+         return rwebp_anim_stream_media_floor(
+               (const rwebp_anim_stream_t*)stream);
+#else
+         break;
+#endif
       case IMAGE_TYPE_WEBM:
 #ifdef HAVE_RWEBM
          return rwebm_video_stream_media_floor(
@@ -855,6 +875,20 @@ size_t image_transfer_anim_stream_consumed(void *stream,
 {
    switch (type)
    {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         return rpng_apng_stream_consumed(
+               (const rpng_apng_stream_t*)stream);
+#else
+         break;
+#endif
+      case IMAGE_TYPE_WEBP:
+#ifdef HAVE_RWEBP
+         return rwebp_anim_stream_consumed(
+               (const rwebp_anim_stream_t*)stream);
+#else
+         break;
+#endif
       case IMAGE_TYPE_WEBM:
 #ifdef HAVE_RWEBM
          return rwebm_video_stream_consumed(
@@ -873,6 +907,32 @@ size_t image_transfer_anim_stream_consumed(void *stream,
          break;
    }
    return 0;
+}
+
+void image_transfer_anim_stream_next_span(void *stream,
+      enum image_type_enum type, size_t *lo, size_t *hi)
+{
+   if (lo)
+      *lo = 0;
+   if (hi)
+      *hi = 0;
+   switch (type)
+   {
+      case IMAGE_TYPE_PNG:
+#ifdef HAVE_RPNG
+         rpng_apng_stream_next_span((const rpng_apng_stream_t*)stream,
+               lo, hi);
+#endif
+         break;
+      case IMAGE_TYPE_WEBP:
+#ifdef HAVE_RWEBP
+         rwebp_anim_stream_next_span((const rwebp_anim_stream_t*)stream,
+               lo, hi);
+#endif
+         break;
+      default:
+         break;
+   }
 }
 
 void image_transfer_anim_stream_complete_scan(void *stream,
@@ -1115,9 +1175,13 @@ void *image_transfer_anim_stream_new_avail(void *buf, size_t len,
 #else
          break;
 #endif
-      /* Animated WEBP has no partial-buffer open (and is small enough
-       * that windowing it buys nothing); callers fall back to the
-       * whole-buffer path for it. */
+      case IMAGE_TYPE_WEBP:
+#ifdef HAVE_RWEBP
+         return rwebp_anim_stream_open_avail((const uint8_t*)buf, len,
+               avail, need_more);
+#else
+         break;
+#endif
       default:
          break;
    }

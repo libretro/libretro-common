@@ -265,6 +265,15 @@ size_t mempagesize(void)
 
 void *memreserve(size_t len)
 {
+#if defined(MEMMAP_TEST_NO_RESERVE)
+   /* Test hook: behave like a platform that cannot reserve address
+    * space (memreserve refused), so the data_transfer whole-file path -
+    * and everything that must agree with it - can be exercised on a
+    * host that normally can. Off unless the env var is set, so a build
+    * with the hook still reserves by default. */
+   if (getenv("MEMMAP_NO_RESERVE"))
+      return NULL;
+#endif
 #if !defined(MEMMAP_HAVE_RESERVE)
    (void)len;
    return NULL;
