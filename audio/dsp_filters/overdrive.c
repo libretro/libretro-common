@@ -1,126 +1,206 @@
-#include "libretro_dspfilter.h"
-#include "dsp_common.h"
+/* Copyright  (C) 2010-2026 The RetroArch team
+ *
+ * ---------------------------------------------------------------------------------------
+ * The following license statement only applies to this file (overdrive.c).
+ * ---------------------------------------------------------------------------------------
+ *
+ * Permission is hereby granted, free of charge,
+ * to any person obtaining a copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+ * and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#include <math.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include <libretro_dspfilter.h>
+
+/* Frames converted per step by the int16 entry point. */
+#define OVERDRIVE_I16_CHUNK 256
 
 struct overdrive_data
 {
-    float drive;
-    float tone_alpha;
-    float mix;
-    float level;
-    float asymmetry;
-    float dc_r;
-    float prev_in[2];
-    float prev_hp[2];
-    float tone_lp[2];
+   float scratch[OVERDRIVE_I16_CHUNK * 2];
+   float drive;
+   float tone_alpha;
+   float mix;
+   float level;
+   float asymmetry;
+   float dc_r;
+   float prev_in[2];
+   float prev_hp[2];
+   float tone_lp[2];
 };
 
-static float overdrive_shape(float x)
+static void overdrive_run(struct overdrive_data *od,
+      float *samples, unsigned frames)
 {
-    return tanhf(x);
+   unsigned i, ch;
+
+   for (i = 0; i < frames; i++, samples += 2)
+   {
+      for (ch = 0; ch < 2; ch++)
+      {
+         float hp, wet;
+         float dry    = samples[ch];
+         float driven = dry * od->drive;
+         float shaped;
+
+         driven += od->asymmetry * driven * driven * 0.15f;
+         if (driven < -12.0f)
+            driven = -12.0f;
+         else if (driven > 12.0f)
+            driven = 12.0f;
+         shaped = (float)tanh(driven);
+
+         /* DC blocker, needed once asymmetric drive is used. */
+         hp               = shaped - od->prev_in[ch]
+                          + od->dc_r * od->prev_hp[ch];
+         od->prev_in[ch]  = shaped;
+         od->prev_hp[ch]  = hp;
+
+         /* One-pole low-pass tone stage with a small direct component. */
+         od->tone_lp[ch] += od->tone_alpha * (hp - od->tone_lp[ch]);
+         wet              = 0.30f * hp + 0.70f * od->tone_lp[ch];
+         wet             *= od->level;
+
+         samples[ch]      = dry + (wet - dry) * od->mix;
+      }
+   }
 }
 
 static void overdrive_process(void *data, struct dspfilter_output *output,
-    const struct dspfilter_input *input)
+      const struct dspfilter_input *input)
 {
-    struct overdrive_data *od = (struct overdrive_data *)data;
-    float *samples = input->samples;
-    unsigned i;
+   output->samples = input->samples;
+   output->frames  = input->frames;
+   overdrive_run((struct overdrive_data*)data, input->samples, input->frames);
+}
 
-    output->samples = samples;
-    output->frames = input->frames;
+static int16_t overdrive_float_to_s16(float v)
+{
+   if (v >= 1.0f)
+      return 32767;
+   if (v > -1.0f)
+   {
+      int32_t s = (v >= 0.0f) ? (int32_t)(v * 32768.0f + 0.5f)
+                              : (int32_t)(v * 32768.0f - 0.5f);
+      return (int16_t)((s > 32767) ? 32767 : s);
+   }
+   if (v <= -1.0f)
+      return -32768;
+   return 0;
+}
 
-    for (i = 0; i < input->frames; ++i)
-    {
-        unsigned ch;
-        for (ch = 0; ch < 2u; ++ch)
-        {
-            unsigned idx = i * 2u + ch;
-            float dry = samples[idx];
-            float driven = dry * od->drive;
-            float shaped;
-            float hp;
-            float wet;
+/* The waveshaper is inherently floating-point; the int16 entry point
+ * runs it on a converted copy so the chain can stay on the int16 path. */
+static void overdrive_process_i16(void *data,
+      struct dspfilter_output_i16 *output,
+      const struct dspfilter_input_i16 *input)
+{
+   struct overdrive_data *od = (struct overdrive_data*)data;
+   int16_t *samples          = input->samples;
+   unsigned remaining        = input->frames;
 
-            driven += od->asymmetry * driven * driven * 0.15f;
-            driven = dsp_clampf(driven, -12.0f, 12.0f);
-            shaped = overdrive_shape(driven);
+   output->samples           = input->samples;
+   output->frames            = input->frames;
 
-            /* DC blocker, important when asymmetric drive is used. */
-            hp = shaped - od->prev_in[ch] + od->dc_r * od->prev_hp[ch];
-            od->prev_in[ch] = shaped;
-            od->prev_hp[ch] = hp;
+   while (remaining)
+   {
+      unsigned i;
+      unsigned chunk = remaining;
+      if (chunk > OVERDRIVE_I16_CHUNK)
+         chunk = OVERDRIVE_I16_CHUNK;
 
-            /* One-pole low-pass tone stage with a small direct component. */
-            od->tone_lp[ch] += od->tone_alpha * (hp - od->tone_lp[ch]);
-            wet = 0.30f * hp + 0.70f * od->tone_lp[ch];
-            wet *= od->level;
+      for (i = 0; i < chunk * 2; i++)
+         od->scratch[i] = (float)samples[i] * (1.0f / 32768.0f);
+      overdrive_run(od, od->scratch, chunk);
+      for (i = 0; i < chunk * 2; i++)
+         samples[i] = overdrive_float_to_s16(od->scratch[i]);
 
-            samples[idx] = dsp_lerp(dry, wet, od->mix);
-        }
-    }
+      samples   += chunk * 2;
+      remaining -= chunk;
+   }
 }
 
 static void overdrive_free(void *data)
 {
-    free(data);
+   free(data);
+}
+
+static float overdrive_clampf(float x, float lo, float hi)
+{
+   return x < lo ? lo : (x > hi ? hi : x);
+}
+
+static float overdrive_db_to_gain(float db)
+{
+   return (float)pow(10.0, db * 0.05f);
 }
 
 static void *overdrive_init(const struct dspfilter_info *info,
-    const struct dspfilter_config *config, void *userdata)
+      const struct dspfilter_config *config, void *userdata)
 {
-    struct overdrive_data *od;
-    float drive_db = 18.0f;
-    float tone_hz = 6500.0f;
-    float mix = 1.0f;
-    float level_db = -4.0f;
-    float asymmetry = 0.12f;
-    float sr;
-    float omega;
+   float drive_db, tone_hz, mix, level_db, asymmetry, sr, omega;
+   struct overdrive_data *od;
 
-    if (!info || info->input_rate <= 1.0f)
-        return NULL;
+   if (!info || info->input_rate <= 1.0f)
+      return NULL;
 
-    od = (struct overdrive_data *)calloc(1, sizeof(*od));
-    if (!od)
-        return NULL;
+   if (!(od = (struct overdrive_data*)calloc(1, sizeof(*od))))
+      return NULL;
 
-    config->get_float(userdata, "drive_db", &drive_db, 18.0f);
-    config->get_float(userdata, "tone_hz", &tone_hz, 6500.0f);
-    config->get_float(userdata, "drywet", &mix, 1.0f);
-    config->get_float(userdata, "level_db", &level_db, -4.0f);
-    config->get_float(userdata, "asymmetry", &asymmetry, 0.12f);
+   config->get_float(userdata, "drive_db", &drive_db, 18.0f);
+   config->get_float(userdata, "tone_hz", &tone_hz, 6500.0f);
+   config->get_float(userdata, "drywet", &mix, 1.0f);
+   config->get_float(userdata, "level_db", &level_db, -4.0f);
+   config->get_float(userdata, "asymmetry", &asymmetry, 0.12f);
 
-    sr = info->input_rate;
-    tone_hz = dsp_clampf(tone_hz, 200.0f, sr * 0.45f);
-    omega = 2.0f * (float)M_PI * tone_hz / sr;
+   sr             = info->input_rate;
+   tone_hz        = overdrive_clampf(tone_hz, 200.0f, sr * 0.45f);
+   omega          = 2.0f * 3.14159265358979323846f * tone_hz / sr;
 
-    od->drive = dsp_db_to_gain(dsp_clampf(drive_db, 0.0f, 42.0f));
-    od->tone_alpha = 1.0f - expf(-omega);
-    od->mix = dsp_clampf(mix, 0.0f, 1.0f);
-    od->level = dsp_db_to_gain(dsp_clampf(level_db, -30.0f, 12.0f));
-    od->asymmetry = dsp_clampf(asymmetry, 0.0f, 1.0f);
-    od->dc_r = 0.995f;
+   od->drive      = overdrive_db_to_gain(overdrive_clampf(drive_db, 0.0f, 42.0f));
+   od->tone_alpha = 1.0f - (float)exp(-omega);
+   od->mix        = overdrive_clampf(mix, 0.0f, 1.0f);
+   od->level      = overdrive_db_to_gain(overdrive_clampf(level_db, -30.0f, 12.0f));
+   od->asymmetry  = overdrive_clampf(asymmetry, 0.0f, 1.0f);
+   od->dc_r       = 0.995f;
 
-    return od;
+   return od;
 }
 
-static const struct dspfilter_implementation overdrive_plug =
-{
-    overdrive_init,
-    overdrive_process,
-    overdrive_free,
-    DSPFILTER_API_VERSION,
-    "Distortion / Overdrive",
-    "overdrive"
+static const struct dspfilter_implementation overdrive_plug = {
+   overdrive_init,
+   overdrive_process,
+   overdrive_free,
+
+   DSPFILTER_API_VERSION,
+   "Distortion / Overdrive",
+   "overdrive",
+
+   overdrive_process_i16,
 };
 
-DSPFILTER_EXPORT const struct dspfilter_implementation *
 #ifdef HAVE_FILTERS_BUILTIN
-overdrive_dspfilter_get_implementation(dspfilter_simd_mask_t mask)
-#else
-dspfilter_get_implementation(dspfilter_simd_mask_t mask)
+#define dspfilter_get_implementation overdrive_dspfilter_get_implementation
 #endif
+
+const struct dspfilter_implementation *dspfilter_get_implementation(dspfilter_simd_mask_t mask)
 {
-    (void)mask;
-    return &overdrive_plug;
+   (void)mask;
+   return &overdrive_plug;
 }
+
+#undef dspfilter_get_implementation
