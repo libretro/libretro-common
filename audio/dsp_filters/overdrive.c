@@ -27,8 +27,12 @@
 #include <retro_inline.h>
 #include <libretro_dspfilter.h>
 
-/* Frames converted per step by the int16 entry point. */
-#define OVERDRIVE_I16_CHUNK 256
+/* int16 path: the shaper is a table of the float curve over
+ * [-16, 16) in Q20 input units, 128 points per unit, read with linear
+ * interpolation; signals run in Q28 (1.0 = full scale). */
+#define OVERDRIVE_LUT_SHIFT 13
+#define OVERDRIVE_LUT_SIZE  4096
+#define OVERDRIVE_LUT_SPAN  (16 << 20)
 
 /* Filter state below this magnitude is flushed to zero, well under
  * audibility and well above the denormal range. */
@@ -36,7 +40,6 @@
 
 struct overdrive_data
 {
-   float scratch[OVERDRIVE_I16_CHUNK * 2];
    /* Asymmetry is a bias into the tanh, with the bias's own output
     * subtracted and the small-signal gain restored, so the curve stays
     * monotonic at any drive. Kept in double so silence maps to exactly
@@ -44,6 +47,19 @@ struct overdrive_data
    double bias;
    double bias_out;
    double bias_norm;
+
+   /* int16 path: shaper table, coefficients and state. */
+   int32_t lut[OVERDRIVE_LUT_SIZE + 1];
+   int32_t drive_q20;
+   int32_t bias_q20;
+   int32_t dc_r_q30;
+   int32_t tone_alpha_q30;
+   int32_t level_q24;
+   int32_t mix_q16;
+   int32_t prev_in_i[2];
+   int32_t prev_hp_i[2];
+   int32_t tone_lp_i[2];
+
    float drive;
    float tone_alpha;
    float mix;
@@ -106,49 +122,74 @@ static void overdrive_process(void *data, struct dspfilter_output *output,
    overdrive_run((struct overdrive_data*)data, input->samples, input->frames);
 }
 
-static int16_t overdrive_float_to_s16(float v)
+/* Round-half-away-from-zero arithmetic shift, defined for negative
+ * values without relying on implementation-defined >> of signed. */
+static INLINE int64_t overdrive_rsh(int64_t v, unsigned s)
 {
-   if (v >= 1.0f)
-      return 32767;
-   if (v > -1.0f)
-   {
-      int32_t s = (v >= 0.0f) ? (int32_t)(v * 32768.0f + 0.5f)
-                              : (int32_t)(v * 32768.0f - 0.5f);
-      return (int16_t)((s > 32767) ? 32767 : s);
-   }
-   if (v <= -1.0f)
-      return -32768;
-   return 0;
+   int64_t h = (int64_t)1 << (s - 1);
+   return (v >= 0) ? ((v + h) >> s) : -(((-v) + h) >> s);
 }
 
-/* The waveshaper is inherently floating-point; the int16 entry point
- * runs it on a converted copy so the chain can stay on the int16 path. */
+static INLINE int32_t overdrive_shape_i(const struct overdrive_data *od,
+      int32_t v_q20)
+{
+   uint32_t pos  = (uint32_t)(v_q20 + OVERDRIVE_LUT_SPAN);
+   uint32_t idx  = pos >> OVERDRIVE_LUT_SHIFT;
+   int32_t  frac = (int32_t)(pos & ((1u << OVERDRIVE_LUT_SHIFT) - 1u));
+   int32_t  a    = od->lut[idx];
+   return a + (int32_t)overdrive_rsh(
+         (int64_t)(od->lut[idx + 1] - a) * frac, OVERDRIVE_LUT_SHIFT);
+}
+
 static void overdrive_process_i16(void *data,
       struct dspfilter_output_i16 *output,
       const struct dspfilter_input_i16 *input)
 {
+   unsigned i, ch;
    struct overdrive_data *od = (struct overdrive_data*)data;
    int16_t *samples          = input->samples;
-   unsigned remaining        = input->frames;
+   const int32_t clip        = 12 << 20;
 
    output->samples           = input->samples;
    output->frames            = input->frames;
 
-   while (remaining)
+   for (i = 0; i < input->frames; i++, samples += 2)
    {
-      unsigned i;
-      unsigned chunk = remaining;
-      if (chunk > OVERDRIVE_I16_CHUNK)
-         chunk = OVERDRIVE_I16_CHUNK;
+      for (ch = 0; ch < 2; ch++)
+      {
+         int32_t u, shaped, hp;
+         int64_t wet, dry, out;
+         int32_t x = samples[ch];
 
-      for (i = 0; i < chunk * 2; i++)
-         od->scratch[i] = (float)samples[i] * (1.0f / 32768.0f);
-      overdrive_run(od, od->scratch, chunk);
-      for (i = 0; i < chunk * 2; i++)
-         samples[i] = overdrive_float_to_s16(od->scratch[i]);
+         u = (int32_t)overdrive_rsh((int64_t)x * od->drive_q20, 15);
+         if (u < -clip)
+            u = -clip;
+         else if (u > clip)
+            u = clip;
+         shaped = overdrive_shape_i(od, u + od->bias_q20);
 
-      samples   += chunk * 2;
-      remaining -= chunk;
+         hp                 = shaped - od->prev_in_i[ch] + (int32_t)
+            overdrive_rsh((int64_t)od->dc_r_q30 * od->prev_hp_i[ch], 30);
+         od->prev_in_i[ch]  = shaped;
+         od->prev_hp_i[ch]  = hp;
+
+         od->tone_lp_i[ch] += (int32_t)overdrive_rsh(
+               (int64_t)od->tone_alpha_q30 * (hp - od->tone_lp_i[ch]), 30);
+
+         /* 0.30 * hp + 0.70 * tone, both Q30 constants. */
+         wet = overdrive_rsh((int64_t)322122547 * hp
+               + (int64_t)751619277 * od->tone_lp_i[ch], 30);
+         wet = overdrive_rsh(wet * od->level_q24, 24);
+
+         dry = (int64_t)x * 8192;
+         out = dry + overdrive_rsh((wet - dry) * od->mix_q16, 16);
+         out = overdrive_rsh(out, 13);
+         if      (out >  32767)
+            out =  32767;
+         else if (out < -32768)
+            out = -32768;
+         samples[ch] = (int16_t)out;
+      }
    }
 }
 
@@ -172,6 +213,7 @@ static void *overdrive_init(const struct dspfilter_info *info,
 {
    float drive_db, tone_hz, mix, level_db, asymmetry, sr, omega;
    double t;
+   unsigned i;
    struct overdrive_data *od;
 
    if (!info || info->input_rate <= 1.0f)
@@ -203,6 +245,16 @@ static void *overdrive_init(const struct dspfilter_info *info,
    od->bias       = 0.5 * log((1.0 + t) / (1.0 - t));
    od->bias_out   = tanh(od->bias);
    od->bias_norm  = 1.0 / (1.0 - od->bias_out * od->bias_out);
+
+   od->drive_q20      = (int32_t)floor((double)od->drive * 1048576.0 + 0.5);
+   od->bias_q20       = (int32_t)floor(od->bias * 1048576.0 + 0.5);
+   od->dc_r_q30       = (int32_t)floor((double)od->dc_r * 1073741824.0 + 0.5);
+   od->tone_alpha_q30 = (int32_t)floor((double)od->tone_alpha * 1073741824.0 + 0.5);
+   od->level_q24      = (int32_t)floor((double)od->level * 16777216.0 + 0.5);
+   od->mix_q16        = (int32_t)floor((double)od->mix * 65536.0 + 0.5);
+   for (i = 0; i <= OVERDRIVE_LUT_SIZE; i++)
+      od->lut[i] = (int32_t)floor((tanh(-16.0 + (double)i / 128.0)
+            - od->bias_out) * od->bias_norm * 268435456.0 + 0.5);
 
    return od;
 }

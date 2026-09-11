@@ -28,14 +28,14 @@
 
 struct bitcrusher_data
 {
-   float mix;
-   float quant_scale;
-   float held[2];
    int32_t held_i[2];
    int32_t quant_scale_i;
    int32_t mix_q16;
    unsigned hold_count;
    unsigned downsample;
+   float mix;
+   float quant_scale;
+   float held[2];
 };
 
 /* Symmetric round-half-away quantisation of [-1, 1] onto

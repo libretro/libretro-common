@@ -30,8 +30,10 @@
 #define EARLYREVERB_COMBS      4
 #define EARLYREVERB_ALLPASS    2
 #define EARLYREVERB_TAPS       8
-/* Frames converted per step by the int16 entry point. */
-#define EARLYREVERB_I16_CHUNK  256
+/* int16 path: delay lines hold Q8 samples (1 LSB of s16 = 256), gains
+ * are Q16 and recirculating coefficients Q30. Stored state saturates
+ * far above full scale, so it can never wrap. */
+#define EARLYREVERB_I16_LIMIT  ((int32_t)1 << 30)
 /* Recirculating state below this magnitude is flushed to zero, well
  * under audibility and well above the denormal range, so a decaying
  * tail never drops into denormals. */
@@ -40,6 +42,8 @@
 struct earlyreverb_line
 {
    float *buf;
+   int32_t *buf_i;
+   int32_t filter_store_i;
    unsigned len;
    unsigned pos;
    float filter_store;
@@ -47,21 +51,40 @@ struct earlyreverb_line
 
 struct earlyreverb_data
 {
-   float scratch[EARLYREVERB_I16_CHUNK * 2];
-
    struct earlyreverb_line comb[2][EARLYREVERB_COMBS];
    struct earlyreverb_line allpass[2][EARLYREVERB_ALLPASS];
-   float comb_feedback[2][EARLYREVERB_COMBS];
 
-   float early_gain_l[EARLYREVERB_TAPS];
-   float early_gain_r[EARLYREVERB_TAPS];
-   unsigned early_tap[EARLYREVERB_TAPS];
-
-   /* Every delay line is a view into this one block. */
-   float *arena;
+   /* Every delay line, float and int16, is a view into this one block. */
+   uint8_t *arena;
    float *predelay[2];
    float *early[2];
+   int16_t *predelay_i[2];
+   int16_t *early_i[2];
 
+   /* int16 path coefficients. */
+   int32_t early_gain_l_q16[EARLYREVERB_TAPS];
+   int32_t early_gain_r_q16[EARLYREVERB_TAPS];
+   int32_t early_cross_l_q16[EARLYREVERB_TAPS];
+   int32_t early_cross_r_q16[EARLYREVERB_TAPS];
+   int32_t comb_feedback_q30[2][EARLYREVERB_COMBS];
+   int32_t damping_q30;
+   int32_t undamped_q30;
+   int32_t allpass_g_q30;
+   int32_t dry_q16;
+   int32_t wet_q16;
+   int32_t early_mix_q16;
+   int32_t late_mix_q16;
+   int32_t width_q16;
+
+   unsigned early_tap[EARLYREVERB_TAPS];
+   unsigned predelay_len;
+   unsigned predelay_pos;
+   unsigned early_mask;
+   unsigned early_pos;
+
+   float comb_feedback[2][EARLYREVERB_COMBS];
+   float early_gain_l[EARLYREVERB_TAPS];
+   float early_gain_r[EARLYREVERB_TAPS];
    float dry;
    float wet;
    float early_mix;
@@ -69,11 +92,6 @@ struct earlyreverb_data
    float width;
    float damping;
    float diffusion;
-
-   unsigned predelay_len;
-   unsigned predelay_pos;
-   unsigned early_mask;
-   unsigned early_pos;
 };
 
 static INLINE float earlyreverb_flush(float v)
@@ -182,49 +200,129 @@ static void earlyreverb_process(void *data, struct dspfilter_output *output,
          input->samples, input->frames);
 }
 
-static int16_t earlyreverb_float_to_s16(float v)
+static INLINE int64_t earlyreverb_rsh(int64_t v, unsigned s)
 {
-   if (v >= 1.0f)
-      return 32767;
-   if (v > -1.0f)
-   {
-      int32_t s = (v >= 0.0f) ? (int32_t)(v * 32768.0f + 0.5f)
-                              : (int32_t)(v * 32768.0f - 0.5f);
-      return (int16_t)((s > 32767) ? 32767 : s);
-   }
-   if (v <= -1.0f)
-      return -32768;
-   return 0;
+   int64_t h = (int64_t)1 << (s - 1);
+   return (v >= 0) ? ((v + h) >> s) : -(((-v) + h) >> s);
 }
 
-/* The reverb network is floating-point; the int16 entry point runs it
- * on a converted copy so the chain can stay on the int16 path. */
+static INLINE int32_t earlyreverb_sat(int64_t v)
+{
+   if (v > EARLYREVERB_I16_LIMIT)
+      return EARLYREVERB_I16_LIMIT;
+   if (v < -EARLYREVERB_I16_LIMIT)
+      return -EARLYREVERB_I16_LIMIT;
+   return (int32_t)v;
+}
+
+static int32_t earlyreverb_comb_i(struct earlyreverb_line *d, int32_t input,
+      int32_t feedback, int32_t damping, int32_t undamped)
+{
+   int32_t out       = d->buf_i[d->pos];
+   d->filter_store_i = earlyreverb_sat(earlyreverb_rsh(
+         (int64_t)out * undamped + (int64_t)d->filter_store_i * damping, 30));
+   d->buf_i[d->pos]  = earlyreverb_sat((int64_t)input + earlyreverb_rsh(
+         (int64_t)d->filter_store_i * feedback, 30));
+   if (++d->pos >= d->len)
+      d->pos = 0;
+   return out;
+}
+
+static int32_t earlyreverb_allpass_i(struct earlyreverb_line *d,
+      int32_t input, int32_t g)
+{
+   int32_t delayed   = d->buf_i[d->pos];
+   d->buf_i[d->pos]  = earlyreverb_sat((int64_t)input
+         + earlyreverb_rsh((int64_t)delayed * g, 30));
+   if (++d->pos >= d->len)
+      d->pos = 0;
+   return earlyreverb_sat((int64_t)delayed - input);
+}
+
 static void earlyreverb_process_i16(void *data,
       struct dspfilter_output_i16 *output,
       const struct dspfilter_input_i16 *input)
 {
+   unsigned f;
    struct earlyreverb_data *rv = (struct earlyreverb_data*)data;
    int16_t *samples            = input->samples;
-   unsigned remaining          = input->frames;
 
    output->samples             = input->samples;
    output->frames              = input->frames;
 
-   while (remaining)
+   for (f = 0; f < input->frames; f++, samples += 2)
    {
-      unsigned i;
-      unsigned chunk = remaining;
-      if (chunk > EARLYREVERB_I16_CHUNK)
-         chunk = EARLYREVERB_I16_CHUNK;
+      unsigned t, i;
+      int32_t pre_l, pre_r, early_l, early_r, feed, late_l, late_r;
+      int32_t wet_l, wet_r, mid, side;
+      int64_t acc_l = 0, acc_r = 0, sum_l = 0, sum_r = 0, out;
+      int32_t dry_l = samples[0];
+      int32_t dry_r = samples[1];
 
-      for (i = 0; i < chunk * 2; i++)
-         rv->scratch[i] = (float)samples[i] * (1.0f / 32768.0f);
-      earlyreverb_run(rv, rv->scratch, chunk);
-      for (i = 0; i < chunk * 2; i++)
-         samples[i] = earlyreverb_float_to_s16(rv->scratch[i]);
+      pre_l = rv->predelay_i[0][rv->predelay_pos];
+      pre_r = rv->predelay_i[1][rv->predelay_pos];
+      rv->predelay_i[0][rv->predelay_pos] = (int16_t)dry_l;
+      rv->predelay_i[1][rv->predelay_pos] = (int16_t)dry_r;
 
-      samples   += chunk * 2;
-      remaining -= chunk;
+      rv->early_i[0][rv->early_pos] = (int16_t)pre_l;
+      rv->early_i[1][rv->early_pos] = (int16_t)pre_r;
+
+      for (t = 0; t < EARLYREVERB_TAPS; t++)
+      {
+         unsigned p = (rv->early_pos - rv->early_tap[t]) & rv->early_mask;
+         int32_t el = rv->early_i[0][p];
+         int32_t er = rv->early_i[1][p];
+         acc_l     += (int64_t)el * rv->early_gain_l_q16[t]
+                    + (int64_t)er * rv->early_cross_r_q16[t];
+         acc_r     += (int64_t)er * rv->early_gain_r_q16[t]
+                    + (int64_t)el * rv->early_cross_l_q16[t];
+      }
+      /* s16 x Q16 -> Q8. */
+      early_l = earlyreverb_sat(earlyreverb_rsh(acc_l, 8));
+      early_r = earlyreverb_sat(earlyreverb_rsh(acc_r, 8));
+
+      /* 0.5 * (pre_l + pre_r) + 0.20 * (early_l + early_r), in Q8. */
+      feed = earlyreverb_sat(((int64_t)pre_l + pre_r) * 128
+            + earlyreverb_rsh(((int64_t)early_l + early_r) * 13107, 16));
+
+      for (i = 0; i < EARLYREVERB_COMBS; i++)
+      {
+         sum_l += earlyreverb_comb_i(&rv->comb[0][i], feed,
+               rv->comb_feedback_q30[0][i], rv->damping_q30, rv->undamped_q30);
+         sum_r += earlyreverb_comb_i(&rv->comb[1][i], feed,
+               rv->comb_feedback_q30[1][i], rv->damping_q30, rv->undamped_q30);
+      }
+      late_l = earlyreverb_sat(earlyreverb_rsh(sum_l, 2));
+      late_r = earlyreverb_sat(earlyreverb_rsh(sum_r, 2));
+
+      for (i = 0; i < EARLYREVERB_ALLPASS; i++)
+      {
+         late_l = earlyreverb_allpass_i(&rv->allpass[0][i], late_l, rv->allpass_g_q30);
+         late_r = earlyreverb_allpass_i(&rv->allpass[1][i], late_r, rv->allpass_g_q30);
+      }
+
+      wet_l = earlyreverb_sat(earlyreverb_rsh((int64_t)early_l * rv->early_mix_q16
+            + (int64_t)late_l * rv->late_mix_q16, 16));
+      wet_r = earlyreverb_sat(earlyreverb_rsh((int64_t)early_r * rv->early_mix_q16
+            + (int64_t)late_r * rv->late_mix_q16, 16));
+
+      mid   = earlyreverb_sat(earlyreverb_rsh((int64_t)wet_l + wet_r, 1));
+      side  = earlyreverb_sat(earlyreverb_rsh(((int64_t)wet_l - wet_r)
+               * rv->width_q16, 17));
+      wet_l = earlyreverb_sat((int64_t)mid + side);
+      wet_r = earlyreverb_sat((int64_t)mid - side);
+
+      /* dry (s16) and wet (Q8) mixed with Q16 gains, back to s16. */
+      out = earlyreverb_rsh((int64_t)dry_l * rv->dry_q16 * 256
+            + (int64_t)wet_l * rv->wet_q16, 24);
+      samples[0] = (int16_t)(out > 32767 ? 32767 : (out < -32768 ? -32768 : out));
+      out = earlyreverb_rsh((int64_t)dry_r * rv->dry_q16 * 256
+            + (int64_t)wet_r * rv->wet_q16, 24);
+      samples[1] = (int16_t)(out > 32767 ? 32767 : (out < -32768 ? -32768 : out));
+
+      if (++rv->predelay_pos >= rv->predelay_len)
+         rv->predelay_pos = 0;
+      rv->early_pos = (rv->early_pos + 1) & rv->early_mask;
    }
 }
 
@@ -242,6 +340,11 @@ static float earlyreverb_clampf(float x, float lo, float hi)
    return x < lo ? lo : (x > hi ? hi : x);
 }
 
+static int32_t earlyreverb_q(float v, unsigned bits)
+{
+   return (int32_t)floor((double)v * (double)((int32_t)1 << bits) + 0.5);
+}
+
 static void *earlyreverb_init(const struct dspfilter_info *info,
       const struct dspfilter_config *config, void *userdata)
 {
@@ -257,8 +360,10 @@ static void *earlyreverb_init(const struct dspfilter_info *info,
    float predelay_ms, room_size, decay_sec, damping, diffusion;
    float early_mix, late_mix, width, drywet, sr;
    unsigned ch, i, early_len, early_size;
-   size_t total;
+   size_t total, total_i32, total_i16;
    float *cur;
+   int32_t *cur_i32;
+   int16_t *cur_i16;
    struct earlyreverb_data *rv;
 
    if (!info || info->input_rate <= 1.0f)
@@ -365,30 +470,65 @@ static void *earlyreverb_init(const struct dspfilter_info *info,
       }
    }
 
-   if (!(rv->arena = (float*)calloc(total, sizeof(float))))
+   /* Floats first, then the int32 comb/allpass lines, then the int16
+    * pre-delay and early rings; each region is naturally aligned. */
+   total_i16 = 2 * (size_t)rv->predelay_len + 2 * (size_t)early_size;
+   total_i32 = total - total_i16;
+   if (!(rv->arena = (uint8_t*)calloc(1, total * sizeof(float)
+               + total_i32 * sizeof(int32_t) + total_i16 * sizeof(int16_t))))
    {
       free(rv);
       return NULL;
    }
 
-   cur = rv->arena;
+   cur     = (float*)rv->arena;
+   cur_i32 = (int32_t*)(rv->arena + total * sizeof(float));
+   cur_i16 = (int16_t*)(rv->arena + total * sizeof(float)
+         + total_i32 * sizeof(int32_t));
    for (ch = 0; ch < 2; ch++)
    {
       rv->predelay[ch] = cur;
       cur             += rv->predelay_len;
       rv->early[ch]    = cur;
       cur             += early_size;
+      rv->predelay_i[ch] = cur_i16;
+      cur_i16           += rv->predelay_len;
+      rv->early_i[ch]    = cur_i16;
+      cur_i16           += early_size;
       for (i = 0; i < EARLYREVERB_COMBS; i++)
       {
-         rv->comb[ch][i].buf = cur;
-         cur                += rv->comb[ch][i].len;
+         rv->comb[ch][i].buf   = cur;
+         cur                  += rv->comb[ch][i].len;
+         rv->comb[ch][i].buf_i = cur_i32;
+         cur_i32              += rv->comb[ch][i].len;
       }
       for (i = 0; i < EARLYREVERB_ALLPASS; i++)
       {
-         rv->allpass[ch][i].buf = cur;
-         cur                   += rv->allpass[ch][i].len;
+         rv->allpass[ch][i].buf   = cur;
+         cur                     += rv->allpass[ch][i].len;
+         rv->allpass[ch][i].buf_i = cur_i32;
+         cur_i32                 += rv->allpass[ch][i].len;
       }
+      for (i = 0; i < EARLYREVERB_COMBS; i++)
+         rv->comb_feedback_q30[ch][i] = earlyreverb_q(
+               rv->comb_feedback[ch][i], 30);
    }
+
+   for (i = 0; i < EARLYREVERB_TAPS; i++)
+   {
+      rv->early_gain_l_q16[i]  = earlyreverb_q(rv->early_gain_l[i], 16);
+      rv->early_gain_r_q16[i]  = earlyreverb_q(rv->early_gain_r[i], 16);
+      rv->early_cross_l_q16[i] = earlyreverb_q(rv->early_gain_l[i] * 0.30f, 16);
+      rv->early_cross_r_q16[i] = earlyreverb_q(rv->early_gain_r[i] * 0.30f, 16);
+   }
+   rv->damping_q30   = earlyreverb_q(rv->damping, 30);
+   rv->undamped_q30  = earlyreverb_q(1.0f - rv->damping, 30);
+   rv->allpass_g_q30 = earlyreverb_q(0.45f + 0.30f * rv->diffusion, 30);
+   rv->dry_q16       = earlyreverb_q(rv->dry, 16);
+   rv->wet_q16       = earlyreverb_q(rv->wet, 16);
+   rv->early_mix_q16 = earlyreverb_q(rv->early_mix, 16);
+   rv->late_mix_q16  = earlyreverb_q(rv->late_mix, 16);
+   rv->width_q16     = earlyreverb_q(rv->width, 16);
 
    return rv;
 }
