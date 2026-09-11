@@ -533,28 +533,19 @@ static void wsola_process(void *opaque, struct dspfilter_output *out,
 }
 
 static const struct dspfilter_implementation plug_scalar = {
-   init_scalar, wsola_process, wsola_free, 1u,
+   init_scalar, wsola_process, wsola_free, DSPFILTER_API_VERSION,
    "WSOLA Pitch / Tempo", "wsolapitchtempo"
-#if DSPFILTER_API_VERSION >= 2
-   , NULL
-#endif
 };
 #if NPT_SSE2
 static const struct dspfilter_implementation plug_sse2 = {
-   init_sse2, wsola_process, wsola_free, 1u,
+   init_sse2, wsola_process, wsola_free, DSPFILTER_API_VERSION,
    "WSOLA Pitch / Tempo (SSE2)", "wsolapitchtempo"
-#if DSPFILTER_API_VERSION >= 2
-   , NULL
-#endif
 };
 #endif
 #if NPT_NEON
 static const struct dspfilter_implementation plug_neon = {
-   init_neon, wsola_process, wsola_free, 1u,
+   init_neon, wsola_process, wsola_free, DSPFILTER_API_VERSION,
    "WSOLA Pitch / Tempo (NEON)", "wsolapitchtempo"
-#if DSPFILTER_API_VERSION >= 2
-   , NULL
-#endif
 };
 #endif
 
