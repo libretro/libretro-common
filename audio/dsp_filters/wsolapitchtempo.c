@@ -20,8 +20,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/* Independent pitch and tempo: a WSOLA duration change followed by a
- * polyphase windowed-sinc resampler. */
+/* Pitch shift at unchanged tempo: a WSOLA duration change by the pitch
+ * ratio, followed by a polyphase windowed-sinc resampler that restores
+ * the duration. Output runs at the input rate, so the filter never
+ * changes how much audio the frontend has to play. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -65,7 +67,7 @@ enum wsola_simd
 
 struct wsola
 {
-   double pitch_st, tempo_pct, pitch_ratio, tempo_ratio, duration_ratio;
+   double pitch_st, pitch_ratio;
    double ha, next_analysis;
    double resamp_pos;
 
@@ -88,19 +90,17 @@ struct wsola
    size_t output_cap_samples;
    size_t in_f_cap_samples, out_i16_cap_samples;
 
-   /* Output pacing: frames owed per input frame, the fractional
-    * remainder carried between calls, and how far production must run
-    * ahead before emission starts. */
-   double out_per_in;
-   double out_acc;
+   /* Output pacing: how far production must run ahead before emission
+    * starts, and any shortfall carried to the next call. */
    unsigned out_prime;
+   unsigned out_owed;
    unsigned out_read;
    int out_started;
 
    float rate;
    unsigned seq, overlap, search, hs;
    unsigned output_frames;
-   int first, wsola_bypass, resamp_bypass, bypass, failed;
+   int first, bypass, failed;
    enum wsola_simd simd;
 };
 
@@ -136,21 +136,6 @@ static int wsola_grow(void **ptr, size_t elem, size_t *cap, size_t need)
 static unsigned wsola_align_up(unsigned v, unsigned a)
 {
    return ((v + a - 1u) / a) * a;
-}
-
-static int wsola_append_output(struct wsola *d, const float *src,
-      unsigned frames)
-{
-   size_t old = (size_t)d->output_frames * WSOLA_CH;
-   size_t add = (size_t)frames * WSOLA_CH;
-   if (!frames)
-      return 1;
-   if (!wsola_grow((void**)&d->output, sizeof(float),
-            &d->output_cap_samples, old + add))
-      return 0;
-   memcpy(d->output + old, src, add * sizeof(float));
-   d->output_frames += frames;
-   return 1;
 }
 
 static double wsola_corr_scalar(const float *a, const float *b,
@@ -427,14 +412,6 @@ static int wsola_process_resamp(struct wsola *d)
    return 1;
 }
 
-static int wsola_feed_audio(struct wsola *d, const float *src,
-      unsigned frames)
-{
-   if (d->resamp_bypass)
-      return wsola_append_output(d, src, frames);
-   return wsola_append_resamp(d, src, frames) && wsola_process_resamp(d);
-}
-
 static int wsola_feed_until(struct wsola *d, uint64_t safe)
 {
    uint64_t end = safe < d->ola_end ? safe : d->ola_end;
@@ -445,7 +422,8 @@ static int wsola_feed_until(struct wsola *d, uint64_t safe)
       if (frames > WSOLA_BLOCK)
          frames = WSOLA_BLOCK;
       off = (size_t)(d->ola_read - d->ola_base);
-      if (!wsola_feed_audio(d, d->ola + off * WSOLA_CH, frames))
+      if (     !wsola_append_resamp(d, d->ola + off * WSOLA_CH, frames)
+            || !wsola_process_resamp(d))
          return 0;
       d->ola_read += frames;
    }
@@ -613,8 +591,6 @@ static int wsola_prepare_resampler(struct wsola *d)
 {
    unsigned ph, t;
    double onyq, cutoff, inv_i0;
-   if (d->resamp_bypass)
-      return 1;
    if (!(d->table = (float*)malloc(
                (size_t)WSOLA_PHASES * WSOLA_TAPS * sizeof(float))))
       return 0;
@@ -678,7 +654,7 @@ static void *wsola_init_common(const struct dspfilter_info *info,
       enum wsola_simd simd)
 {
    unsigned rate;
-   float pitch, tempo;
+   float pitch;
    struct wsola *d;
 
    if (!info || info->input_rate <= 0.0f)
@@ -687,18 +663,11 @@ static void *wsola_init_common(const struct dspfilter_info *info,
       return NULL;
 
    config->get_float(userdata, "pitch", &pitch, 0.0f);
-   config->get_float(userdata, "tempo", &tempo, 0.0f);
 
    d->rate           = info->input_rate;
    d->pitch_st       = wsola_clampd(pitch, -12.0, 12.0);
-   d->tempo_pct      = wsola_clampd(tempo, -50.0, 100.0);
    d->pitch_ratio    = pow(2.0, d->pitch_st / 12.0);
-   d->tempo_ratio    = 1.0 + d->tempo_pct * 0.01;
-   d->duration_ratio = d->pitch_ratio / d->tempo_ratio;
-   d->wsola_bypass   = fabs(d->duration_ratio - 1.0) < 1.0e-9;
-   d->resamp_bypass  = fabs(d->pitch_ratio - 1.0) < 1.0e-9;
-   d->bypass         = d->wsola_bypass && d->resamp_bypass;
-   d->out_per_in     = 1.0 / d->tempo_ratio;
+   d->bypass         = fabs(d->pitch_ratio - 1.0) < 1.0e-9;
    d->simd           = simd;
 
    /* 40 ms segments, 8 ms cross-fade, +/-12 ms search, 8-frame aligned. */
@@ -715,27 +684,20 @@ static void *wsola_init_common(const struct dspfilter_info *info,
    if (d->search < 16u)
       d->search = 16u;
    d->hs      = d->seq - d->overlap;
-   d->ha      = (double)d->hs / d->duration_ratio;
+   d->ha      = (double)d->hs / d->pitch_ratio;
    d->first   = 1;
 
-   /* WSOLA output lands one synthesis hop (as resampled) at a time; with
-    * that much held back, every call can emit at the nominal rate. The
-    * resampler on its own produces smoothly and needs only a margin. */
-   d->out_prime = 64u;
-   if (!d->wsola_bypass)
-      d->out_prime += (unsigned)ceil((double)d->hs
-            / (d->resamp_bypass ? 1.0 : d->pitch_ratio));
+   /* Output lands one synthesis hop, as resampled, at a time; with that
+    * much held back, every call can emit as many frames as it takes. */
+   d->out_prime = 64u + (unsigned)ceil((double)d->hs / d->pitch_ratio);
 
    if (d->bypass)
       return d;
 
-   if (!d->wsola_bypass)
+   if (!(d->reference = (float*)malloc((size_t)d->overlap * sizeof(float))))
    {
-      if (!(d->reference = (float*)malloc((size_t)d->overlap * sizeof(float))))
-      {
-         wsola_free(d);
-         return NULL;
-      }
+      wsola_free(d);
+      return NULL;
    }
    if (!wsola_prepare_resampler(d))
    {
@@ -791,32 +753,16 @@ static void wsola_process(void *opaque, struct dspfilter_output *out,
       d->out_read      = 0;
    }
 
-   if (d->wsola_bypass)
+   if (     !wsola_append_input(d, in->samples, in->frames)
+         || !wsola_run(d))
    {
-      if (     !wsola_append_resamp(d, in->samples, in->frames)
-            || !wsola_process_resamp(d))
-         d->failed = 1;
-   }
-   else
-   {
-      if (     !wsola_append_input(d, in->samples, in->frames)
-            || !wsola_run(d))
-         d->failed = 1;
-   }
-   if (d->failed)
+      d->failed = 1;
       return;
+   }
 
-   d->out_acc += (double)in->frames * d->out_per_in;
-   want        = (unsigned)d->out_acc;
-   d->out_acc -= want;
+   want        = in->frames + d->out_owed;
+   d->out_owed = 0;
    avail       = d->output_frames;
-
-   /* Faster tempos can owe nothing for a short input. */
-   if (!want)
-   {
-      out->frames = 0;
-      return;
-   }
 
    if (!d->out_started)
    {
@@ -843,7 +789,7 @@ static void wsola_process(void *opaque, struct dspfilter_output *out,
    /* A shortfall is carried and made up once production catches up. */
    if (want > avail)
    {
-      d->out_acc += want - avail;
+      d->out_owed = want - avail;
       want        = avail;
    }
    out->samples = d->output;
@@ -918,7 +864,7 @@ static const struct dspfilter_implementation wsola_plug_scalar = {
    wsola_free,
 
    DSPFILTER_API_VERSION,
-   "WSOLA Pitch / Tempo",
+   "WSOLA Pitch Shift",
    "wsolapitchtempo",
 
    wsola_process_i16,
@@ -931,7 +877,7 @@ static const struct dspfilter_implementation wsola_plug_sse2 = {
    wsola_free,
 
    DSPFILTER_API_VERSION,
-   "WSOLA Pitch / Tempo (SSE2)",
+   "WSOLA Pitch Shift (SSE2)",
    "wsolapitchtempo",
 
    wsola_process_i16,
@@ -945,7 +891,7 @@ static const struct dspfilter_implementation wsola_plug_neon = {
    wsola_free,
 
    DSPFILTER_API_VERSION,
-   "WSOLA Pitch / Tempo (NEON)",
+   "WSOLA Pitch Shift (NEON)",
    "wsolapitchtempo",
 
    wsola_process_i16,
