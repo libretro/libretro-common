@@ -46,9 +46,13 @@
 
 #define WSOLA_CH      2u
 #define WSOLA_PI      3.141592653589793238462643383279502884
-#define WSOLA_TAPS    16u
+#define WSOLA_TAPS    32u
 #define WSOLA_HALF    (WSOLA_TAPS / 2u)
 #define WSOLA_PHASES  1024u
+/* Kaiser window for the resampler, ~72 dB stopband; the transition
+ * width follows from it and WSOLA_TAPS, in units of Nyquist. */
+#define WSOLA_KAISER_BETA 7.0
+#define WSOLA_TRANSITION  0.29
 #define WSOLA_BLOCK   8192u
 #define WSOLA_SIZE_MAX ((size_t)-1)
 
@@ -84,10 +88,19 @@ struct wsola
    size_t output_cap_samples;
    size_t in_f_cap_samples, out_i16_cap_samples;
 
+   /* Output pacing: frames owed per input frame, the fractional
+    * remainder carried between calls, and how far production must run
+    * ahead before emission starts. */
+   double out_per_in;
+   double out_acc;
+   unsigned out_prime;
+   unsigned out_read;
+   int out_started;
+
    float rate;
    unsigned seq, overlap, search, hs;
    unsigned output_frames;
-   int first, wsola_bypass, resamp_bypass, failed;
+   int first, wsola_bypass, resamp_bypass, bypass, failed;
    enum wsola_simd simd;
 };
 
@@ -364,10 +377,12 @@ static int wsola_append_resamp_zero(struct wsola *d, unsigned frames)
    return 1;
 }
 
+/* Output frame at resamp_pos reads input frames
+ * floor(pos) - (WSOLA_HALF - 1) .. floor(pos) + WSOLA_HALF. */
 static int wsola_resamp_can_output(const struct wsola *d)
 {
    uint64_t c = d->resamp_pos > 0.0 ? (uint64_t)floor(d->resamp_pos) : 0u;
-   return c >= WSOLA_HALF && c + WSOLA_HALF < d->resamp_write;
+   return c >= WSOLA_HALF - 1u && c + WSOLA_HALF < d->resamp_write;
 }
 
 static int wsola_process_resamp(struct wsola *d)
@@ -382,23 +397,25 @@ static int wsola_process_resamp(struct wsola *d)
          return 0;
       while (made < WSOLA_BLOCK && wsola_resamp_can_output(d))
       {
-         unsigned ch, t;
-         const float *coef;
-         size_t first;
+         unsigned t;
+         const float *coef, *src;
+         float sum_l     = 0.0f;
+         float sum_r     = 0.0f;
          uint64_t center = (uint64_t)floor(d->resamp_pos);
          double frac     = d->resamp_pos - (double)center;
          unsigned ph     = (unsigned)(frac * WSOLA_PHASES);
          if (ph >= WSOLA_PHASES)
             ph = WSOLA_PHASES - 1u;
-         coef  = d->table + (size_t)ph * WSOLA_TAPS;
-         first = (size_t)((center - WSOLA_HALF) - d->resamp_base);
-         for (ch = 0; ch < WSOLA_CH; ++ch)
+         coef = d->table + (size_t)ph * WSOLA_TAPS;
+         src  = d->resamp + (size_t)((center - (WSOLA_HALF - 1u))
+               - d->resamp_base) * WSOLA_CH;
+         for (t = 0; t < WSOLA_TAPS; ++t)
          {
-            double sum = 0.0;
-            for (t = 0; t < WSOLA_TAPS; ++t)
-               sum += (double)d->resamp[(first + t) * WSOLA_CH + ch] * coef[t];
-            d->output[old + (size_t)made * WSOLA_CH + ch] = (float)sum;
+            sum_l += src[t * 2u]      * coef[t];
+            sum_r += src[t * 2u + 1u] * coef[t];
          }
+         d->output[old + (size_t)made * WSOLA_CH]      = sum_l;
+         d->output[old + (size_t)made * WSOLA_CH + 1u] = sum_r;
          ++made;
          d->resamp_pos += d->pitch_ratio;
       }
@@ -576,27 +593,48 @@ static int wsola_run(struct wsola *d)
    }
 }
 
+static double wsola_bessel_i0(double x)
+{
+   unsigned k;
+   double sum  = 1.0;
+   double term = 1.0;
+   double q    = x * x * 0.25;
+   for (k = 1; k < 64; k++)
+   {
+      term *= q / ((double)k * (double)k);
+      sum  += term;
+      if (term < sum * 1.0e-16)
+         break;
+   }
+   return sum;
+}
+
 static int wsola_prepare_resampler(struct wsola *d)
 {
    unsigned ph, t;
-   double cutoff;
+   double onyq, cutoff, inv_i0;
    if (d->resamp_bypass)
       return 1;
    if (!(d->table = (float*)malloc(
                (size_t)WSOLA_PHASES * WSOLA_TAPS * sizeof(float))))
       return 0;
-   cutoff = 0.95 / (d->pitch_ratio > 1.0 ? d->pitch_ratio : 1.0);
+   /* Kaiser-windowed sinc with the transition band just below the lower
+    * of the two Nyquist rates, so what would alias (pitch up) or image
+    * (pitch down) falls in the stopband. */
+   onyq   = d->pitch_ratio > 1.0 ? 1.0 / d->pitch_ratio : 1.0;
+   cutoff = onyq - WSOLA_TRANSITION * 0.5;
+   inv_i0 = 1.0 / wsola_bessel_i0(WSOLA_KAISER_BETA);
    for (ph = 0; ph < WSOLA_PHASES; ++ph)
    {
       double frac = (double)ph / WSOLA_PHASES;
       double sum  = 0.0;
       for (t = 0; t < WSOLA_TAPS; ++t)
       {
-         double dist = (double)((int)t - (int)WSOLA_HALF) - frac;
+         double dist = (double)((int)t - (int)(WSOLA_HALF - 1u)) - frac;
          double norm = dist / WSOLA_HALF;
-         double win  = fabs(norm) <= 1.0
-            ? 0.42 + 0.50 * cos(WSOLA_PI * norm)
-                   + 0.08 * cos(2.0 * WSOLA_PI * norm)
+         double win  = fabs(norm) < 1.0
+            ? wsola_bessel_i0(WSOLA_KAISER_BETA * sqrt(1.0 - norm * norm))
+               * inv_i0
             : 0.0;
          double x    = cutoff * dist;
          double sinc = fabs(x) < 1.0e-12
@@ -612,9 +650,9 @@ static int wsola_prepare_resampler(struct wsola *d)
             d->table[(size_t)ph * WSOLA_TAPS + t] *= inv;
       }
    }
-   if (!wsola_append_resamp_zero(d, WSOLA_HALF))
+   if (!wsola_append_resamp_zero(d, WSOLA_HALF - 1u))
       return 0;
-   d->resamp_pos = WSOLA_HALF;
+   d->resamp_pos = WSOLA_HALF - 1u;
    return 1;
 }
 
@@ -659,6 +697,8 @@ static void *wsola_init_common(const struct dspfilter_info *info,
    d->duration_ratio = d->pitch_ratio / d->tempo_ratio;
    d->wsola_bypass   = fabs(d->duration_ratio - 1.0) < 1.0e-9;
    d->resamp_bypass  = fabs(d->pitch_ratio - 1.0) < 1.0e-9;
+   d->bypass         = d->wsola_bypass && d->resamp_bypass;
+   d->out_per_in     = 1.0 / d->tempo_ratio;
    d->simd           = simd;
 
    /* 40 ms segments, 8 ms cross-fade, +/-12 ms search, 8-frame aligned. */
@@ -677,6 +717,17 @@ static void *wsola_init_common(const struct dspfilter_info *info,
    d->hs      = d->seq - d->overlap;
    d->ha      = (double)d->hs / d->duration_ratio;
    d->first   = 1;
+
+   /* WSOLA output lands one synthesis hop (as resampled) at a time; with
+    * that much held back, every call can emit at the nominal rate. The
+    * resampler on its own produces smoothly and needs only a margin. */
+   d->out_prime = 64u;
+   if (!d->wsola_bypass)
+      d->out_prime += (unsigned)ceil((double)d->hs
+            / (d->resamp_bypass ? 1.0 : d->pitch_ratio));
+
+   if (d->bypass)
+      return d;
 
    if (!d->wsola_bypass)
    {
@@ -719,20 +770,27 @@ static void *wsola_init_neon(const struct dspfilter_info *info,
 static void wsola_process(void *opaque, struct dspfilter_output *out,
       const struct dspfilter_input *in)
 {
+   unsigned want, avail;
    struct wsola *d = (struct wsola*)opaque;
-   if (!out)
+
+   /* The unprocessed input is the fallback for anything that stops the
+    * filter; the output pointer is never NULL. */
+   out->samples    = in->samples;
+   out->frames     = in->frames;
+   if (d->bypass || d->failed || !in->frames)
       return;
-   out->samples = NULL;
-   out->frames  = 0;
-   if (!d || !in || !in->samples || !in->frames || d->failed)
-      return;
-   if (d->pitch_st == 0.0 && d->tempo_pct == 0.0)
+
+   /* What the previous call handed out has been consumed by now. */
+   if (d->out_read)
    {
-      out->samples = in->samples;
-      out->frames  = in->frames;
-      return;
+      avail = d->output_frames - d->out_read;
+      if (avail)
+         memmove(d->output, d->output + (size_t)d->out_read * WSOLA_CH,
+               (size_t)avail * WSOLA_CH * sizeof(float));
+      d->output_frames = avail;
+      d->out_read      = 0;
    }
-   d->output_frames = 0;
+
    if (d->wsola_bypass)
    {
       if (     !wsola_append_resamp(d, in->samples, in->frames)
@@ -745,11 +803,52 @@ static void wsola_process(void *opaque, struct dspfilter_output *out,
             || !wsola_run(d))
          d->failed = 1;
    }
-   if (!d->failed)
+   if (d->failed)
+      return;
+
+   d->out_acc += (double)in->frames * d->out_per_in;
+   want        = (unsigned)d->out_acc;
+   d->out_acc -= want;
+   avail       = d->output_frames;
+
+   /* Faster tempos can owe nothing for a short input. */
+   if (!want)
    {
-      out->samples = d->output;
-      out->frames  = d->output_frames;
+      out->frames = 0;
+      return;
    }
+
+   if (!d->out_started)
+   {
+      if (avail < want + d->out_prime)
+      {
+         /* Still priming: emit silence at the nominal rate, from the
+          * space past the pending output. */
+         if (!wsola_grow((void**)&d->output, sizeof(float),
+                  &d->output_cap_samples,
+                  ((size_t)avail + want) * WSOLA_CH))
+         {
+            d->failed = 1;
+            return;
+         }
+         memset(d->output + (size_t)avail * WSOLA_CH, 0,
+               (size_t)want * WSOLA_CH * sizeof(float));
+         out->samples = d->output + (size_t)avail * WSOLA_CH;
+         out->frames  = want;
+         return;
+      }
+      d->out_started = 1;
+   }
+
+   /* A shortfall is carried and made up once production catches up. */
+   if (want > avail)
+   {
+      d->out_acc += want - avail;
+      want        = avail;
+   }
+   out->samples = d->output;
+   out->frames  = want;
+   d->out_read  = want;
 }
 
 static int16_t wsola_float_to_s16(float v)
@@ -781,9 +880,7 @@ static void wsola_process_i16(void *opaque,
    out->samples    = in->samples;
    out->frames     = in->frames;
 
-   if (     !in->frames
-         || d->failed
-         || (d->pitch_st == 0.0 && d->tempo_pct == 0.0))
+   if (d->bypass || d->failed || !in->frames)
       return;
 
    if (!wsola_grow((void**)&d->in_f, sizeof(float),
@@ -796,15 +893,16 @@ static void wsola_process_i16(void *opaque,
    fin.frames  = in->frames;
    wsola_process(d, &fout, &fin);
 
-   if (d->failed)
+   /* The float path fell back to its input: pass the original through. */
+   if (fout.samples == d->in_f)
       return;
    out->frames = 0;
-   if (!fout.samples || !fout.frames)
+   if (!fout.frames)
       return;
    if (!wsola_grow((void**)&d->out_i16, sizeof(int16_t),
             &d->out_i16_cap_samples, (size_t)fout.frames * WSOLA_CH))
    {
-      d->failed = 1;
+      d->failed   = 1;
       out->frames = in->frames;
       return;
    }

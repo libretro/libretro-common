@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+#include <retro_inline.h>
 #include <libretro_dspfilter.h>
 
 #define EARLYREVERB_COMBS      4
@@ -31,6 +32,10 @@
 #define EARLYREVERB_TAPS       8
 /* Frames converted per step by the int16 entry point. */
 #define EARLYREVERB_I16_CHUNK  256
+/* Recirculating state below this magnitude is flushed to zero, well
+ * under audibility and well above the denormal range, so a decaying
+ * tail never drops into denormals. */
+#define EARLYREVERB_FLUSH      1.0e-15f
 
 struct earlyreverb_line
 {
@@ -71,12 +76,18 @@ struct earlyreverb_data
    unsigned early_pos;
 };
 
+static INLINE float earlyreverb_flush(float v)
+{
+   return (fabs(v) < EARLYREVERB_FLUSH) ? 0.0f : v;
+}
+
 static float earlyreverb_comb(struct earlyreverb_line *d, float input,
       float feedback, float damping)
 {
    float out         = d->buf[d->pos];
-   d->filter_store   = out * (1.0f - damping) + d->filter_store * damping;
-   d->buf[d->pos]    = input + d->filter_store * feedback;
+   d->filter_store   = earlyreverb_flush(
+         out * (1.0f - damping) + d->filter_store * damping);
+   d->buf[d->pos]    = earlyreverb_flush(input + d->filter_store * feedback);
    if (++d->pos >= d->len)
       d->pos = 0;
    return out;
@@ -87,7 +98,7 @@ static float earlyreverb_allpass(struct earlyreverb_line *d,
 {
    float delayed     = d->buf[d->pos];
    float out         = delayed - input;
-   d->buf[d->pos]    = input + delayed * g;
+   d->buf[d->pos]    = earlyreverb_flush(input + delayed * g);
    if (++d->pos >= d->len)
       d->pos = 0;
    return out;

@@ -24,24 +24,40 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+#include <retro_inline.h>
 #include <libretro_dspfilter.h>
 
 /* Frames converted per step by the int16 entry point. */
 #define OVERDRIVE_I16_CHUNK 256
 
+/* Filter state below this magnitude is flushed to zero, well under
+ * audibility and well above the denormal range. */
+#define OVERDRIVE_FLUSH 1.0e-15f
+
 struct overdrive_data
 {
    float scratch[OVERDRIVE_I16_CHUNK * 2];
+   /* Asymmetry is a bias into the tanh, with the bias's own output
+    * subtracted and the small-signal gain restored, so the curve stays
+    * monotonic at any drive. Kept in double so silence maps to exactly
+    * zero. */
+   double bias;
+   double bias_out;
+   double bias_norm;
    float drive;
    float tone_alpha;
    float mix;
    float level;
-   float asymmetry;
    float dc_r;
    float prev_in[2];
    float prev_hp[2];
    float tone_lp[2];
 };
+
+static INLINE float overdrive_flush(float v)
+{
+   return (fabs(v) < OVERDRIVE_FLUSH) ? 0.0f : v;
+}
 
 static void overdrive_run(struct overdrive_data *od,
       float *samples, unsigned frames)
@@ -57,21 +73,23 @@ static void overdrive_run(struct overdrive_data *od,
          float driven = dry * od->drive;
          float shaped;
 
-         driven += od->asymmetry * driven * driven * 0.15f;
          if (driven < -12.0f)
             driven = -12.0f;
          else if (driven > 12.0f)
             driven = 12.0f;
-         shaped = (float)tanh(driven);
+         shaped = (float)((tanh((double)driven + od->bias) - od->bias_out)
+               * od->bias_norm);
 
-         /* DC blocker, needed once asymmetric drive is used. */
+         /* DC blocker for the offset the asymmetric curve introduces. */
          hp               = shaped - od->prev_in[ch]
                           + od->dc_r * od->prev_hp[ch];
+         hp               = overdrive_flush(hp);
          od->prev_in[ch]  = shaped;
          od->prev_hp[ch]  = hp;
 
          /* One-pole low-pass tone stage with a small direct component. */
          od->tone_lp[ch] += od->tone_alpha * (hp - od->tone_lp[ch]);
+         od->tone_lp[ch]  = overdrive_flush(od->tone_lp[ch]);
          wet              = 0.30f * hp + 0.70f * od->tone_lp[ch];
          wet             *= od->level;
 
@@ -153,6 +171,7 @@ static void *overdrive_init(const struct dspfilter_info *info,
       const struct dspfilter_config *config, void *userdata)
 {
    float drive_db, tone_hz, mix, level_db, asymmetry, sr, omega;
+   double t;
    struct overdrive_data *od;
 
    if (!info || info->input_rate <= 1.0f)
@@ -175,8 +194,15 @@ static void *overdrive_init(const struct dspfilter_info *info,
    od->tone_alpha = 1.0f - (float)exp(-omega);
    od->mix        = overdrive_clampf(mix, 0.0f, 1.0f);
    od->level      = overdrive_db_to_gain(overdrive_clampf(level_db, -30.0f, 12.0f));
-   od->asymmetry  = overdrive_clampf(asymmetry, 0.0f, 1.0f);
    od->dc_r       = 0.995f;
+
+   /* tanh(x + b) - tanh(b), scaled by 1 / (1 - tanh(b)^2), expands to
+    * x - tanh(b) x^2 + ..., so tanh(b) = -0.15 * asymmetry keeps the
+    * even-harmonic balance of the asymmetry control. */
+   t              = -0.15 * overdrive_clampf(asymmetry, 0.0f, 1.0f);
+   od->bias       = 0.5 * log((1.0 + t) / (1.0 - t));
+   od->bias_out   = tanh(od->bias);
+   od->bias_norm  = 1.0 / (1.0 - od->bias_out * od->bias_out);
 
    return od;
 }
