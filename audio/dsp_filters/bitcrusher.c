@@ -72,9 +72,12 @@ static void *bitcrusher_init(const struct dspfilter_info *info,
     if (!bc)
         return NULL;
 
-    config->get_int(userdata, "bits", &bits, 8);
-    config->get_int(userdata, "downsample", &downsample, 4);
-    config->get_float(userdata, "drywet", &mix, 1.0f);
+    if (config)
+    {
+        config->get_int(userdata, "bits", &bits, 8);
+        config->get_int(userdata, "downsample", &downsample, 4);
+        config->get_float(userdata, "drywet", &mix, 1.0f);
+    }
 
     bc->bits = dsp_clampi(bits, 2, 24);
     bc->downsample = dsp_clampi(downsample, 1, 64);
