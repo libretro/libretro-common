@@ -166,6 +166,32 @@ size_t retro_spsc_write(retro_spsc_t *q, const void *data, size_t bytes)
    return bytes;
 }
 
+size_t retro_spsc_write_frames(retro_spsc_t *q, const void *data,
+      size_t frames, size_t frame_bytes)
+{
+   size_t head, avail, bytes, index, first;
+   const uint8_t *src = (const uint8_t*)data;
+   if (!frames || !frame_bytes) return 0;
+   head = retro_atomic_load_relaxed_size(&q->head);
+   avail = (q->capacity - (head - q->cached_tail)) / frame_bytes;
+   if (avail < frames)
+   {
+      q->cached_tail = retro_atomic_load_acquire_size(&q->tail);
+      avail = (q->capacity - (head - q->cached_tail)) / frame_bytes;
+   }
+   if (frames > avail) frames = avail;
+   if (!frames) return 0;
+   /* Multiplication is bounded by capacity, even for an oversized request. */
+   bytes = frames * frame_bytes;
+   index = head & (q->capacity - 1);
+   first = q->capacity - index;
+   if (first > bytes) first = bytes;
+   memcpy(q->buffer + index, src, first);
+   memcpy(q->buffer, src + first, bytes - first);
+   retro_atomic_store_release_size(&q->head, head + bytes);
+   return frames;
+}
+
 size_t retro_spsc_read(retro_spsc_t *q, void *data, size_t bytes)
 {
    size_t mask, tail_idx, first;

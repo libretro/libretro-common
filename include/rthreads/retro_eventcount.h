@@ -32,8 +32,8 @@
  * every publish whether or not anyone is asleep.  An eventcount is the
  * third answer: the consumer registers its intent to sleep, re-checks
  * its own condition, and only then blocks, and the producer pays one
- * atomic read-modify-write, one fence and one load when nobody is
- * parked.
+ * sequentially-consistent read-modify-write and one sequentially-
+ * consistent load when nobody is parked - no lock, no syscall.
  *
  * The pairing this exists for is retro_spsc plus retro_atomic: the queue
  * moves the data, a retired-work counter published by the consumer
@@ -75,17 +75,24 @@
  *    one retro_eventcount_commit_wait() or retro_eventcount_cancel_wait()
  *    on the same thread.
  *
- * 2. Between prepare_wait and its answer, do nothing but evaluate the
- *    predicate.  Do not block, do not call notify, do not take a lock.
- *    On the backends that have no address-wait primitive the window is
- *    covered by a mutex this object holds for you, so anything else in
- *    there risks a deadlock that the address-wait backends would not
- *    show.
+ * 2. No lock is held across that window on any backend, so the window
+ *    is yours: evaluating a predicate that touches other objects is
+ *    fine.  Keep it short anyway.  A notifier that sees a registered
+ *    waiter does the wake work whether or not the waiter goes on to
+ *    sleep, so a long window buys a notifier pointless syscalls.
  *
  * 3. Any number of threads may notify.  Any number may wait; a notify
- *    releases all of them.
+ *    releases all of them.  That holds on every backend, including the
+ *    ones whose atomics are not lock-free, where the bookkeeping is
+ *    kept under a mutex because their read-modify-writes are not
+ *    indivisible.
  *
- * 4. A consumer that spins before parking must gate the spin on
+ * 4. The window between prepare_wait and its answer must not span 2^32
+ *    notifications, or the key could match a different epoch than the
+ *    one it named.  Keeping the window short, which rule 2 asks for
+ *    anyway, is several orders of magnitude more than enough.
+ *
+ * 5. A consumer that spins before parking must gate the spin on
  *    RETRO_ATOMIC_LOCK_FREE, not merely on this header existing.  On a
  *    backend where the atomics are real but not lock-free -- the PS2 EE
  *    masks interrupts around a read-modify-write and reschedules only
@@ -96,10 +103,17 @@
  * Backends
  * --------
  *   Linux / Android      futex(FUTEX_WAIT_PRIVATE), no lock at all
- *   Windows 8 and newer  WaitOnAddress, resolved at runtime so the same
- *                        binary still starts on 9x and XP
- *   everything else      rthreads scond, with the lock taken only when a
- *                        waiter is actually registered
+ *   Windows              a waiter list of stack blocks, slept on with the
+ *                        best primitive ntdll offers, resolved at runtime:
+ *                        NtWaitForAlertByThreadId on 8 and newer,
+ *                        NtWaitForKeyedEvent back to XP, and a per-thread
+ *                        auto-reset event on anything older, including 9x.
+ *                        No mutex on any tier.  If none of the three can
+ *                        be had - no ntdll entry points and no TLS index
+ *                        left for the event - the object falls back to
+ *                        the scond backend below rather than failing.
+ *   everything else      rthreads scond, with the lock taken only across
+ *                        the sleep itself
  *
  * The scond backend is not a degraded mode; it is correct and it is what
  * macOS, the BSDs and the console ports use.  What it costs is one lock
@@ -124,8 +138,15 @@ RETRO_BEGIN_DECLS
  * translation unit that includes both is then legal C89. */
 typedef struct retro_eventcount
 {
-   struct slock       *lock;    /* NULL when the backend parks on an address */
-   struct scond       *cond;    /* NULL when the backend parks on an address */
+   struct slock       *lock;    /* NULL unless the backend needs a condvar   */
+   struct scond       *cond;    /* NULL unless the backend needs a condvar   */
+#if defined(_WIN32) && !defined(_XBOX) && defined(RETRO_ATOMIC_HAS_PTR)
+   /* Win32 keeps its own waiter list: the blocks live on the waiters'
+    * stacks and the low bit of the head is the list's spin lock.  No
+    * caller mutex is involved, which is the whole point of it -- a
+    * condition variable would re-acquire one on every wake. */
+   retro_atomic_ptr_t  waitlist;
+#endif
    retro_atomic_int_t  epoch;   /* bumped once per notify                    */
    retro_atomic_int_t  waiters; /* threads inside a prepare/commit window    */
 } retro_eventcount_t;
@@ -159,8 +180,9 @@ void retro_eventcount_free(retro_eventcount_t *ec);
  * prepare_wait that has already run to return without blocking.  Call
  * after the work is published, never before.
  *
- * With nobody parked this is one read-modify-write, one fence and one
- * load: no lock, no syscall.
+ * With nobody parked this is one sequentially-consistent
+ * read-modify-write and one sequentially-consistent load: no lock, no
+ * syscall.
  */
 void retro_eventcount_notify(retro_eventcount_t *ec);
 
@@ -200,7 +222,9 @@ void retro_eventcount_commit_wait(retro_eventcount_t *ec, int key);
  * retro_eventcount_commit_wait_timeout:
  * @ec         : object to block on.
  * @key        : value returned by the matching prepare_wait().
- * @timeout_us : how long to block for, in microseconds.  Zero polls.
+ * @timeout_us : how long to block for, in microseconds.  Zero or less
+ *               polls.  A bound long enough to overflow the backend's
+ *               own unit is clamped, never wrapped.
  *
  * As retro_eventcount_commit_wait(), bounded in time.
  *
@@ -210,6 +234,17 @@ void retro_eventcount_commit_wait(retro_eventcount_t *ec, int key);
  */
 bool retro_eventcount_commit_wait_timeout(retro_eventcount_t *ec,
       int key, int64_t timeout_us);
+
+/**
+ * retro_eventcount_spin_iters:
+ *
+ * @return how many times a waiter spins on its flag word before it
+ * commits to the kernel, as this build resolved it.  Zero on a
+ * uniprocessor, where the spin is skipped.  For logs and benchmarks;
+ * on Windows it is only meaningful after the first
+ * retro_eventcount_init().
+ */
+unsigned retro_eventcount_spin_iters(void);
 
 /**
  * retro_eventcount_backend_name:

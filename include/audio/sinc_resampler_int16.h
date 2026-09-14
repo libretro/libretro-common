@@ -58,7 +58,8 @@ struct resampler_data_int16
 };
 
 /* Allocates a resampler.  bandwidth_mod < 1.0 selects downsampling (lowers
- * cutoff and extends the tap count exactly like the float driver). */
+ * cutoff and extends the tap count exactly like the float driver).
+ * Returns NULL if the nominal ratio cannot safely advance the phase clock. */
 void *sinc_resampler_int16_init(double bandwidth_mod,
       enum sinc_int16_quality quality);
 

@@ -256,6 +256,15 @@ size_t retro_spsc_read_avail(const retro_spsc_t *q);
  */
 size_t retro_spsc_write(retro_spsc_t *q, const void *data, size_t bytes);
 
+/* Producer-only whole-frame write; returns frames, not bytes. Free bytes
+ * shorter than one frame remain unused. The byte queue capacity need not be
+ * divisible by frame_bytes, and frames may wrap across its physical end.
+ * Zero frames or frame_bytes writes nothing. As with write(), q must be
+ * initialized and data must cover the frames that can be accepted.
+ * Consumers must read/skip whole frames to preserve stream boundaries. */
+size_t retro_spsc_write_frames(retro_spsc_t *q, const void *data,
+      size_t frames, size_t frame_bytes);
+
 /**
  * retro_spsc_read:
  * @q     : The queue.

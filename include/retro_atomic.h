@@ -94,6 +94,8 @@
  *                                 operation is still offered so a
  *                                 caller never has to branch on width.
  *   retro_atomic_fetch_add      - acq_rel RMW
+ *   retro_atomic_*_seq_cst_int  - seq_cst RMW and load, int only,
+ *                                 for Dekker-shaped handshakes
  *   retro_atomic_fetch_sub      - acq_rel RMW
  *   retro_atomic_fetch_or       - acq_rel RMW, int only, returns old value
  *   retro_atomic_fetch_and      - acq_rel RMW, int only, returns old value
@@ -493,6 +495,10 @@ typedef atomic_size_t retro_atomic_size_t;
    atomic_store_explicit((p), (v), memory_order_relaxed)
 #define retro_atomic_fetch_add_int(p, v) \
    atomic_fetch_add_explicit((p), (v), memory_order_acq_rel)
+#define retro_atomic_fetch_add_seq_cst_int(p, v) \
+   atomic_fetch_add_explicit((p), (v), memory_order_seq_cst)
+#define retro_atomic_load_seq_cst_int(p) \
+   atomic_load_explicit((p), memory_order_seq_cst)
 #define retro_atomic_fetch_sub_int(p, v) \
    atomic_fetch_sub_explicit((p), (v), memory_order_acq_rel)
 #define retro_atomic_fetch_or_int(p, v) \
@@ -558,6 +564,10 @@ typedef std::atomic<std::size_t> retro_atomic_size_t;
    std::atomic_store_explicit((p), (v), std::memory_order_relaxed)
 #define retro_atomic_fetch_add_int(p, v) \
    std::atomic_fetch_add_explicit((p), (v), std::memory_order_acq_rel)
+#define retro_atomic_fetch_add_seq_cst_int(p, v) \
+   std::atomic_fetch_add_explicit((p), (v), std::memory_order_seq_cst)
+#define retro_atomic_load_seq_cst_int(p) \
+   std::atomic_load_explicit((p), std::memory_order_seq_cst)
 #define retro_atomic_fetch_sub_int(p, v) \
    std::atomic_fetch_sub_explicit((p), (v), std::memory_order_acq_rel)
 #define retro_atomic_fetch_or_int(p, v) \
@@ -600,6 +610,10 @@ typedef size_t retro_atomic_size_t;
    __atomic_store_n((p), (v), __ATOMIC_RELAXED)
 #define retro_atomic_fetch_add_int(p, v) \
    __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
+#define retro_atomic_fetch_add_seq_cst_int(p, v) \
+   __atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
+#define retro_atomic_load_seq_cst_int(p) \
+   __atomic_load_n((p), __ATOMIC_SEQ_CST)
 #define retro_atomic_fetch_sub_int(p, v) \
    __atomic_fetch_sub((p), (v), __ATOMIC_ACQ_REL)
 #define retro_atomic_fetch_or_int(p, v) \
@@ -1469,6 +1483,36 @@ static INLINE int retro_atomic_ee_cas_ptr_(retro_atomic_ptr_t *p,
 #define retro_atomic_thread_fence_release() ((void)0)
 #define retro_atomic_thread_fence_seq_cst() ((void)0)
 #endif
+#endif
+
+/* Sequentially consistent add-and-load, for the one pattern that needs
+ * a store ordered against a later load of a different location: two
+ * threads each bumping their own word and then reading the other's,
+ * neither allowed to miss both.  An acq_rel read-modify-write does not
+ * give that, and a standalone seq_cst fence is a second locked
+ * operation on x86 -- measurably so, about twice the cost of the RMW
+ * it follows.
+ *
+ * Backends that express seq_cst directly define these above.  The rest
+ * are backends whose plain read-modify-write is already a full barrier
+ * (MSVC Interlocked, Apple's Barrier variants, __sync), so the load
+ * after it needs no more ordering than the acquire it already has; and
+ * the two that cannot express a barrier at all, where this degrades
+ * the same way every other operation on them does. */
+#if !defined(retro_atomic_fetch_add_seq_cst_int)
+#define retro_atomic_fetch_add_seq_cst_int(p, v) \
+   retro_atomic_fetch_add_int((p), (v))
+#endif
+#if !defined(retro_atomic_load_seq_cst_int)
+/* A function rather than a comma expression: the fence is a statement
+ * on the backends that spell it as inline asm. */
+static INLINE int retro_atomic_load_seq_cst_int_fb_(retro_atomic_int_t *p)
+{
+   retro_atomic_thread_fence_seq_cst();
+   return retro_atomic_load_acquire_int(p);
+}
+#define retro_atomic_load_seq_cst_int(p) \
+   retro_atomic_load_seq_cst_int_fb_(p)
 #endif
 
 /* ---- 64-bit operations -------------------------------------------------

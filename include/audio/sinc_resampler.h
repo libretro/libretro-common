@@ -35,7 +35,8 @@ RETRO_BEGIN_DECLS
 
 /* Experimental opt-in table preset. Use sinc_resampler's process/reset/free.
  * bandwidth_mod is the nominal output/input ratio, not a live DRC ratio.
- * At ratios below 2, or with HQ off, the selected quality is unchanged. */
+ * At ratios below 2, or with HQ off, the selected quality is unchanged.
+ * Returns NULL if the nominal ratio cannot safely advance the phase clock. */
 void *sinc_resampler_init_hq(double bandwidth_mod,
       enum resampler_quality quality, resampler_simd_mask_t mask,
       int hq_oversampling);

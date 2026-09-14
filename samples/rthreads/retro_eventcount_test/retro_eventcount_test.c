@@ -36,8 +36,17 @@
 #include <rthreads/retro_eventcount.h>
 #include <retro_atomic.h>
 #include <retro_miscellaneous.h>
-#include <retro_timers.h>
+
+/* A plain pause, not the tree's sleep helper: on desktop Windows that
+ * one lives in time/rtime.c on top of a waitable timer, and this
+ * harness has no reason to pull that in just to wait. */
+#if defined(_WIN32)
+#include <windows.h>
+#define ec_test_sleep_ms(ms) Sleep(ms)
+#else
 #include <unistd.h>
+#define ec_test_sleep_ms(ms) usleep((unsigned)(ms) * 1000u)
+#endif
 
 #ifndef HANDOFF_ITEMS
 #define HANDOFF_ITEMS   200000
@@ -46,6 +55,9 @@
 #define WAKEUP_ROUNDS   200000
 #endif
 #define BROADCAST_CONSUMERS 4
+#ifndef BROADCAST_STRESS_ROUNDS
+#define BROADCAST_STRESS_ROUNDS 20000
+#endif
 #define WATCHDOG_SECONDS    60
 
 static retro_eventcount_t  ec;
@@ -65,7 +77,7 @@ static void watchdog_thread(void *unused)
    {
       if (retro_atomic_load_acquire_int(&watchdog_stop))
          return;
-      retro_sleep(100);
+      ec_test_sleep_ms(100);
    }
 
    fprintf(stderr, "FAIL: watchdog fired after %d s -- a waiter was "
@@ -303,7 +315,7 @@ static int lane_broadcast(void)
    /* Give them time to reach a real park rather than winning the
     * pre-check race; the assertion below does not depend on it, but a
     * run where nobody parks tests nothing. */
-   retro_sleep(200);
+   ec_test_sleep_ms(200);
 
    retro_atomic_store_release_int(&bcast_go, 1);
    retro_eventcount_notify(&ec);
@@ -326,6 +338,94 @@ static int lane_broadcast(void)
    return 0;
 }
 
+/* ---- lane 4: broadcast under load -------------------------------- */
+
+/* The single-shot broadcast above parks every consumer once and wakes
+ * them once, which never exercises the path where a notify takes a
+ * block off the list while its own thread is on its way out of the
+ * wait.  That window is only reachable when consumers re-park in a
+ * tight loop against a producer that keeps moving, so this lane does
+ * exactly that -- and it is the lane that catches a waker still
+ * reading a block whose stack frame has gone. */
+
+static retro_atomic_int_t stress_gen;
+static retro_atomic_int_t stress_arrived;
+static retro_atomic_int_t stress_stop;
+
+static void stress_consumer(void *unused)
+{
+   int seen = 0;
+   (void)unused;
+
+   for (;;)
+   {
+      int key;
+      int g;
+
+      if (retro_atomic_load_acquire_int(&stress_stop))
+         return;
+
+      g = retro_atomic_load_acquire_int(&stress_gen);
+      if (g != seen)
+      {
+         seen = g;
+         retro_atomic_fetch_add_int(&stress_arrived, 1);
+         continue;
+      }
+
+      key = retro_eventcount_prepare_wait(&ec);
+
+      if (retro_atomic_load_acquire_int(&stress_gen) != seen ||
+          retro_atomic_load_acquire_int(&stress_stop))
+      {
+         retro_eventcount_cancel_wait(&ec);
+         continue;
+      }
+
+      retro_eventcount_commit_wait(&ec, key);
+   }
+}
+
+static int lane_broadcast_stress(void)
+{
+   sthread_t *t[BROADCAST_CONSUMERS];
+   int i, r;
+
+   retro_atomic_int_init(&stress_gen, 0);
+   retro_atomic_int_init(&stress_arrived, 0);
+   retro_atomic_int_init(&stress_stop, 0);
+
+   if (!retro_eventcount_init(&ec))
+   {
+      fprintf(stderr, "FAIL: broadcast_stress: eventcount init\n");
+      return 1;
+   }
+
+   for (i = 0; i < BROADCAST_CONSUMERS; i++)
+      t[i] = sthread_create(stress_consumer, NULL);
+
+   for (r = 1; r <= BROADCAST_STRESS_ROUNDS; r++)
+   {
+      retro_atomic_store_release_int(&stress_arrived, 0);
+      retro_atomic_store_release_int(&stress_gen, r);
+      retro_eventcount_notify(&ec);
+
+      while (retro_atomic_load_acquire_int(&stress_arrived)
+            < BROADCAST_CONSUMERS)
+         retro_cpu_relax();
+   }
+
+   retro_atomic_store_release_int(&stress_stop, 1);
+   retro_eventcount_notify(&ec);
+   for (i = 0; i < BROADCAST_CONSUMERS; i++)
+      sthread_join(t[i]);
+   retro_eventcount_free(&ec);
+
+   printf("  bcast_load %d rounds x %d consumers\n",
+         BROADCAST_STRESS_ROUNDS, BROADCAST_CONSUMERS);
+   return 0;
+}
+
 int main(void)
 {
    sthread_t *wd;
@@ -340,6 +440,7 @@ int main(void)
    rc |= lane_handoff();
    rc |= lane_wakeup();
    rc |= lane_broadcast();
+   rc |= lane_broadcast_stress();
 
    retro_atomic_store_release_int(&watchdog_stop, 1);
    sthread_join(wd);

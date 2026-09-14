@@ -52,6 +52,8 @@
 #include <memalign.h>
 #include <math.h>
 
+#include "sinc_resampler_internal.h"
+
 #include <audio/sinc_resampler_int16.h>
 #include <audio/sinc_resampler.h>
 
@@ -550,6 +552,10 @@ void *sinc_resampler_int16_init_hq(double bandwidth_mod,
       window            = SINC_I16_WINDOW_KAISER;
       re->kaiser_beta   = SINC_HQ_KAISER_BETA;
    }
+
+   if (!sinc_resampler_ratio_valid(bandwidth_mod,
+            re->phase_bits, re->subphase_bits))
+      goto error;
 
    re->window        = (unsigned)window;
    re->subphase_mask = (1u << re->subphase_bits) - 1u;

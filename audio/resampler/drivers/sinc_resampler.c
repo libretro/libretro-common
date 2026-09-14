@@ -38,6 +38,8 @@
 #include <memalign.h>
 
 #include <audio/audio_resampler.h>
+#include "sinc_resampler_internal.h"
+
 #include <audio/sinc_resampler.h>
 
 #ifdef __SSE__
@@ -894,6 +896,10 @@ void *sinc_resampler_init_hq(double bandwidth_mod,
       re->kaiser_beta   = SINC_HQ_KAISER_BETA;
       enable_avx        = 1;
    }
+
+   if (!sinc_resampler_ratio_valid(bandwidth_mod,
+            re->phase_bits, re->subphase_bits))
+      goto error;
 
    re->subphase_mask = (1 << re->subphase_bits) - 1;
    re->subphase_mod  = 1.0f / (1 << re->subphase_bits);
