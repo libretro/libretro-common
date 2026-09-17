@@ -322,10 +322,12 @@ static void retro_task_regular_gather(void)
          }
          else
             task->handler(task);
-
-         task_queue_push_progress(task);
       }
 
+      /* No progress push here: the gather on the main thread pushes
+       * for every running task each check, and retirement pushes the
+       * final state. The push renders text and touches widget state,
+       * which is the main thread's, not this worker's. */
       if ((task->flags & RETRO_TASK_FLG_FINISHED) > 0)
          task_queue_put(&tasks_finished, task);
       else
@@ -752,7 +754,13 @@ static void threaded_worker(void *userdata)
       if (!worker_continue)
       {
          slock_unlock(running_lock);
-         break; /* should we keep running until all tasks finished? */
+         /* No: draining is the caller's job, done while the
+          * subsystems that finish callbacks reach are still alive
+          * (RetroArch's exit path cancels and drains, bounded,
+          * before any teardown). Whatever is still here when deinit
+          * runs is deliberately abandoned - running its handlers
+          * during teardown would be worse. */
+         break;
       }
 
       /* Get first task to run */
