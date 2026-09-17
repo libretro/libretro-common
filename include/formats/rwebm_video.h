@@ -154,6 +154,24 @@ const uint32_t *rwebm_video_stream_next(rwebm_video_stream_t *stream,
  * the default order. */
 void rwebm_video_stream_set_argb(rwebm_video_stream_t *stream, int argb);
 
+/* Blit decoded frames into @out - width * height words, the caller's,
+ * which then comes back from rwebm_video_stream_next - instead of the
+ * stream's own frame, so a caller uploading from its own buffer needs
+ * no copy out of the stream. NULL restores the stream's frame. Takes
+ * effect from the next decoded frame; @out must stay valid until the
+ * next call that decodes has returned. */
+void rwebm_video_stream_set_output(rwebm_video_stream_t *stream,
+      uint32_t *out);
+
+/* Convert decoded frames in @bands row bands on @pool (an rthreads
+ * tpool_t of at least bands - 1 threads; the calling thread takes one
+ * band and joins the rest), and decode a VP9 frame's tile columns on
+ * the same threads (rvp9_set_tile_pool). NULL or bands <= 1 keeps
+ * everything on the calling thread. The pool is the caller's and must
+ * outlive every decode call made while it is set. */
+void rwebm_video_stream_set_blit_pool(rwebm_video_stream_t *stream,
+      void *pool, unsigned bands);
+
 /* Partial-read support: raise the number of leading buffer bytes that
  * are valid (monotonic).  A blocked step resumes once the needed
  * block's bytes are inside the window; fully-resident streams never

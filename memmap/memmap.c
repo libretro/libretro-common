@@ -49,6 +49,15 @@
 #endif
 
 #ifdef _WIN32
+/* FILE_MAP_EXECUTE is XP SP2 / Server 2003 SP1: the kernel rejects it
+ * before that, and an older SDK may not spell it at all. The value is
+ * SECTION_MAP_EXECUTE_EXPLICIT, declared here so the oldest SDK builds;
+ * on a kernel that refuses it MapViewOfFileEx fails and the call reports
+ * NULL rather than mapping without execute. */
+#ifndef FILE_MAP_EXECUTE
+#define FILE_MAP_EXECUTE 0x0020
+#endif
+
 /* Map POSIX prot bits to a PAGE_* protection constant.  Windows has
  * no write-only or exec-only protections; those requests take the
  * nearest expressible superset, as every mman shim does. */
@@ -181,48 +190,36 @@ int mprotect(void *addr, size_t len, int prot)
 
 #endif
 
-#if defined(__MACH__) && defined(__arm__)
+#if defined(__MACH__) && (defined(__arm__) || defined(__aarch64__))
 #include <libkern/OSCacheControl.h>
 #endif
 
 int memsync(void *start, void *end)
 {
-#if defined(__MACH__) && defined(__arm__)
-   size_t _len = (char*)end - (char*)start;
-   sys_dcache_flush(start, _len);
-   sys_icache_invalidate(start, _len);
+   size_t len = (char*)end - (char*)start;
+#if defined(_WIN32) && !defined(_XBOX)
+   /* Coherent on x86; required on ARM64 Windows, where the JIT's writes
+    * are not seen by instruction fetch until this. */
+   return FlushInstructionCache(GetCurrentProcess(), start, len) ? 0 : -1;
+#elif defined(__MACH__) && (defined(__arm__) || defined(__aarch64__))
+   sys_icache_invalidate(start, len);
    return 0;
-#elif defined(__arm__) && !defined(__QNX__)
+#elif (defined(__arm__) || defined(__aarch64__)) && !defined(__QNX__)
    /* __builtin___clear_cache, not bare __clear_cache: the builtin is
-    * known to GCC and clang without any declaration, while the plain
-    * symbol is only declared by some toolchains' libgcc headers -- the
-    * webOS armv7 GCC rejects it as an implicit declaration. */
+    * what both GCC and clang provide, and it is the instruction cache
+    * these callers need flushed -- a JIT that just wrote code. aarch64
+    * does not define __arm__, so it is named here: before, it fell
+    * through to msync below, which flushes data and not instructions. */
    __builtin___clear_cache((char*)start, (char*)end);
    return 0;
 #elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MS_SYNC) && defined(MS_INVALIDATE)
-   /* Gate on the constants rather than on HAVE_MMAN alone: DJGPP falls
-    * into the HAVE_MMAN branch of memmap.h and ships a <sys/mman.h>
-    * that includes cleanly but declares neither msync nor the MS_
-    * flags. Without this the call compiles to an implicit declaration
-    * and then fails on the undefined constants.
-    *
-    * Emscripten is the one target named outright rather than reached
-    * through the constants: it declares msync and both MS_ flags, but
-    * that msync refuses any address outside a live mapping, and wasm
-    * has no instruction cache standing behind this call anyway, so the
-    * no-op below is the answer there. */
-   size_t _len = (char*)end - (char*)start;
-   return msync(start, _len, MS_SYNC | MS_INVALIDATE
+   return msync(start, len, MS_SYNC | MS_INVALIDATE
 #ifdef __QNX__
-         MS_CACHE_ONLY
+         | MS_CACHE_ONLY
 #endif
          );
 #else
-   /* Nothing to do, or no way to do it: the caller treats 0 as
-    * success, and on these targets there is no separate instruction
-    * cache to flush through this path. */
-   (void)start;
-   (void)end;
+   (void)start; (void)end; (void)len;
    return 0;
 #endif
 }
@@ -311,6 +308,31 @@ void *memreserve(size_t len)
 #endif
 }
 
+/* As memreserve, at a preferred address. The hint is a hint: a taken
+ * address gets another, and the caller compares. On Windows the whole
+ * reservation is one VirtualAlloc at the hint; on mman platforms an
+ * mmap of PROT_NONE at the hint, which the kernel may move. */
+void *memreserve_at(void *hint, size_t len)
+{
+#if !defined(MEMMAP_HAVE_RESERVE)
+   (void)hint; (void)len;
+   return NULL;
+#else
+   size_t page = mempagesize();
+   size_t r    = (len + page - 1) & ~(page - 1);
+   if (!len)
+      return NULL;
+#if defined(_WIN32)
+   return VirtualAlloc(hint, r, MEM_RESERVE, PAGE_NOACCESS);
+#else
+   {
+      void *m = mmap(hint, r, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      return (m == MAP_FAILED) ? NULL : m;
+   }
+#endif
+#endif
+}
+
 bool memcommit(void *addr, size_t len)
 {
 #if !defined(MEMMAP_HAVE_RESERVE)
@@ -369,7 +391,14 @@ void memdecommit(void *addr, size_t len, bool strict)
 #else
    if (strict)
       mprotect(addr, len, PROT_NONE);
+   /* MADV_DONTNEED is BSD/Linux; a libc built to a strict POSIX
+    * profile has only the posix_madvise() spelling, and one with
+    * neither keeps the pages, which is correct, just not free. */
+#if defined(MADV_DONTNEED)
    madvise(addr, len, MADV_DONTNEED);
+#elif defined(POSIX_MADV_DONTNEED)
+   posix_madvise(addr, len, POSIX_MADV_DONTNEED);
+#endif
 #endif
 #endif
 }
@@ -400,3 +429,192 @@ void memrelease(void *addr, size_t len)
 #endif
 #endif
 }
+
+/* ------------------------------------------------------------------ */
+/* Named shared memory, mappable at more than one address              */
+/* ------------------------------------------------------------------ */
+
+#if defined(_WIN32) && !defined(_XBOX)
+
+void *memshm_create(const char *name, size_t len)
+{
+   HANDLE h;
+   wchar_t wname[128];
+   int i;
+   /* The name is ASCII by contract; widen it byte-for-byte. */
+   for (i = 0; i < 127 && name[i]; i++)
+      wname[i] = (wchar_t)(unsigned char)name[i];
+   wname[i] = 0;
+   h = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+         (DWORD)((uint64_t)len >> 32), (DWORD)(len & 0xFFFFFFFFu), wname);
+   return (h == NULL) ? NULL : (void*)h;
+}
+
+void memshm_destroy(void *handle)
+{
+   if (handle)
+      CloseHandle((HANDLE)handle);
+}
+
+void *memshm_map(void *handle, size_t offset, void *hint, size_t len, int prot)
+{
+   DWORD access = FILE_MAP_READ;
+   void *p;
+   if (prot & PROT_WRITE)
+      access |= FILE_MAP_WRITE;
+   if (prot & PROT_EXEC)
+      access |= FILE_MAP_EXECUTE;
+   p = MapViewOfFileEx((HANDLE)handle, access,
+         (DWORD)((uint64_t)offset >> 32), (DWORD)(offset & 0xFFFFFFFFu), len, hint);
+   if (!p && hint)
+      p = MapViewOfFileEx((HANDLE)handle, access,
+            (DWORD)((uint64_t)offset >> 32), (DWORD)(offset & 0xFFFFFFFFu), len, NULL);
+   return p;
+}
+
+void memshm_unmap(void *addr, size_t len)
+{
+   (void)len;
+   if (addr)
+      UnmapViewOfFile(addr);
+}
+
+/* Gated on MAP_SHARED, as reserve/commit gates on its constants: DJGPP
+ * defines __unix__ and HAVE_MMAN but ships a stub <sys/mman.h> with no
+ * MAP_SHARED and no shm_open, and falls through to the stubs below. */
+#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_SHARED)
+
+#include <unistd.h>
+#include <fcntl.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
+
+/* The handle is the file descriptor itself, carried in the pointer --
+ * as on Windows it is the HANDLE itself. A caller that maps the region
+ * some way memshm_map does not offer (MAP_FIXED into a reservation it
+ * owns) can use it directly. Descriptor 0 would read as NULL, so a
+ * region that lands there is moved off it at create. */
+#define MEMSHM_FD(h)   ((int)(intptr_t)(h))
+#define MEMSHM_H(fd)   ((void*)(intptr_t)(fd))
+
+void *memshm_create(const char *name, size_t len)
+{
+   int fd;
+#if defined(__ANDROID__)
+   /* Bionic has no shm_open. A memfd is anonymous and needs no name in
+    * the filesystem, so nothing to unlink. */
+   fd = (int)syscall(__NR_memfd_create, name, 1u /* MFD_CLOEXEC */);
+   if (fd < 0)
+      return NULL;
+#else
+   fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+   if (fd < 0)
+      return NULL;
+   /* Unlink at once: the fd keeps the object alive, the name does not
+    * outlive the process. */
+   shm_unlink(name);
+#endif
+   /* off_t is 32 bits where _FILE_OFFSET_BITS is not set, and a cast
+    * would wrap a 2 GB length to a negative one. Refuse rather than
+    * truncate; a caller that needs more on a 32-bit off_t has no way to
+    * get it through this call. */
+   if (sizeof(off_t) < 8 && len > (size_t)0x7FFFFFFFu)
+   {
+      close(fd);
+      return NULL;
+   }
+   if (ftruncate(fd, (off_t)len) < 0)
+   {
+      close(fd);
+      return NULL;
+   }
+   if (fd == 0)
+   {
+      /* Only if stdin was closed; keep 0 out of the handle anyway.
+       * F_DUPFD_CLOEXEC is POSIX 2008 and missing from the Orbis libc
+       * and the older Apple SDKs; F_DUPFD and a separate F_SETFD are
+       * everywhere, and the gap between them cannot leak the
+       * descriptor to a child this process has not forked yet. */
+      int moved = fcntl(fd, F_DUPFD, 1);
+      close(fd);
+      if (moved < 0)
+         return NULL;
+      fcntl(moved, F_SETFD, FD_CLOEXEC);
+      fd = moved;
+   }
+   return MEMSHM_H(fd);
+}
+
+void memshm_destroy(void *handle)
+{
+   if (handle)
+      close(MEMSHM_FD(handle));
+}
+
+void *memshm_map(void *handle, size_t offset, void *hint, size_t len, int prot)
+{
+   void *p;
+   if (!handle)
+      return NULL;
+   /* A hint, never MAP_FIXED: MAP_FIXED silently replaces whatever is
+    * there, and a caller that wanted an address it did not get should
+    * find out by comparing, not by corrupting a neighbour. */
+   p = mmap(hint, len, prot, MAP_SHARED, MEMSHM_FD(handle), (off_t)offset);
+   return (p == MAP_FAILED) ? NULL : p;
+}
+
+void memshm_unmap(void *addr, size_t len)
+{
+   if (addr)
+      munmap(addr, len);
+}
+
+#else
+
+void *memshm_create(const char *name, size_t len)
+{
+   (void)name; (void)len;
+   return NULL;
+}
+void memshm_destroy(void *handle) { (void)handle; }
+void *memshm_map(void *handle, size_t offset, void *hint, size_t len, int prot)
+{
+   (void)handle; (void)offset; (void)hint; (void)len; (void)prot;
+   return NULL;
+}
+void memshm_unmap(void *addr, size_t len) { (void)addr; (void)len; }
+
+#endif
+
+/* ------------------------------------------------------------------ */
+/* JIT write toggle for per-thread W^X                                 */
+/* ------------------------------------------------------------------ */
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+/* pthread_jit_write_protect_np is macOS on Apple Silicon and nothing
+ * else: iOS and tvOS are arm64 and __APPLE__ too, and do not have it.
+ * TARGET_OS_OSX is the test, not the architecture. */
+#if defined(__APPLE__) && defined(__aarch64__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX
+#include <pthread.h>
+/* pthread_jit_write_protect_np is per thread, and so is this depth:
+ * one thread's nesting must not flip another's pages. */
+static __thread int memjit_depth;
+
+void memjit_write_begin(void)
+{
+   if (memjit_depth++ == 0)
+      pthread_jit_write_protect_np(0);
+}
+
+void memjit_write_end(void)
+{
+   if (--memjit_depth == 0)
+      pthread_jit_write_protect_np(1);
+}
+#else
+void memjit_write_begin(void) { }
+void memjit_write_end(void)   { }
+#endif

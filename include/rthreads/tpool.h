@@ -30,6 +30,7 @@
 
 #include <retro_common_api.h>
 
+#include <stddef.h>
 #include <boolean.h>
 
 #include <retro_inline.h>
@@ -58,6 +59,21 @@ typedef void (*thread_func_t)(void *arg);
  * Returns: pool.
  */
 tpool_t *tpool_create(size_t num);
+
+/**
+ * tpool_create_with_stack_size:
+ * @num           : Number of threads the pool should have.
+ *                  If 0 defaults to 2.
+ * @stack_size    : Stack size of each thread in bytes; 0 for the
+ *                  platform default, as tpool_create.
+ *
+ * Create a thread pool whose threads have a stack of the given size,
+ * for work whose depth is known rather than whatever the platform's
+ * default happens to be.
+ *
+ * Returns: pool.
+ */
+tpool_t *tpool_create_with_stack_size(size_t num, size_t stack_size);
 
 /**
  * tpool_destroy:

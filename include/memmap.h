@@ -26,10 +26,21 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <boolean.h>
+#include <retro_common_api.h>
 
 #if defined(PSP) || defined(PS2) || defined(GEKKO) || defined(VITA) || defined(_XBOX) || defined(_3DS) || defined(WIIU) || defined(SWITCH) || defined(HAVE_LIBNX) || defined(__PS3__) || defined(__PSL1GHT__)
 /* No mman available */
 #elif defined(_WIN32) && !defined(_XBOX)
+/* MSVC's minwindef.h defines min and max as macros in C++ as well as C
+ * -- MinGW's is guarded by #ifndef __cplusplus -- and they then break
+ * every std::numeric_limits<>::max() in any C++ file that reaches this
+ * header. A public header must not leak them. */
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <errno.h>
 #include <io.h>
@@ -37,6 +48,8 @@
 #define HAVE_MMAN
 #include <sys/mman.h>
 #endif
+
+RETRO_BEGIN_DECLS
 
 #if !defined(HAVE_MMAN) || defined(_WIN32)
 /* PROT_/MAP_ request bits for the shim platforms (real <sys/mman.h>
@@ -120,6 +133,17 @@ size_t mempagesize(void);
 void *memreserve(size_t len);
 
 /**
+ * memreserve_at:
+ * @hint       : preferred base, or NULL for any.
+ * @len        : bytes; rounded up to a page.
+ *
+ * As memreserve, at a preferred address -- a fastmem window that must
+ * sit where the recompiler expects it. A hint, never forced: the
+ * platform may return another address, and the caller compares.
+ */
+void *memreserve_at(void *hint, size_t len);
+
+/**
  * memcommit:
  * @addr       : start of the sub-range, within a memreserve() result
  * @len        : bytes to make readable and writable
@@ -169,5 +193,68 @@ void memdecommit(void *addr, size_t len, bool strict);
  * Releases the reservation and everything committed in it.
  */
 void memrelease(void *addr, size_t len);
+
+/**
+ * memshm_create:
+ * @name       : a name unique to this process, e.g. built from the pid.
+ * @len        : size in bytes.
+ *
+ * Creates an anonymous-backed shared memory region that can be mapped
+ * at more than one address with memshm_map -- how an emulator mirrors
+ * a guest RAM into several places in a large reserved window. The name
+ * is unlinked at once where the platform links it, so it never outlives
+ * the process. Windows uses a pagefile-backed file mapping, Android a
+ * memfd (Bionic has no shm_open), everything else shm_open.
+ *
+ * Returns: a handle for memshm_map / memshm_destroy, or NULL. It is the
+ * platform's own object -- the file descriptor on POSIX, the HANDLE on
+ * Windows -- so a caller that must map the region a way memshm_map does
+ * not offer, such as MAP_FIXED into a reservation it owns, can use it.
+ * Never 0 on POSIX. On platforms with no mman this is always NULL.
+ */
+void *memshm_create(const char *name, size_t len);
+
+/**
+ * memshm_destroy:
+ * @handle     : from memshm_create.
+ *
+ * Closes the handle. Mappings made from it stay valid until unmapped.
+ */
+void memshm_destroy(void *handle);
+
+/**
+ * memshm_map:
+ * @handle     : from memshm_create.
+ * @offset     : byte offset into the region; page-aligned.
+ * @hint       : preferred address, or NULL. A hint, never forced: on a
+ *               taken address the platform picks another, and the
+ *               caller compares the result against what it asked for.
+ * @len        : bytes to map.
+ * @prot       : PROT_READ | PROT_WRITE | PROT_EXEC as memmap.h defines.
+ *
+ * Returns: the mapped address, or NULL.
+ */
+void *memshm_map(void *handle, size_t offset, void *hint, size_t len, int prot);
+
+/**
+ * memshm_unmap:
+ * @addr       : from memshm_map.
+ * @len        : the length passed to memshm_map.
+ */
+void memshm_unmap(void *addr, size_t len);
+
+/**
+ * memjit_write_begin / memjit_write_end:
+ *
+ * On a platform whose JIT pages are write-xor-execute per thread --
+ * Apple Silicon, where MAP_JIT memory is executable until the thread
+ * asks otherwise -- these switch the calling thread to writing and back
+ * (pthread_jit_write_protect_np). Nesting is counted, so a writer that
+ * calls another writer is fine. Everywhere else they do nothing.
+ */
+void memjit_write_begin(void);
+void memjit_write_end(void);
+
+RETRO_END_DECLS
 
 #endif

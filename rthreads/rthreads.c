@@ -28,6 +28,13 @@
 #endif
 #endif
 
+/* Affinity: cpu_set_t, CPU_SET and pthread_setaffinity_np are GNU
+ * extensions, exposed only when this is set before the first system
+ * header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -271,6 +278,7 @@ typedef sys_lwcond_attr_t rthreads_ps3_lwcond_attr_t;
 #define rthreads_ps3_thread_exit        sysThreadExit
 #define rthreads_ps3_thread_get_id      sysThreadGetId
 #define rthreads_ps3_thread_get_prio    sysThreadGetPriority
+#define rthreads_ps3_thread_yield       sysThreadYield
 #define rthreads_ps3_thread_set_prio    sysThreadSetPriority
 #define rthreads_ps3_lwmutex_create     sysLwMutexCreate
 #define rthreads_ps3_lwmutex_destroy    sysLwMutexDestroy
@@ -293,6 +301,7 @@ typedef sys_lwcond_attribute_t rthreads_ps3_lwcond_attr_t;
 
 #define RTHREADS_PS3_JOINABLE           SYS_PPU_THREAD_CREATE_JOINABLE
 #define rthreads_ps3_thread_create      sys_ppu_thread_create
+#define rthreads_ps3_thread_yield       sys_ppu_thread_yield
 #define rthreads_ps3_thread_join        sys_ppu_thread_join
 #define rthreads_ps3_thread_detach      sys_ppu_thread_detach
 #define rthreads_ps3_thread_exit        sys_ppu_thread_exit
@@ -891,9 +900,22 @@ static void *thread_wrap(void *data_)
 }
 #endif
 
+static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+      void *userdata, int thread_priority, size_t stack_size);
+
 sthread_t *sthread_create(void (*thread_func)(void*), void *userdata)
 {
-   return sthread_create_with_priority(thread_func, userdata, 0);
+   return sthread_create_ex(thread_func, userdata, 0, 0);
+}
+
+sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userdata, int thread_priority)
+{
+   return sthread_create_ex(thread_func, userdata, thread_priority, 0);
+}
+
+sthread_t *sthread_create_with_stack_size(void (*thread_func)(void*), void *userdata, size_t stack_size)
+{
+   return sthread_create_ex(thread_func, userdata, 0, stack_size);
 }
 
 #if !defined(USE_WIN32_THREADS) && !defined(USE_GX_THREADS) \
@@ -905,8 +927,15 @@ sthread_t *sthread_create(void (*thread_func)(void*), void *userdata)
 #define HAVE_THREAD_ATTR
 #endif
 
-sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userdata, int thread_priority)
+static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+      void *userdata, int thread_priority, size_t stack_size)
 {
+#if defined(STACKSIZE)
+   /* 0 keeps the backend's own default. This is the console case: each
+    * takes a size at create, and STACKSIZE is its default. Windows takes
+    * stack_size directly and pthread takes it through the attr. */
+   const size_t stack       = stack_size ? stack_size : (size_t)STACKSIZE;
+#endif
 #ifdef HAVE_THREAD_ATTR
    pthread_attr_t thread_attr;
    bool thread_attr_needed  = false;
@@ -933,7 +962,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
 #if defined(USE_WIN32_THREADS)
    thread->id               = 0;
-   thread->thread           = CreateThread(NULL, 0, thread_wrap,
+   thread->thread           = CreateThread(NULL, stack_size, thread_wrap,
          data, 0, &thread->id);
    thread_created           = !!thread->thread;
 #elif defined(USE_GX_THREADS)
@@ -945,7 +974,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
          prio        = (u8)(1 + ((thread_priority - 1) * 126) / 99);
       thread->id     = LWP_THREAD_NULL;
       thread_created = LWP_CreateThread(&thread->id, thread_wrap,
-            data, NULL, STACKSIZE, prio) == 0;
+            data, NULL, stack, prio) == 0;
    }
 #elif defined(USE_CTR_THREADS)
    {
@@ -974,7 +1003,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
          prio        = 0x3F;
 
       thread->id     = threadCreate(thread_wrap, data,
-            STACKSIZE, prio, core_id, false);
+            stack, prio, core_id, false);
       thread_created = !!thread->id;
    }
 #elif defined(USE_PSP_THREADS)
@@ -1008,7 +1037,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
       thread->start   = start;
       thread->id      = sceKernelCreateThread("rarch_thread",
-            psp_thread_wrap, prio, STACKSIZE,
+            psp_thread_wrap, prio, stack,
             PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU, NULL);
       if (thread->id >= 0)
       {
@@ -1039,7 +1068,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       thread->id       = -1;
       thread->done     = -1;
       retro_atomic_int_init(&thread->state, 0);
-      thread->stack    = memalign(16, STACKSIZE);
+      thread->stack    = memalign(16, stack);
       if (!thread->stack)
       {
          free(thread);
@@ -1064,7 +1093,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       memset(&th, 0, sizeof(th));
       th.func             = (void*)ps2_thread_wrap;
       th.stack            = thread->stack;
-      th.stack_size       = STACKSIZE;
+      th.stack_size       = stack;
       th.gp_reg           = &_gp;
       th.initial_priority = prio;
       if (thread->done >= 0)
@@ -1101,14 +1130,14 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       {
          s32 want = 0x3F - ((thread_priority - 1) * (0x3F - 0x1C)) / 99;
          rc       = threadCreate(&thread->t, thread_wrap, data,
-               NULL, STACKSIZE, want, -2);
+               NULL, stack, want, -2);
          if (R_FAILED(rc))
             rc    = threadCreate(&thread->t, thread_wrap, data,
-                  NULL, STACKSIZE, prio, -2);
+                  NULL, stack, prio, -2);
       }
       else
          rc       = threadCreate(&thread->t, thread_wrap, data,
-               NULL, STACKSIZE, prio, -2);
+               NULL, stack, prio, -2);
 
       if (R_SUCCEEDED(rc))
       {
@@ -1128,7 +1157,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
        * top, since PowerPC stacks grow down. */
       int32_t prio;
       uint8_t *block = (uint8_t*)memalign(16,
-            sizeof(OSThread) + STACKSIZE);
+            sizeof(OSThread) + stack);
 
       if (!block)
       {
@@ -1148,7 +1177,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
       thread->id = (OSThread*)block;
       if (OSCreateThread(thread->id, thread_wrap, 0, (char*)data,
-            block + sizeof(OSThread) + STACKSIZE, STACKSIZE, prio,
+            block + sizeof(OSThread) + stack, stack, prio,
             OS_THREAD_ATTRIB_AFFINITY_ANY))
       {
          OSSetThreadDeallocator(thread->id, wiiu_thread_dealloc);
@@ -1189,7 +1218,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
       thread->start   = start;
       thread->id      = sceKernelCreateThread("rarch_thread",
-            psp_thread_wrap, prio, STACKSIZE, 0, 0, NULL);
+            psp_thread_wrap, prio, stack, 0, 0, NULL);
       if (thread->id >= 0)
       {
          if (sceKernelStartThread(thread->id, sizeof(start), &start) >= 0)
@@ -1226,7 +1255,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 #else
             (uint64_t)(uintptr_t)data,
 #endif
-            prio, STACKSIZE, RTHREADS_PS3_JOINABLE,
+            prio, stack, RTHREADS_PS3_JOINABLE,
             (char*)"rarch_thread") == 0;
    }
 #else
@@ -1247,9 +1276,16 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
 #if defined(__APPLE__)
    /* Default stack size on Apple is 512Kb;
-    * for PS2 disc scanning and other reasons, we'd like 2MB. */
-   pthread_attr_setstacksize(&thread_attr , 0x200000 );
+    * for PS2 disc scanning and other reasons, we'd like 2MB. A caller
+    * asking for more than that gets it below. */
+   pthread_attr_setstacksize(&thread_attr, stack_size > 0x200000 ? stack_size : 0x200000);
    thread_attr_needed = true;
+#else
+   if (stack_size)
+   {
+      pthread_attr_setstacksize(&thread_attr, stack_size);
+      thread_attr_needed = true;
+   }
 #endif
 
    if (thread_attr_needed)
@@ -1738,6 +1774,138 @@ void sthread_join(sthread_t *thread)
    pthread_join(thread->id, NULL);
 #endif
    free(thread);
+}
+
+/* Affinity. A mask of 0 means "any CPU", which is how a caller undoes a
+ * pin. Windows takes the mask directly; glibc takes a cpu_set built from
+ * it; Bionic has no pthread_setaffinity_np, so the thread's kernel id is
+ * used with sched_setaffinity instead. Darwin has no hard affinity, only
+ * a scheduler hint, and reports false rather than pretend; so does every
+ * console and every other backend. */
+#if defined(USE_WIN32_THREADS)
+static bool sthread_set_affinity_handle(HANDLE h, uint64_t mask)
+{
+   if (mask == 0)
+      mask = ~mask;
+   return SetThreadAffinityMask(h, (DWORD_PTR)mask) != 0;
+}
+#elif defined(__ANDROID__)
+/* bionic declares cpu_set_t and sched_setaffinity under _GNU_SOURCE
+ * only, which has to be set before the first system header - not
+ * something a unity build's include order provides. The kernel call
+ * takes a plain bit mask, so it is made directly. */
+static bool sthread_set_tid_affinity(pid_t tid, uint64_t mask)
+{
+   unsigned long bits[64 / (8 * sizeof(unsigned long))];
+   unsigned i;
+   memset(bits, 0, sizeof(bits));
+   if (!mask)
+   {
+      long n = sysconf(_SC_NPROCESSORS_CONF);
+      for (i = 0; (long)i < n && i < 64; i++)
+         mask |= (uint64_t)1 << i;
+   }
+   for (i = 0; i < 64; i++)
+      if (mask & ((uint64_t)1 << i))
+         bits[i / (8 * sizeof(unsigned long))] |=
+            1UL << (i % (8 * sizeof(unsigned long)));
+   return syscall(__NR_sched_setaffinity, tid, sizeof(bits), bits) == 0;
+}
+#elif defined(__linux__) && !defined(USE_GX_THREADS) && !defined(USE_CTR_THREADS) \
+   && !defined(USE_PSP_THREADS) && !defined(USE_PS2_THREADS) && !defined(USE_PS3_THREADS) \
+   && !defined(USE_SWITCH_THREADS) && !defined(USE_WIIU_THREADS) && !defined(USE_VITA_THREADS)
+#include <sched.h>
+static void sthread_mask_to_set(uint64_t mask, cpu_set_t *set)
+{
+   unsigned i;
+   CPU_ZERO(set);
+   if (mask)
+   {
+      for (i = 0; i < 64; i++)
+         if (mask & ((uint64_t)1 << i))
+            CPU_SET(i, set);
+   }
+   else
+   {
+      long n = sysconf(_SC_NPROCESSORS_CONF);
+      for (i = 0; (long)i < n && i < CPU_SETSIZE; i++)
+         CPU_SET(i, set);
+   }
+}
+#endif
+
+bool sthread_set_affinity(sthread_t *thread, uint64_t mask)
+{
+#if defined(USE_WIN32_THREADS)
+   return thread && sthread_set_affinity_handle(thread->thread, mask);
+#elif defined(__ANDROID__)
+#if __ANDROID_API__ >= 21
+   return thread && sthread_set_tid_affinity(pthread_gettid_np(thread->id), mask);
+#else
+   /* No pthread_gettid_np before API 21 and no other way to name
+    * another thread to sched_setaffinity; only the calling thread can
+    * pin itself there (sthread_set_current_affinity). */
+   (void)thread; (void)mask;
+   return false;
+#endif
+#elif defined(__linux__) && !defined(USE_GX_THREADS) && !defined(USE_CTR_THREADS) \
+   && !defined(USE_PSP_THREADS) && !defined(USE_PS2_THREADS) && !defined(USE_PS3_THREADS) \
+   && !defined(USE_SWITCH_THREADS) && !defined(USE_WIIU_THREADS) && !defined(USE_VITA_THREADS)
+   cpu_set_t set;
+   if (!thread)
+      return false;
+   sthread_mask_to_set(mask, &set);
+   return pthread_setaffinity_np(thread->id, sizeof(set), &set) == 0;
+#else
+   (void)thread; (void)mask;
+   return false;
+#endif
+}
+
+bool sthread_set_current_affinity(uint64_t mask)
+{
+#if defined(USE_WIN32_THREADS)
+   return sthread_set_affinity_handle(GetCurrentThread(), mask);
+#elif defined(__ANDROID__)
+   return sthread_set_tid_affinity(0, mask);
+#elif defined(__linux__) && !defined(USE_GX_THREADS) && !defined(USE_CTR_THREADS) \
+   && !defined(USE_PSP_THREADS) && !defined(USE_PS2_THREADS) && !defined(USE_PS3_THREADS) \
+   && !defined(USE_SWITCH_THREADS) && !defined(USE_WIIU_THREADS) && !defined(USE_VITA_THREADS)
+   cpu_set_t set;
+   sthread_mask_to_set(mask, &set);
+   return sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+   (void)mask;
+   return false;
+#endif
+}
+
+/* Yield the rest of this timeslice to any runnable thread. What a
+ * bounded spin does when its bound is reached and it is not yet ready to
+ * park: the signal-safe alternative to a lock, for the one place a lock
+ * cannot go (a fault handler), and the backoff between polls of a
+ * condition that has no waiter list. Every backend has one. */
+void sthread_yield(void)
+{
+#if defined(USE_WIN32_THREADS)
+   SwitchToThread();
+#elif defined(USE_GX_THREADS)
+   LWP_YieldThread();
+#elif defined(USE_CTR_THREADS)
+   svcSleepThread(0);
+#elif defined(USE_PSP_THREADS) || defined(USE_VITA_THREADS)
+   sceKernelDelayThread(0);
+#elif defined(USE_WIIU_THREADS)
+   OSYieldThread();
+#elif defined(USE_SWITCH_THREADS)
+   svcSleepThread(0);
+#elif defined(USE_PS2_THREADS)
+   RotateThreadReadyQueue(0);
+#elif defined(USE_PS3_THREADS)
+   rthreads_ps3_thread_yield();
+#else
+   sched_yield();
+#endif
 }
 
 bool sthread_isself(sthread_t *thread)
