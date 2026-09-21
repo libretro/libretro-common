@@ -74,6 +74,32 @@ int rh264_video_drain(rh264_video *v);
 /* Bits per sample of the decoded pictures (8..14).  Above 8 the planes
  * hold uint16_t samples: rh264_video_plane still returns a byte
  * pointer (cast it; the stride counts samples). */
+/* While @skip is set, a non-reference picture is consumed without
+ * being decoded: rh264_video_decode() returns 0 for it, as for any
+ * sample that yields no picture, and the stream moves on. Nothing
+ * predicts from such a picture, so what follows decodes unchanged.
+ * For a caller that has fallen behind its clock and would rather
+ * drop a frame than show every one late. */
+void rh264_video_set_skip_nonref(rh264_video *v, int skip);
+/* Whether the last decode call passed a picture over under that
+ * setting: it returned 0 as it does for a picture held back for
+ * reordering, but this one's presentation slot has gone. */
+int rh264_video_dropped(const rh264_video *v);
+
+/* For the decoder's own samples: how many times a reference read found
+ * the rows it needed not yet final. On a single thread that is zero
+ * by construction, and a sample asserts it; it is the count a
+ * threaded decoder would have waited on. */
+int rh264_video_ref_wait_misses(void);
+
+/* How many pictures the decoder keeps in rotation, 1 to 4. Each new
+ * picture takes the next context round; with one, the same every
+ * time. Today the pictures still decode one after the other, so this
+ * changes which memory a picture uses and nothing else - which is
+ * what lets a sample prove the per-picture state complete before the
+ * pictures decode concurrently. */
+void rh264_video_set_contexts(rh264_video *v, int n);
+
 int rh264_video_bit_depth(const rh264_video *v);
 
 /* Borrow a decoded plane (0=Y, 1=U, 2=V). Valid until the next decode call. */

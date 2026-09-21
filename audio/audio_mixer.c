@@ -94,6 +94,8 @@
 
 
 
+#include <retro_atomic.h>
+
 #ifdef HAVE_THREADS
 #include <rthreads/rthreads.h>
 #define AUDIO_MIXER_LOCK(voice)   slock_lock(voice->lock)
@@ -224,7 +226,13 @@ struct audio_mixer_voice
    } types;
    audio_mixer_sound_t *sound;
    audio_mixer_stop_cb_t stop_cb;
-   unsigned type;
+   /* Which codec the voice carries, AUDIO_MIXER_TYPE_NONE when idle.
+    * Published with a release store when a voice is claimed and cleared
+    * the same way once it is released, so the mix loops and the voice
+    * counts can test a voice for idle without taking its lock. Every
+    * read that goes on to touch the rest of the voice takes the lock
+    * and reads this again under it. */
+   retro_atomic_int_t type;
    /* volume drives the float pipeline, gain the s16 one. They are held
     * separately rather than converted on demand so that an s16 voice
     * never needs a float operation on the audio thread. */
@@ -719,7 +727,7 @@ void audio_mixer_init(unsigned rate)
    {
       audio_mixer_voice_t *voice = &s_voices[i];
 
-      voice->type = AUDIO_MIXER_TYPE_NONE;
+      retro_atomic_store_release_int(&voice->type, AUDIO_MIXER_TYPE_NONE);
 #ifdef HAVE_THREADS
       if (!voice->lock)
          voice->lock = slock_new();
@@ -1130,17 +1138,13 @@ audio_mixer_sound_t* audio_mixer_load_wav(void *buffer, size_t size,
    /* Build the pipeline the caller asked for now, so that triggering
     * the sound later allocates nothing. The other one is built only
     * if a mode flip actually asks for it. */
-   if (!(want_s16 ? wav_build_s16(sound, quality)
-                  : wav_build_float(sound, resampler_ident, quality)))
-   {
-      audio_mixer_destroy(sound);
-      return NULL;
-   }
+   if (want_s16 ? wav_build_s16(sound, quality)
+                : wav_build_float(sound, resampler_ident, quality))
+      return sound;
 
-   return sound;
-#else
-   return NULL;
+   audio_mixer_destroy(sound);
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_wav_stream(void *buffer, size_t size)
@@ -1151,21 +1155,17 @@ audio_mixer_sound_t* audio_mixer_load_wav_stream(void *buffer, size_t size)
    if (!buffer || size <= 0)
       return NULL;
 
-   if (!(sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound))))
-      return NULL;
-
-   /* nothing is decoded here: the voice reads frames out of these
-    * bytes as it mixes them */
-   sound->type              = AUDIO_MIXER_TYPE_WAV_STREAM;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   (void)buffer;
-   (void)size;
-   return NULL;
+   if ((sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound))))
+   {
+      /* nothing is decoded here: the voice reads frames out of these
+       * bytes as it mixes them */
+      sound->type              = AUDIO_MIXER_TYPE_WAV_STREAM;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_ogg(void *buffer, size_t size)
@@ -1198,17 +1198,15 @@ audio_mixer_sound_t* audio_mixer_load_ogg(void *buffer, size_t size)
 
    sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type           = mt;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = mt;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_flac(void *buffer, size_t size)
@@ -1216,17 +1214,15 @@ audio_mixer_sound_t* audio_mixer_load_flac(void *buffer, size_t size)
 #ifdef HAVE_RFLAC
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type           = AUDIO_MIXER_TYPE_FLAC;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_FLAC;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_mp3(void *buffer, size_t size)
@@ -1234,17 +1230,15 @@ audio_mixer_sound_t* audio_mixer_load_mp3(void *buffer, size_t size)
 #ifdef HAVE_RMP3
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type           = AUDIO_MIXER_TYPE_MP3;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_MP3;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_m4a(void *buffer, size_t size)
@@ -1252,17 +1246,15 @@ audio_mixer_sound_t* audio_mixer_load_m4a(void *buffer, size_t size)
 #ifdef HAVE_RAAC
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type           = AUDIO_MIXER_TYPE_M4A;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_M4A;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_ac3(void *buffer, size_t size)
@@ -1270,17 +1262,15 @@ audio_mixer_sound_t* audio_mixer_load_ac3(void *buffer, size_t size)
 #ifdef HAVE_RAC3
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type           = AUDIO_MIXER_TYPE_AC3;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_AC3;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_lpcm(void *buffer, size_t size)
@@ -1288,19 +1278,15 @@ audio_mixer_sound_t* audio_mixer_load_lpcm(void *buffer, size_t size)
 #ifdef HAVE_RLPCM
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type              = AUDIO_MIXER_TYPE_LPCM;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   (void)buffer;
-   (void)size;
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_LPCM;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_opus(void *buffer, size_t size)
@@ -1308,17 +1294,15 @@ audio_mixer_sound_t* audio_mixer_load_opus(void *buffer, size_t size)
 #ifdef HAVE_ROPUS
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type           = AUDIO_MIXER_TYPE_OPUS;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_OPUS;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 audio_mixer_sound_t* audio_mixer_load_weba_avail(void *buffer, size_t size,
@@ -1375,17 +1359,15 @@ audio_mixer_sound_t* audio_mixer_load_mod(void *buffer, size_t size)
 #ifdef HAVE_RMODTRACKER
    audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
-   if (!sound)
-      return NULL;
-
-   sound->type              = AUDIO_MIXER_TYPE_MOD;
-   sound->types.stream.size = size;
-   sound->types.stream.data = buffer;
-
-   return sound;
-#else
-   return NULL;
+   if (sound)
+   {
+      sound->type              = AUDIO_MIXER_TYPE_MOD;
+      sound->types.stream.size = size;
+      sound->types.stream.data = buffer;
+      return sound;
+   }
 #endif
+   return NULL;
 }
 
 void audio_mixer_sound_set_data_owner(audio_mixer_sound_t *sound,
@@ -1440,7 +1422,7 @@ void audio_mixer_voice_set_avail(audio_mixer_voice_t *voice, size_t avail)
       return;
 #ifdef AUDIO_MIXER_HAS_STREAM
    AUDIO_MIXER_LOCK(voice);
-   switch (voice->type)
+   switch (retro_atomic_load_relaxed_int(&voice->type))
    {
 #ifdef HAVE_RAC3
       case AUDIO_MIXER_TYPE_AC3:
@@ -1500,7 +1482,7 @@ size_t audio_mixer_voice_buffer_tell(audio_mixer_voice_t *voice)
       return 0;
 #ifdef AUDIO_MIXER_HAS_STREAM
    AUDIO_MIXER_LOCK(voice);
-   switch (voice->type)
+   switch (retro_atomic_load_relaxed_int(&voice->type))
    {
 #ifdef HAVE_RWAV
       case AUDIO_MIXER_TYPE_WAV_STREAM:
@@ -2065,19 +2047,21 @@ audio_mixer_voice_t* audio_mixer_play(audio_mixer_sound_t* sound,
 
    for (i = 0; i < AUDIO_MIXER_MAX_VOICES; i++, voice++)
    {
-      if (voice->type != AUDIO_MIXER_TYPE_NONE)
+      if (retro_atomic_load_acquire_int(&voice->type)
+            != AUDIO_MIXER_TYPE_NONE)
          continue;
 
       AUDIO_MIXER_LOCK(voice);
 
-      if (voice->type != AUDIO_MIXER_TYPE_NONE)
+      if (retro_atomic_load_relaxed_int(&voice->type)
+            != AUDIO_MIXER_TYPE_NONE)
       {
          AUDIO_MIXER_UNLOCK(voice);
          continue;
       }
 
       /* claim the voice, also helps with cleanup on error */
-      voice->type = sound->type;
+      retro_atomic_store_release_int(&voice->type, sound->type);
 
       switch (sound->type)
       {
@@ -2185,19 +2169,24 @@ audio_mixer_voice_t* audio_mixer_play_s16(audio_mixer_sound_t* sound,
 
    for (i = 0; i < AUDIO_MIXER_MAX_VOICES; i++, voice++)
    {
-      if (voice->type != AUDIO_MIXER_TYPE_NONE)
+      if (retro_atomic_load_acquire_int(&voice->type)
+            != AUDIO_MIXER_TYPE_NONE)
          continue;
 
       AUDIO_MIXER_LOCK(voice);
 
-      if (voice->type != AUDIO_MIXER_TYPE_NONE)
+      if (retro_atomic_load_relaxed_int(&voice->type)
+            != AUDIO_MIXER_TYPE_NONE)
       {
          AUDIO_MIXER_UNLOCK(voice);
          continue;
       }
 
-      voice->type   = sound->type;
+      /* is_s16 before the release store that publishes the voice: the
+       * unlocked voice counts read the flag only once type says the
+       * voice is claimed, so it has to be set by then. */
       voice->is_s16 = true;
+      retro_atomic_store_release_int(&voice->type, sound->type);
 
       switch (sound->type)
       {
@@ -2297,7 +2286,7 @@ static void audio_mixer_release(audio_mixer_voice_t* voice)
    if (!voice)
       return;
 
-   switch (voice->type)
+   switch (retro_atomic_load_relaxed_int(&voice->type))
    {
 #ifdef HAVE_RWAV
       case AUDIO_MIXER_TYPE_WAV_STREAM:
@@ -2349,7 +2338,7 @@ static void audio_mixer_release(audio_mixer_voice_t* voice)
    }
 
    memset(&voice->types, 0, sizeof(voice->types));
-   voice->type   = AUDIO_MIXER_TYPE_NONE;
+   retro_atomic_store_release_int(&voice->type, AUDIO_MIXER_TYPE_NONE);
    voice->is_s16 = false;
 }
 
@@ -2763,6 +2752,14 @@ void audio_mixer_mix(float* buffer, size_t num_frames,
    {
       float volume;
 
+      /* An idle voice holds nothing to mix, so it is passed over
+       * without its lock: with every voice idle this loop takes none
+       * at all. The switch below reads type again under the lock, so a
+       * voice released in between lands on its NONE case. */
+      if (retro_atomic_load_acquire_int(&voice->type)
+            == AUDIO_MIXER_TYPE_NONE)
+         continue;
+
       AUDIO_MIXER_LOCK(voice);
 
       if (voice->is_s16)
@@ -2773,7 +2770,7 @@ void audio_mixer_mix(float* buffer, size_t num_frames,
 
       volume = (override) ? volume_override : voice->volume;
 
-      switch (voice->type)
+      switch (retro_atomic_load_relaxed_int(&voice->type))
       {
          case AUDIO_MIXER_TYPE_WAV:
             audio_mixer_mix_wav(buffer, num_frames, voice, volume);
@@ -2850,6 +2847,12 @@ void audio_mixer_mix_s16(int16_t* buffer, size_t num_frames,
    {
       int32_t gain_q16;
 
+      /* Idle voices are skipped without the lock, as in
+       * audio_mixer_mix() above */
+      if (retro_atomic_load_acquire_int(&voice->type)
+            == AUDIO_MIXER_TYPE_NONE)
+         continue;
+
       AUDIO_MIXER_LOCK(voice);
 
       if (!voice->is_s16)
@@ -2863,7 +2866,7 @@ void audio_mixer_mix_s16(int16_t* buffer, size_t num_frames,
        * thread, in the pipeline that exists to avoid float. */
       gain_q16 = (override) ? gain_override : voice->gain;
 
-      switch (voice->type)
+      switch (retro_atomic_load_relaxed_int(&voice->type))
       {
          case AUDIO_MIXER_TYPE_FLAC:
 #ifdef HAVE_RFLAC
@@ -2940,7 +2943,8 @@ bool audio_mixer_has_float_voices(void)
    unsigned i;
    const audio_mixer_voice_t *voice = s_voices;
    for (i = 0; i < AUDIO_MIXER_MAX_VOICES; i++, voice++)
-      if (voice->type != AUDIO_MIXER_TYPE_NONE && !voice->is_s16)
+      if (retro_atomic_load_acquire_int(&voice->type)
+               != AUDIO_MIXER_TYPE_NONE && !voice->is_s16)
          return true;
    return false;
 }
@@ -2950,7 +2954,8 @@ bool audio_mixer_has_s16_voices(void)
    unsigned i;
    const audio_mixer_voice_t *voice = s_voices;
    for (i = 0; i < AUDIO_MIXER_MAX_VOICES; i++, voice++)
-      if (voice->type != AUDIO_MIXER_TYPE_NONE && voice->is_s16)
+      if (retro_atomic_load_acquire_int(&voice->type)
+               != AUDIO_MIXER_TYPE_NONE && voice->is_s16)
          return true;
    return false;
 }
