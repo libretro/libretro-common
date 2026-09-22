@@ -39,7 +39,9 @@
 
 #include <formats/rmp4.h>
 #include <formats/rh264.h>
+#ifdef HAVE_THREADS
 #include <rthreads/tpool.h>
+#endif
 
 static int fails;
 static char dir[256];
@@ -186,6 +188,24 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
                off += (size_t)w[k]*bps;
             }
          }
+         if (getenv("RH264_FRAMEDIFF"))
+            fprintf(stderr, "FRAME %d diff so far %ld\n", frames, bad);
+         if (getenv("RH264_DUMP") && frames == atoi(getenv("RH264_DUMP")))
+         {
+            /* luma of this frame, one line per macroblock row: the
+             * count of samples differing from the reference */
+            size_t o = 0; int fy; int y, x;
+            for (fy = 0; fy < frames; fy++)
+               for (k = 0; k < 3; k++) o += (size_t)w[k] * hh[k] * bps;
+            for (y = 0; y < hh[0]; y += 16)
+            {
+               long d = 0; int yy;
+               for (yy = y; yy < y + 16 && yy < hh[0]; yy++)
+                  for (x = 0; x < w[0]*bps; x++)
+                     if (p[0][(size_t)yy*st[0]*bps + x] != ref_a[o + (size_t)yy*w[0]*bps + x]) d++;
+               fprintf(stderr, "ROW %2d diff %ld\n", y / 16, d);
+            }
+         }
          frames++;
       }
    }
@@ -211,6 +231,25 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
                if (p[k][(size_t)y*st[k]*bps + x] != ref[off + x])
                   bad++;
             off += (size_t)w[k]*bps;
+         }
+      }
+      if (getenv("RH264_FRAMEDIFF"))
+         fprintf(stderr, "FRAME %d (drained) diff so far %ld\n", frames, bad);
+      if (getenv("RH264_DUMP") && frames == atoi(getenv("RH264_DUMP")))
+      {
+         /* luma of this frame against reference frames f-1, f and f+1,
+          * whole-frame counts: an order slip shows as a match elsewhere */
+         int cand, y, x;
+         for (cand = frames - 1; cand <= frames + 1; cand++)
+         {
+            size_t o = 0; long dd = 0; int fy;
+            for (fy = 0; fy < cand; fy++)
+               for (k = 0; k < 3; k++) o += (size_t)w[k] * hh[k] * bps;
+            if (o + (size_t)w[0]*hh[0]*bps > alen) { fprintf(stderr, "ref %d: past end\n", cand); continue; }
+            for (y = 0; y < hh[0]; y++)
+               for (x = 0; x < w[0]*bps; x++)
+                  if (p[0][(size_t)y*st[0]*bps + x] != ref_a[o + (size_t)y*w[0]*bps + x]) dd++;
+            fprintf(stderr, "frame %d vs ref %d: %ld luma differ\n", frames, cand, dd);
          }
       }
       frames++;
@@ -242,7 +281,7 @@ static void oracle_case(const char *name, const char *src, int frames,
          name, pix, x264);
    if (run("ffmpeg -v error -y -f lavfi -i \"%s\" -frames:v %d -c:v libx264 "
            "%s -pix_fmt %s %s '%s' && "
-           "ffmpeg -v error -y -i '%s' -f rawvideo -pix_fmt %s '%s'",
+           "ffmpeg -v error -y -i '%s' -fps_mode passthrough -f rawvideo -pix_fmt %s '%s'",
            src, frames, rate, pix, x264, mp4, mp4, pix, yuv) != 0
        || !(ref = slurp(yuv, &rlen)))
    {
@@ -482,7 +521,7 @@ static void mixed_case(void)
            "-c:v libx264 -preset ultrafast -qp 0 -g 1 -x264-params slices=2 "
            "-pix_fmt yuv420p '%s/ll2.mp4' && "
            "ffmpeg -v error -y -i '%s/ll2.mp4' -c:v copy -bsf:v h264_mp4toannexb '%s' && "
-           "ffmpeg -v error -y -i '%s/ll2.mp4' -f rawvideo -pix_fmt yuv420p '%s' && "
+           "ffmpeg -v error -y -i '%s/ll2.mp4' -fps_mode passthrough -f rawvideo -pix_fmt yuv420p '%s' && "
            "ffmpeg -v error -y -f lavfi -i testsrc2=s=96x80:r=10 -frames:v 3 "
            "-c:v libx264 -preset ultrafast -qp 30 -g 1 "
            "-x264-params slices=2:deblock=6,6:aq-mode=0 -pix_fmt yuv420p '%s/lossy2.mp4' && "
@@ -520,7 +559,7 @@ static void mixed_case(void)
    free(a); free(b); free(m.out);
    check("M0 mixed stream assembled (6 slices)", 1);
    if (run("ffmpeg -v error -y -i '%s' -c:v copy '%s' && "
-           "ffmpeg -v error -y -i '%s' -f rawvideo -pix_fmt yuv420p '%s'",
+           "ffmpeg -v error -y -i '%s' -fps_mode passthrough -f rawvideo -pix_fmt yuv420p '%s'",
            mix, mixmp4, mixmp4, ffyuv) != 0)
    {
       check("M0 ffmpeg decodes the mixed stream", 0);
@@ -545,6 +584,56 @@ static void mixed_case(void)
 
 int main(void)
 {
+   /* RH264_FILE=path RH264_REF=path.yuv: decode one file against its
+    * ffmpeg reference, at one thread and, with RH264_FILE_THREADS,
+    * concurrently - for a file that misbehaves in the field. */
+   if (getenv("RH264_FILE"))
+   {
+      /* The reference is ffmpeg's decode of the same stream, its
+       * pictures and no more: without -fps_mode passthrough ffmpeg
+       * duplicates pictures to hold the declared rate against the
+       * timestamps, and the last picture of a file then compares
+       * against a copy of the one before it. RH264_REF names a
+       * reference already made that way. */
+      size_t rlen = 0;
+      const char *rf = getenv("RH264_REF");
+      char made[512];
+      uint8_t *ref;
+      if (!rf)
+      {
+         snprintf(made, sizeof(made), "/tmp/rh264_file_ref_%ld.yuv", (long)getpid());
+         if (run("ffmpeg -v error -y -i '%s' -fps_mode passthrough "
+                 "-f rawvideo -pix_fmt yuv420p '%s'", getenv("RH264_FILE"), made))
+            return 2;
+         rf = made;
+      }
+      ref = slurp(rf, &rlen);
+      int nf = 0;
+      long bad;
+      const char *te = getenv("RH264_FILE_THREADS");
+      if (!ref)
+         return 2;
+      #ifdef HAVE_THREADS
+      g_pool = tpool_create_with_stack_size(3, 512 * 1024);
+      #endif
+      bad = compare(getenv("RH264_FILE"), ref, rlen, ref, 0, &nf);
+      printf("one thread: %d frames, %ld differing samples, %d reads short of their rows\n",
+            nf, bad, rh264_video_ref_wait_misses());
+      g_contexts = 4;
+      bad = compare(getenv("RH264_FILE"), ref, rlen, ref, 0, &nf);
+      g_contexts = 1;
+      printf("4 contexts, one thread: %d frames, %ld differing samples\n", nf, bad);
+      if (te && g_pool)
+      {
+         g_threads = atoi(te);
+         bad = compare(getenv("RH264_FILE"), ref, rlen, ref, 0, &nf);
+         printf("%d threads: %d frames, %ld differing samples\n", g_threads, nf, bad);
+      }
+      free(ref);
+      if (rf == made)
+         remove(made);
+      return bad != 0;
+   }
    if (system("ffmpeg -version >/dev/null 2>&1") != 0)
    {
       printf("rh264_lossless_test: ffmpeg is required (with libx264)\n");
@@ -578,7 +667,9 @@ int main(void)
     * and in CABAC the contexts still see it.  Intra macroblocks amid
     * inter ones in P / B pictures exercise every neighbour position. */
    printf("constrained_intra_pred, byte-exact vs ffmpeg:\n");
+   #ifdef HAVE_THREADS
    g_pool = tpool_create_with_stack_size(3, 512 * 1024);
+   #endif
    if (!g_pool)
       printf("no thread pool: the concurrent decodes are skipped\n");
    oracle_case("cip_cabac",  "testsrc2=s=176x144:r=15",   8, "yuv420p", "-crf 20",
@@ -617,6 +708,22 @@ int main(void)
          "-preset medium");
    oracle_case("c444_ll_cavlc",  "mandelbrot=s=112x96:r=10", 3, "yuv444p", "-qp 0",
          "-preset medium -g 1 -x264-params cabac=0");
+   /* Every picture in eight slices: the shape the field sent in, and
+    * the one that showed the concurrent decoder stopping a sample at
+    * the first slice that showed a picture. Larger than the others so
+    * that eight slices are eight rows of macroblocks. */
+   oracle_case("slices8_ipb",    "mandelbrot=s=176x256:r=10", 8, "yuv420p", "-qp 0",
+         "-preset medium -x264-params slices=8:bframes=2");
+   /* Interlaced, macroblock-adaptive frame/field (x264's interlaced
+    * coding): pair scanning, field motion compensation and the
+    * per-pair deblocking; and with pictures in flight, the rows of a
+    * MBAFF picture published only at its completion. */
+   oracle_case("mbaff_cavlc",    "mandelbrot=s=176x144:r=10", 8, "yuv420p", "-crf 20",
+         "-preset medium -x264-params tff=1:cabac=0:bframes=2");
+   oracle_case("mbaff_cabac_b",  "mandelbrot=s=176x144:r=10", 8, "yuv420p", "-crf 20",
+         "-preset medium -x264-params tff=1:cabac=1:bframes=2:b-pyramid=normal");
+   oracle_case("mbaff_wp",       "mandelbrot=s=176x144:r=10", 8, "yuv420p", "-crf 20",
+         "-preset medium -x264-params tff=1:cabac=1:bframes=2:weightp=2");
 
    run("rm -rf '%s'", dir);
    /* The row counter every reference read consults: on one thread a

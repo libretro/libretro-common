@@ -115,6 +115,24 @@ void rh264_video_set_thread_pool(rh264_video *v, void *pool, int threads);
  * must be byte-exact under it. 0 is off. Debug only. */
 void rh264_video_set_publish_delay(int max_yields);
 
+/* What the pipeline did, for a bench: pictures posted to the pool, the
+ * mean pictures in flight at a post (x100), posts that found the most
+ * possible in flight, joins that had to wait for a context, output
+ * pops that held a due picture for being incomplete, and pops that
+ * waited for one because the queue was full. */
+void rh264_video_stats(const rh264_video *v, int *posted, int *inflight_x100,
+      int *at_max, int *join_waits, int *pop_held, int *pop_waits);
+
+/* Reference reads that had to wait for rows since the last call, and
+ * the rows they were short by on average (x100): how often a picture
+ * in flight stalls on the one it predicts from, and how far behind it
+ * stands when it does. Process-wide; reading resets. */
+void rh264_video_row_wait_stats(int *waits, int *rows_short_x100);
+
+/* The most pictures the pool had decoding at one moment since the last
+ * call; reading resets. Process-wide. One means they never overlapped. */
+int rh264_video_jobs_at_once(void);
+
 int rh264_video_bit_depth(const rh264_video *v);
 
 /* Borrow a decoded plane (0=Y, 1=U, 2=V). Valid until the next decode call. */

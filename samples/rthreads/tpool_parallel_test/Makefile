@@ -1,4 +1,4 @@
-TARGET := tpool_wait_test
+TARGET := tpool_parallel_test
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -7,9 +7,10 @@ LIBRETRO_COMM_DIR := ../../..
 # pthreads / Win32 / etc.) so we just compile them in directly --
 # no other libretro-common sources are needed.
 SOURCES := \
-	tpool_wait_test.c \
+	tpool_parallel_test.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/tpool.c \
-	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c
+	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.c
 
 OBJS := $(SOURCES:.c=.o)
 
