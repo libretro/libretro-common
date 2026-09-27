@@ -307,16 +307,51 @@ static void retro_task_internal_retire_cleanup(retro_task_t *task)
 #endif
 }
 
+/* Per-check budgets (task_queue_set_budget). Read and written on the
+ * thread that drives task_queue_check(); zero means unbounded, the
+ * behaviour before budgets existed. */
+static retro_time_t task_retire_budget_usec;
+static unsigned     task_retire_budget_max;
+static retro_time_t task_handler_budget_usec;
+
+void task_queue_set_budget(retro_time_t retire_usec, unsigned retire_max,
+      retro_time_t handler_usec)
+{
+   task_retire_budget_usec  = retire_usec;
+   task_retire_budget_max   = retire_max;
+   task_handler_budget_usec = handler_usec;
+}
+
+/* Whether one more retirement fits: always the first, then while
+ * under the count and time budgets. */
+static bool task_retire_budget_allows(unsigned done, retro_time_t started)
+{
+   if (!done)
+      return true;
+   if (task_retire_budget_max && done >= task_retire_budget_max)
+      return false;
+   if (task_retire_budget_usec
+         && cpu_features_get_time_usec() - started >= task_retire_budget_usec)
+      return false;
+   return true;
+}
+
 static void retro_task_internal_gather(void)
 {
-   retro_task_t *task = NULL;
-   while ((task = task_queue_get(&tasks_finished)))
+   retro_task_t *task   = NULL;
+   unsigned      done   = 0;
+   retro_time_t  started = (task_retire_budget_usec)
+      ? cpu_features_get_time_usec() : 0;
+
+   while (task_retire_budget_allows(done, started)
+         && (task = task_queue_get(&tasks_finished)))
    {
       /* Already popped off the queue, so it is unreachable either way
        * and the split is unobservable here. */
       retro_task_internal_retire_callback(task);
       retro_task_internal_retire_cleanup(task);
       free(task);
+      done++;
    }
 }
 
@@ -346,19 +381,47 @@ void task_queue_set_slow_handler_cb(retro_task_slow_handler_t cb,
 
 static void retro_task_regular_gather(void)
 {
-   retro_task_t *task  = NULL;
-   retro_task_t *queue = NULL;
-   retro_task_t *next  = NULL;
+   retro_task_t *task     = NULL;
+   retro_task_t *queue    = NULL;
+   retro_task_t *tail     = NULL;
+   retro_task_t *next     = NULL;
+   retro_task_t *ran      = NULL;
+   retro_task_t *ran_tail = NULL;
+   retro_time_t  started  = 0;
+   unsigned      n_ran    = 0;
+   bool          over     = false;
 
+   /* Detach the running list, in order. */
    while ((task = task_queue_get(&tasks_running)))
    {
-      task->next = queue;
-      queue = task;
+      if (tail)
+         tail->next = task;
+      else
+         queue      = task;
+      tail = task;
    }
+
+   if (task_handler_budget_usec)
+      started = cpu_features_get_time_usec();
 
    for (task = queue; task; task = next)
    {
       next = task->next;
+
+      /* Past the budget, the rest of the list waits for the next
+       * check. At least one due handler always runs, so a budget too
+       * small for any single handler still makes progress. */
+      if (   !over && n_ran && task_handler_budget_usec
+          && cpu_features_get_time_usec() - started >= task_handler_budget_usec)
+         over = true;
+
+      if (over)
+      {
+         /* Unrun tasks stay at the front, so a busy queue rotates
+          * through them rather than starving the tail. */
+         task_queue_put(&tasks_running, task);
+         continue;
+      }
 
       if (!task->when || task->when < cpu_features_get_time_usec())
       {
@@ -366,17 +429,18 @@ static void retro_task_regular_gather(void)
           * callback registered this costs nothing at all. */
          if (task_slow_handler_cb)
          {
-            retro_time_t started = cpu_features_get_time_usec();
+            retro_time_t h_started = cpu_features_get_time_usec();
             retro_time_t took;
 
             task->handler(task);
 
-            took = cpu_features_get_time_usec() - started;
+            took = cpu_features_get_time_usec() - h_started;
             if (took > task_slow_handler_budget)
                task_slow_handler_cb(task, took);
          }
          else
             task->handler(task);
+         n_ran++;
       }
 
       /* No progress push here: the gather on the main thread pushes
@@ -386,7 +450,21 @@ static void retro_task_regular_gather(void)
       if ((task->flags & RETRO_TASK_FLG_FINISHED) > 0)
          task_queue_put(&tasks_finished, task);
       else
-         task_queue_put(&tasks_running, task);
+      {
+         task->next = NULL;
+         if (ran_tail)
+            ran_tail->next = task;
+         else
+            ran            = task;
+         ran_tail = task;
+      }
+   }
+
+   /* The tasks that ran go behind the ones that did not. */
+   for (task = ran; task; task = next)
+   {
+      next = task->next;
+      task_queue_put(&tasks_running, task);
    }
 
    retro_task_internal_gather();
@@ -623,9 +701,22 @@ static void retro_task_threaded_gather(void)
       /* Retire outside the lock (callbacks may push tasks, taking
        * running_lock; see the deadlock note above), pruning each
        * task from the retiring list - under the lock - before it
-       * is freed */
+       * is freed. Bounded by the retire budget: what is left on the
+       * retiring list stays findable and is picked up next check. */
+      {
+      unsigned     done    = 0;
+      retro_time_t started = (task_retire_budget_usec)
+         ? cpu_features_get_time_usec() : 0;
       for (;;)
       {
+         if (!task_retire_budget_allows(done, started))
+         {
+            /* Leftovers: keep the early-out at the top of this
+             * function from skipping the next check. */
+            retro_atomic_store_release_int(&tasks_finished_count, 1);
+            break;
+         }
+
          slock_lock(finished_lock);
          task = tasks_retiring.front;
          slock_unlock(finished_lock);
@@ -647,6 +738,8 @@ static void retro_task_threaded_gather(void)
          retro_task_internal_retire_cleanup(task);
 
          free(task);
+         done++;
+      }
       }
 
       in_gather = false;
@@ -793,11 +886,20 @@ static void retro_task_threaded_retrieve(task_retriever_data_t *data)
    slock_unlock(running_lock);
 }
 
+static bool task_worker_prefer_fast_cores;
+
+void task_queue_set_prefer_fast_cores(bool prefer)
+{
+   task_worker_prefer_fast_cores = prefer;
+}
+
 static void threaded_worker(void *userdata)
 {
    struct task_worker *self = (struct task_worker*)userdata;
 
    sthread_setname("ra-task");
+   if (task_worker_prefer_fast_cores)
+      sthread_prefer_fast_cores();
 
    for (;;)
    {
@@ -1280,9 +1382,13 @@ void task_queue_init(bool threaded, retro_task_queue_msg_t msg_push)
    impl_current   = &impl_regular;
 #ifdef HAVE_THREADS
    main_thread_id = sthread_get_current_thread_id();
+   /* The flag follows the argument both ways: it used to be set only
+    * on true, so init(false) after a threaded session left it on and
+    * the next task_queue_check() re-initialised the threaded queue
+    * behind the caller's back. */
+   task_threaded_enable = threaded;
    if (threaded)
    {
-      task_threaded_enable = true;
 #ifdef HAVE_GCD
       impl_current         = &impl_gcd;
 #else

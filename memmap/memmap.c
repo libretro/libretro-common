@@ -648,6 +648,86 @@ void memjit_write_end(void)   { }
 #endif
 
 /* ------------------------------------------------------------------ */
+/* JIT code memory                                                     */
+/* ------------------------------------------------------------------ */
+
+void *memjit_alloc(size_t len)
+{
+#if defined(_WIN32) && !defined(_XBOX)
+   return VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE,
+         PAGE_EXECUTE_READWRITE);
+#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_ANONYMOUS)
+   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+   void *p;
+   /* On macOS on Apple Silicon a plain executable mapping is refused;
+    * MAP_JIT is the one that is granted, and it is then write-xor-execute
+    * per thread, switched with memjit_write_begin/end above. It is macOS
+    * only: iOS and tvOS need an entitlement for it that a core does not
+    * have, and keep the plain mapping. */
+#if defined(MAP_JIT) && defined(__APPLE__) && defined(__aarch64__) \
+   && defined(TARGET_OS_OSX) && TARGET_OS_OSX
+   flags |= MAP_JIT;
+#endif
+   p = mmap(NULL, len, PROT_READ | PROT_WRITE | PROT_EXEC, flags, -1, 0);
+   return (p == MAP_FAILED) ? NULL : p;
+#else
+   /* No mmap: DOS, the consoles, Emscripten. */
+   (void)len;
+   return NULL;
+#endif
+}
+
+void memjit_free(void *addr, size_t len)
+{
+   if (!addr)
+      return;
+#if defined(_WIN32) && !defined(_XBOX)
+   (void)len;
+   VirtualFree(addr, 0, MEM_RELEASE);
+#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_ANONYMOUS)
+   munmap(addr, len);
+#else
+   (void)len;
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* Zeroing a range of pages                                            */
+/* ------------------------------------------------------------------ */
+
+bool memzero_pages(void *addr, size_t len)
+{
+   if (!addr || !len)
+      return true;
+#if defined(_WIN32) && !defined(_XBOX)
+   /* Decommitting and recommitting hands the pages back and takes fresh
+    * zeroed ones, at page granularity within the region. Once the
+    * decommit has succeeded the range is no longer backed, so a failed
+    * recommit cannot fall through to memset: that would fault. The
+    * range is reported lost instead, and the caller must not touch it. */
+   if (VirtualFree(addr, len, MEM_DECOMMIT))
+   {
+      if (VirtualAlloc(addr, len, MEM_COMMIT, PAGE_READWRITE))
+         return true;
+      return false;
+   }
+#elif defined(__linux__) && defined(MADV_DONTNEED)
+   /* Linux and Android zero-fill private anonymous memory on the next
+    * touch after MADV_DONTNEED; on every other system the advice may
+    * leave the contents in place, so it is only taken here. */
+   if (madvise(addr, len, MADV_DONTNEED) == 0)
+      return true;
+#elif defined(HAVE_MMAN) && !defined(__EMSCRIPTEN__) && defined(MAP_FIXED)
+   /* Fresh zero pages mapped over the range. */
+   if (mmap(addr, len, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED)
+      return true;
+#endif
+   memset(addr, 0, len);
+   return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* A reservation that shared memory is mapped into at several places   */
 /* ------------------------------------------------------------------ */
 

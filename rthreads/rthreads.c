@@ -138,6 +138,12 @@
 #else
 #include <pthread.h>
 #include <time.h>
+#if (defined(__FreeBSD__) && !defined(__ORBIS__) && !defined(ORBIS)) \
+      || defined(__OpenBSD__) || defined(__DragonFly__)
+/* pthread_set_name_np() lives here, not in pthread.h.  The PS4 toolchain
+ * defines __FreeBSD__ but Sony's libc ships no pthread_np.h. */
+#include <pthread_np.h>
+#endif
 #endif
 
 #if defined(USE_CTR_THREADS) && !defined(USE_CTRULIB_2)
@@ -336,9 +342,12 @@ typedef sys_lwcond_attribute_t rthreads_ps3_lwcond_attr_t;
 #include <sys/prctl.h>
 #endif
 
-#if defined(__ANDROID__)
+#if defined(__linux__) && !defined(USE_WIN32_THREADS)
 #include <sys/resource.h>
 #include <unistd.h>
+#if !defined(__ANDROID__) && defined(RLIMIT_RTPRIO) && defined(RLIMIT_NICE)
+#define RTHREADS_HAVE_PRIO_RLIMITS 1
+#endif
 #endif
 
 /* Linux: scond goes straight to the futex. The case for it on Android
@@ -387,6 +396,7 @@ extern long syscall(long number, ...);
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
+#include <sys/sysctl.h> /* sthread_get_core_topology */
 #include <TargetConditionals.h>
 #include <AvailabilityMacros.h> /* MAC_OS_X_VERSION_MIN_REQUIRED (since 10.2) */
 /* The pthread QoS override API (pthread_override_qos_class_start_np, used by
@@ -585,7 +595,8 @@ enum scond_spin_kind
    SCOND_SPIN_UMWAIT
 };
 
-typedef LONG (NTAPI *scond_nt_wait_alert_t)(void *hint, LARGE_INTEGER *timeout);
+typedef LONG (NTAPI *scond_nt_wait_alert_t)(volatile void *hint,
+      LARGE_INTEGER *timeout);
 typedef LONG (NTAPI *scond_nt_alert_tid_t)(HANDLE tid);
 typedef LONG (NTAPI *scond_nt_keyed_t)(HANDLE h, void *key, BOOLEAN alertable,
       LARGE_INTEGER *timeout);
@@ -1309,19 +1320,84 @@ static sthread_t *sthread_create_ex(void (*thread_func)(void*),
 }
 
 #ifdef RTHREADS_HAVE_AFFINITY
-/* The set of CPUs whose maximum frequency matches the highest in the
- * system, intersected with what this thread may already run on.
- * Computed once; on a homogeneous part it comes out equal to the
- * allowed set and the pin is skipped. */
-static unsigned long rthreads_fast_mask[4];
+/* The fast cores of an asymmetric part, intersected with what this
+ * thread may already run on. Computed once; on a homogeneous part it
+ * comes out equal to the allowed set and the pin is skipped.
+ *
+ * The class of each processor comes from cpu_class.h, the same read
+ * cpu_features_get_processor_order() ranks by, so a thread pinned
+ * here and one a core pins to "the strongest processor" agree on
+ * which silicon that is. */
+#if defined(RTHREADS_CPU_SYSFS) && !defined(CPU_CLASS_SYSFS)
+#define CPU_CLASS_SYSFS RTHREADS_CPU_SYSFS
+#endif
+#include "../features/cpu_class.h"
+
+#define RTHREADS_MASK_WORDS 4
+#define RTHREADS_MASK_BITS  (RTHREADS_MASK_WORDS * 8 * (int)sizeof(unsigned long))
+
+static unsigned long rthreads_fast_mask[RTHREADS_MASK_WORDS];
 static int           rthreads_fast_state; /* 0 unknown, 1 pin, -1 no-op */
+
+#define RTHREADS_MASK_TEST(m, i) \
+   (((m)[(i) / (8 * sizeof(unsigned long))] >> ((i) % (8 * sizeof(unsigned long)))) & 1ul)
+#define RTHREADS_MASK_SET(m, i) \
+   ((m)[(i) / (8 * sizeof(unsigned long))] |= 1ul << ((i) % (8 * sizeof(unsigned long))))
+
+/* Marks in cls every processor of the highest class; returns whether
+ * the platform published any class at all. */
+static bool rthreads_read_fast_class(unsigned long *cls)
+{
+   unsigned char klass[CPU_CLASS_MAX_IDS];
+   unsigned char best = 0;
+   size_t        i, n = cpu_class_read(klass, sizeof(klass));
+
+   memset(cls, 0, RTHREADS_MASK_WORDS * sizeof(unsigned long));
+   if (!n)
+      return false;
+   for (i = 0; i < n; i++)
+      if (klass[i] > best)
+         best = klass[i];
+   for (i = 0; i < n && i < (size_t)RTHREADS_MASK_BITS; i++)
+      if (klass[i] == best)
+         RTHREADS_MASK_SET(cls, i);
+   return true;
+}
+
+/* Classifies the system's cores into fast, intersects with allowed,
+ * and stores the result in fast. Returns 1 when the thread should be
+ * pinned to fast and -1 when it should be left alone: nothing was
+ * readable, every allowed CPU is a fast one (a homogeneous part, or
+ * an affinity already inside the fast set), or none is. */
+static int rthreads_classify_fast_cores(const unsigned long *allowed,
+      unsigned long *fast)
+{
+   unsigned long cls[RTHREADS_MASK_WORDS];
+   unsigned      i;
+   bool          any = false, all = true;
+
+   memset(fast, 0, RTHREADS_MASK_WORDS * sizeof(unsigned long));
+   if (!rthreads_read_fast_class(cls))
+      return -1;
+
+   for (i = 0; i < (unsigned)RTHREADS_MASK_BITS; i++)
+   {
+      if (!RTHREADS_MASK_TEST(allowed, i))
+         continue;
+      if (RTHREADS_MASK_TEST(cls, i))
+      {
+         RTHREADS_MASK_SET(fast, i);
+         any = true;
+      }
+      else
+         all = false;
+   }
+   return (any && !all) ? 1 : -1;
+}
 
 static void rthreads_find_fast_cores(void)
 {
-   unsigned long allowed[4];
-   unsigned long best = 0;
-   unsigned      i;
-   int           ncpu = (int)(sizeof(allowed) * 8);
+   unsigned long allowed[RTHREADS_MASK_WORDS];
 
    memset(allowed, 0, sizeof(allowed));
    if (syscall(__NR_sched_getaffinity, 0, sizeof(allowed), allowed) <= 0)
@@ -1329,37 +1405,54 @@ static void rthreads_find_fast_cores(void)
       rthreads_fast_state = -1;
       return;
    }
-   memset(rthreads_fast_mask, 0, sizeof(rthreads_fast_mask));
-   for (i = 0; i < (unsigned)ncpu; i++)
+   rthreads_fast_state = rthreads_classify_fast_cores(allowed, rthreads_fast_mask);
+}
+
+/* Counts the physical cores in allowed, split by class. A core is the
+ * set in its thread_siblings_list; without topology files every CPU
+ * is its own core. Without a readable class every core is fast.
+ * Returns whether any allowed CPU was found. */
+static bool rthreads_count_cores_masked(const unsigned long *allowed,
+      unsigned *fast, unsigned *slow)
+{
+   unsigned long cls[RTHREADS_MASK_WORDS];
+   unsigned long seen[RTHREADS_MASK_WORDS];
+   bool          have_cls = rthreads_read_fast_class(cls);
+   unsigned      i, n = 0;
+
+   *fast = *slow = 0;
+   memset(seen, 0, sizeof(seen));
+   for (i = 0; i < (unsigned)RTHREADS_MASK_BITS; i++)
    {
-      char path[96];
-      FILE *f;
-      unsigned long khz = 0;
-      if (!(allowed[i / (8 * sizeof(unsigned long))]
-               & (1ul << (i % (8 * sizeof(unsigned long))))))
+      char          path[512];
+      unsigned char sibs[CPU_CLASS_MAX_IDS];
+      unsigned      j;
+      bool          core_fast = false;
+
+      if (!RTHREADS_MASK_TEST(allowed, i) || RTHREADS_MASK_TEST(seen, i))
          continue;
-      sprintf(path, RTHREADS_CPU_SYSFS "/cpu%u/cpufreq/cpuinfo_max_freq", i);
-      f = fopen(path, "r");
-      if (!f)
-         continue;
-      if (fscanf(f, "%lu", &khz) != 1)
-         khz = 0;
-      fclose(f);
-      if (khz > best)
+      n++;
+      /* The core is fast if any of its allowed threads is. */
+      memset(sibs, 0, sizeof(sibs));
+      snprintf(path, sizeof(path),
+            CPU_CLASS_SYSFS "/cpu%u/topology/thread_siblings_list", i);
+      if (!cpu_class_sysfs_cpulist(path, sibs, sizeof(sibs)))
+         sibs[i] = 1;
+      for (j = 0; j < (unsigned)RTHREADS_MASK_BITS && j < CPU_CLASS_MAX_IDS; j++)
       {
-         best = khz;
-         memset(rthreads_fast_mask, 0, sizeof(rthreads_fast_mask));
+         if (!sibs[j])
+            continue;
+         RTHREADS_MASK_SET(seen, j);
+         if (RTHREADS_MASK_TEST(allowed, j)
+               && (!have_cls || RTHREADS_MASK_TEST(cls, j)))
+            core_fast = true;
       }
-      if (khz && khz == best)
-         rthreads_fast_mask[i / (8 * sizeof(unsigned long))]
-            |= 1ul << (i % (8 * sizeof(unsigned long)));
+      if (core_fast)
+         (*fast)++;
+      else
+         (*slow)++;
    }
-   /* Nothing readable, or every allowed CPU is a fast one: leave the
-    * thread where the scheduler puts it. */
-   if (!best || !memcmp(rthreads_fast_mask, allowed, sizeof(allowed)))
-      rthreads_fast_state = -1;
-   else
-      rthreads_fast_state = 1;
+   return n > 0;
 }
 #endif
 
@@ -1436,6 +1529,137 @@ static void rthreads_find_fast_cores(void)
       rthreads_fast_state = 1;
 }
 #endif
+
+#ifdef USE_WIN32_THREADS
+/* Physical cores by class. CPU Sets carry CoreIndex (offset 15) and
+ * EfficiencyClass (offset 18) per logical processor: one core per
+ * (Group, CoreIndex), fast when its class is the highest present.
+ * Before CPU Sets (Windows 10 1607) GetLogicalProcessorInformation
+ * counts cores and every one is fast. */
+static bool rthreads_win32_core_topology(unsigned *fast, unsigned *slow)
+{
+   HMODULE k32                    = GetModuleHandleA("kernel32.dll");
+   rthreads_get_cpusets_t getinfo = NULL;
+   unsigned char *buf             = NULL;
+   ULONG len                      = 0;
+   ULONG off;
+   BYTE  best                     = 0;
+   unsigned short key[256];
+   BYTE           keycls[256];
+   unsigned       nkey            = 0, i;
+
+   *fast = *slow = 0;
+   if (k32)
+      getinfo = (rthreads_get_cpusets_t)(void (*)(void))
+         GetProcAddress(k32, "GetSystemCpuSetInformation");
+   if (getinfo)
+   {
+      getinfo(NULL, 0, &len, GetCurrentProcess(), 0);
+      if (len && (buf = (unsigned char*)malloc(len))
+            && getinfo(buf, len, &len, GetCurrentProcess(), 0))
+      {
+         for (off = 0; off + 20 <= len; )
+         {
+            DWORD size = *(DWORD*)(buf + off);
+            if (size < 20)
+               break;
+            if (*(DWORD*)(buf + off + 4) == 0)
+            {
+               unsigned short k = (unsigned short)
+                  ((*(WORD*)(buf + off + 12) << 8) | buf[off + 15]);
+               BYTE cls         = buf[off + 18];
+               for (i = 0; i < nkey; i++)
+                  if (key[i] == k)
+                     break;
+               if (i == nkey && nkey < sizeof(key) / sizeof(key[0]))
+               {
+                  key[nkey]    = k;
+                  keycls[nkey] = cls;
+                  nkey++;
+               }
+               else if (i < nkey && cls > keycls[i])
+                  keycls[i] = cls;
+               if (cls > best)
+                  best = cls;
+            }
+            off += size;
+         }
+      }
+      if (buf)
+         free(buf);
+      if (nkey)
+      {
+         for (i = 0; i < nkey; i++)
+         {
+            if (keycls[i] == best)
+               (*fast)++;
+            else
+               (*slow)++;
+         }
+         return true;
+      }
+   }
+   /* Windows 7 to 10 1511: no core classes. */
+   {
+      SYSTEM_LOGICAL_PROCESSOR_INFORMATION *info = NULL;
+      DWORD n = 0;
+      GetLogicalProcessorInformation(NULL, &n);
+      if (n && (info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION*)malloc(n)))
+      {
+         if (GetLogicalProcessorInformation(info, &n))
+         {
+            DWORD c;
+            for (c = 0; c < n / sizeof(*info); c++)
+               if (info[c].Relationship == RelationProcessorCore)
+                  (*fast)++;
+         }
+         free(info);
+      }
+   }
+   return *fast > 0;
+}
+#endif
+
+bool sthread_get_core_topology(unsigned *fast, unsigned *slow)
+{
+#if defined(RTHREADS_HAVE_AFFINITY)
+   unsigned long allowed[RTHREADS_MASK_WORDS];
+   memset(allowed, 0, sizeof(allowed));
+   if (syscall(__NR_sched_getaffinity, 0, sizeof(allowed), allowed) <= 0)
+      return false;
+   return rthreads_count_cores_masked(allowed, fast, slow);
+#elif defined(USE_WIN32_THREADS)
+   return rthreads_win32_core_topology(fast, slow);
+#elif defined(__APPLE__)
+   /* macOS 12 / iOS 15 publish the per-level physical counts on Apple
+    * silicon (level 0 is the performance cluster); older systems and
+    * Intel Macs have only the total, and every core is fast. */
+   int    p = 0, e = 0, t = 0;
+   size_t l = sizeof(int);
+   if (   sysctlbyname("hw.perflevel0.physicalcpu", &p, &l, NULL, 0) == 0
+       && p > 0)
+   {
+      l = sizeof(int);
+      if (sysctlbyname("hw.perflevel1.physicalcpu", &e, &l, NULL, 0) != 0)
+         e = 0;
+      *fast = (unsigned)p;
+      *slow = (unsigned)(e > 0 ? e : 0);
+      return true;
+   }
+   l = sizeof(int);
+   if (sysctlbyname("hw.physicalcpu", &t, &l, NULL, 0) == 0 && t > 0)
+   {
+      *fast = (unsigned)t;
+      *slow = 0;
+      return true;
+   }
+   return false;
+#else
+   (void)fast;
+   (void)slow;
+   return false;
+#endif
+}
 
 bool sthread_prefer_fast_cores(void)
 {
@@ -1569,16 +1793,59 @@ bool sthread_raise_current_priority(void)
    /* Real-time round-robin at a middling priority: above every
     * time-shared thread, below anything the system runs at the top of
     * the band. Distributions that grant the audio group an rtprio
-    * limit allow this without root; where it is refused the thread
+    * limit allow this without root. Linux then falls back to what the
+    * process's rlimits allow; where nothing is granted the thread
     * simply keeps its default, which is the caller's contract. */
-   struct sched_param sp;
-   int lo  = sched_get_priority_min(SCHED_RR);
-   int hi  = sched_get_priority_max(SCHED_RR);
-   memset(&sp, 0, sizeof(sp));
-   if (lo >= 0 && hi >= lo)
    {
-      sp.sched_priority = lo + (hi - lo) / 2;
-      return pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0;
+      struct sched_param sp;
+      int lo  = sched_get_priority_min(SCHED_RR);
+      int hi  = sched_get_priority_max(SCHED_RR);
+#if defined(RTHREADS_HAVE_PRIO_RLIMITS)
+      struct rlimit rl;
+      int nice_floor;
+      int nice_now;
+#endif
+      memset(&sp, 0, sizeof(sp));
+      if (lo >= 0 && hi >= lo)
+      {
+         sp.sched_priority = lo + (hi - lo) / 2;
+         if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0)
+            return true;
+#if defined(RTHREADS_HAVE_PRIO_RLIMITS)
+         /* Without CAP_SYS_NICE a thread may take any real-time
+          * priority up to its RLIMIT_RTPRIO, so a limit below the
+          * middle of the band is asked for as it stands. */
+         if (     getrlimit(RLIMIT_RTPRIO, &rl) == 0
+               && rl.rlim_cur != RLIM_INFINITY
+               && rl.rlim_cur >= (rlim_t)lo
+               && rl.rlim_cur <  (rlim_t)sp.sched_priority)
+         {
+            sp.sched_priority = (int)rl.rlim_cur;
+            if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0)
+               return true;
+         }
+#endif
+      }
+#if defined(RTHREADS_HAVE_PRIO_RLIMITS)
+      /* With real time refused, a thread may still lower its own nice
+       * value as far as 20 - RLIMIT_NICE; on Linux the nice value
+       * belongs to the thread, named by its tid. -11 is the level a
+       * sound server takes when it cannot have real time. */
+      if (getrlimit(RLIMIT_NICE, &rl) != 0 || rl.rlim_cur == 0)
+         return false;
+      nice_floor = -11;
+      if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 31)
+         nice_floor = 20 - (int)rl.rlim_cur;
+      errno    = 0;
+      nice_now = getpriority(PRIO_PROCESS,
+            (id_t)syscall(__NR_gettid));
+      if (nice_now == -1 && errno)
+         return false;
+      if (nice_floor >= nice_now)
+         return false;
+      return setpriority(PRIO_PROCESS,
+            (id_t)syscall(__NR_gettid), nice_floor) == 0;
+#endif
    }
 #endif
    return false;
@@ -2302,7 +2569,7 @@ static INLINE void scond_pause(void)
 #if defined(SCOND_HAVE_MWAITX)
 /* AMD: park on the line holding *addr until it is written or ticks
  * TSC cycles pass (ECX bit 1 enables the timer) */
-static INLINE void scond_monitorx(const void *addr)
+static INLINE void scond_monitorx(const volatile void *addr)
 {
 #if defined(SCOND_HAVE_X86_INTRIN)
    _mm_monitorx((void*)addr, 0, 0);
@@ -2326,7 +2593,7 @@ static INLINE void scond_mwaitx(unsigned ticks)
 #if defined(SCOND_HAVE_UMWAIT)
 /* Intel WAITPKG: park on the line until written or the absolute TSC
  * deadline; control 1 asks for the lighter C0.1 state */
-static INLINE void scond_umonitor(const void *addr)
+static INLINE void scond_umonitor(const volatile void *addr)
 {
 #if defined(SCOND_HAVE_X86_INTRIN)
    _umonitor((void*)addr);

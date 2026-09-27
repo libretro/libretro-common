@@ -633,6 +633,15 @@ void task_queue_unset_threaded(void);
 bool task_queue_is_threaded(void);
 
 /**
+ * Asks that the task worker thread, once spawned, be placed on the
+ * fast cores of a mixed-core processor (see sthread_prefer_fast_cores).
+ * Takes effect at the next task_queue_init(); a worker already running
+ * is not moved. Off by default. No effect where the queue runs on the
+ * caller's thread or on GCD.
+ */
+void task_queue_set_prefer_fast_cores(bool prefer);
+
+/**
  * Calls the function given in \c find_data for each task
  * until it returns \c true for one of them,
  * or until all tasks have been searched.
@@ -775,6 +784,35 @@ void task_queue_deinit(void);
  * @see retro_task_queue_msg_t
  */
 void task_queue_init(bool threaded, retro_task_queue_msg_t msg_push);
+
+/**
+ * Bounds what one task_queue_check() may do on the calling thread,
+ * which is the thread that also drives the frame loop.
+ *
+ * Retirement: finished tasks are retired (progress push, callback,
+ * cleanup, free) on the checking thread, and a burst of completions -
+ * a thumbnail scan, a bulk download - used to retire in one call
+ * however long the callbacks took. With a budget, a check retires at
+ * least one task, then stops once @retire_max tasks or @retire_usec
+ * microseconds have gone by; the rest stay queued, still findable,
+ * for the next check.
+ *
+ * Handlers (unthreaded queue only): task handlers run on the checking
+ * thread, one call per running task per check. With a budget, a check
+ * runs at least one due handler, then stops once @handler_usec has
+ * gone by; the tasks not run keep their place at the front of the
+ * queue so the list rotates rather than starving its tail. On the
+ * threaded queue handlers run on the worker and this bound is unused.
+ *
+ * Zero for any bound means unbounded, which is the default and the
+ * behaviour before budgets existed.
+ *
+ * task_queue_wait() and task_queue_wait_timeout() loop on the check,
+ * so a budget slows a blocking wait but never changes what it waits
+ * for.
+ */
+void task_queue_set_budget(retro_time_t retire_usec, unsigned retire_max,
+      retro_time_t handler_usec);
 
 /**
  * Called when a task handler occupies the calling thread for longer
