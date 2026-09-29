@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include <queues/task_queue.h>
 
@@ -166,6 +167,7 @@ static void task_queue_push_progress(retro_task_t *task)
 {
    char buf[1024];
    bool have_msg = false;
+   bool finished;
    bool flush    = false;
 
    buf[0] = '\0';
@@ -173,6 +175,8 @@ static void task_queue_push_progress(retro_task_t *task)
 #ifdef HAVE_THREADS
    slock_lock(property_lock);
 #endif
+
+   finished = (task->flags & RETRO_TASK_FLG_FINISHED) != 0;
 
    if (task->title && (!((task->flags & RETRO_TASK_FLG_MUTE) > 0)))
    {
@@ -214,7 +218,10 @@ static void task_queue_push_progress(retro_task_t *task)
    slock_unlock(property_lock);
 #endif
 
-   if (have_msg && impl_current->msg_push)
+   /* Retirement must reach an attached frontend even when text is
+    * suppressed or a replacement title allocation failed. */
+   if (impl_current->msg_push &&
+         (have_msg || (finished && task->frontend_userdata)))
       impl_current->msg_push(task, buf, 1, 60, flush);
 }
 
@@ -443,14 +450,13 @@ static void retro_task_regular_gather(void)
          n_ran++;
       }
 
-      /* No progress push here: the gather on the main thread pushes
-       * for every running task each check, and retirement pushes the
-       * final state. The push renders text and touches widget state,
-       * which is the main thread's, not this worker's. */
+      /* This runner is already on the pumping thread. Retirement
+       * publishes finished tasks; publish running tasks here. */
       if ((task->flags & RETRO_TASK_FLG_FINISHED) > 0)
          task_queue_put(&tasks_finished, task);
       else
       {
+         task_queue_push_progress(task);
          task->next = NULL;
          if (ran_tail)
             ran_tail->next = task;
@@ -1595,6 +1601,48 @@ bool task_is_on_main_thread(void)
 #else
    return true;
 #endif
+}
+
+bool task_get_progress_snapshot(const retro_task_t *task,
+      task_progress_snapshot_t *snapshot)
+{
+   bool success = true;
+   size_t len;
+
+   snapshot->title = NULL;
+   snapshot->error = NULL;
+#ifdef HAVE_THREADS
+   slock_lock(property_lock);
+#endif
+   snapshot->flags    = task->flags;
+   snapshot->progress = task->progress;
+   if (task->title)
+   {
+      len = strlen(task->title) + 1;
+      if ((snapshot->title = (char*)malloc(len)))
+         memcpy(snapshot->title, task->title, len);
+      else
+         success = false;
+   }
+   if (success && task->error)
+   {
+      len = strlen(task->error) + 1;
+      if ((snapshot->error = (char*)malloc(len)))
+         memcpy(snapshot->error, task->error, len);
+      else
+         success = false;
+   }
+#ifdef HAVE_THREADS
+   slock_unlock(property_lock);
+#endif
+   if (!success)
+   {
+      free(snapshot->title);
+      free(snapshot->error);
+      snapshot->title = NULL;
+      snapshot->error = NULL;
+   }
+   return success;
 }
 
 void task_set_error(retro_task_t *task, char *err)
