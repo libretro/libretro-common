@@ -260,8 +260,8 @@ static struct smb2_context *smb_connect_with(const struct smb_conn_key *key, int
    smb2_set_authentication(ctx, auth);
 #ifdef HAVE_RETROSMB
    smb2_set_kerberos(ctx, key->realm, key->kdc, 0);
-   if (key->readahead)
-      smb2_set_readahead(ctx, key->readahead * 1024);
+   /* 0 is off: one request per read, as before read-ahead existed */
+   smb2_set_readahead(ctx, key->readahead * 1024);
 #endif
    if (smb2_connect_share(ctx, key->server_address, key->share, username) < 0)
    {
@@ -777,7 +777,20 @@ struct smb_prefetch
    struct smb2_context *ctx;
    struct smb_slot     *slot;
    struct smb2fh       *fh;
+   uint64_t             from_window;  /* octets served by the prefetcher */
+   uint64_t             direct;       /* octets it missed, read directly */
 };
+
+/* What the prefetchers served and missed, in KiB, over the streams
+ * closed since smb_take_readahead_stats() last took them. */
+static retro_atomic_int_t smb_ra_window_kib;
+static retro_atomic_int_t smb_ra_direct_kib;
+
+void smb_take_readahead_stats(unsigned *window_kib, unsigned *direct_kib)
+{
+   *window_kib = (unsigned)retro_atomic_exchange_int(&smb_ra_window_kib, 0);
+   *direct_kib = (unsigned)retro_atomic_exchange_int(&smb_ra_direct_kib, 0);
+}
 
 #ifdef HAVE_THREADS
 static int64_t smb_prefetch_fetch(void *user, uint64_t off, uint8_t *buf, size_t len)
@@ -800,15 +813,18 @@ static int64_t smb_prefetch_fetch(void *user, uint64_t off, uint8_t *buf, size_t
 #endif
 
 /* Start prefetching @path for a stream opened read-only. Nothing
- * happens without threads, or without a spare connection, or when the
- * window is off: the stream then reads as before. */
+ * happens without threads, without a spare connection, or with
+ * read-ahead off: the stream then reads as before, holding no second
+ * connection and no thread. */
 static void smb_prefetch_start(libretro_vfs_implementation_file *stream,
       const char *share, const char *path)
 {
 #ifdef HAVE_THREADS
    const struct smb_settings *cfg = smb_cfg_get();
    struct smb_prefetch *sp;
-   size_t window = (cfg && cfg->readahead) ? (size_t)cfg->readahead * 1024 : 1024 * 1024;
+   size_t window = cfg ? (size_t)cfg->readahead * 1024 : 0;
+   if (!window)
+      return;
    if (!(sp = (struct smb_prefetch*)calloc(1, sizeof(*sp))))
       return;
    if (!(sp->ctx = smb_take(share, &sp->slot)))
@@ -846,13 +862,15 @@ static void smb_prefetch_stop(libretro_vfs_implementation_file *stream)
    if (!sp)
       return;
    vfs_prefetch_free(sp->p);              /* joins the thread first */
+   retro_atomic_fetch_add_int(&smb_ra_window_kib, (int)((sp->from_window + 512) >> 10));
+   retro_atomic_fetch_add_int(&smb_ra_direct_kib, (int)((sp->direct + 512) >> 10));
    if (smb_ctx_active(sp->ctx))
       smb2_close(sp->ctx, sp->fh);
 #ifdef HAVE_RETROSMB
    {
       /* the pooled connection goes back with its window as configured */
       const struct smb_settings *cfg = smb_cfg_get();
-      smb2_set_readahead(sp->ctx, (cfg && cfg->readahead) ? cfg->readahead * 1024 : 1024 * 1024);
+      smb2_set_readahead(sp->ctx, cfg ? cfg->readahead * 1024 : 0);
    }
 #endif
    smb_give(sp->ctx, sp->slot);
@@ -966,6 +984,7 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
          if (got >= 0)
          {
             smb2_lseek(ctx, fh, got, SEEK_CUR, NULL);
+            sp->from_window += (uint64_t)got;
             return got;
          }
       }
@@ -993,6 +1012,9 @@ int64_t retro_vfs_file_read_smb(libretro_vfs_implementation_file *stream,
       total += (uint64_t)ret;
    }
 
+   /* a read the prefetcher had nothing ready for */
+   if (stream->smb_prefetch)
+      ((struct smb_prefetch*)(void*)(uintptr_t)stream->smb_prefetch)->direct += total;
    return (int64_t)total;
 }
 
