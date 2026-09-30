@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 /* System headers may lack SMB2_SEC_ defines but
- * will clash with deps/libsmb2 if provided here
+ * will clash with libsmb2 if provided here
  */
 #define RETRO_SMB2_SEC_UNDEFINED 0
 #define RETRO_SMB2_SEC_NTLMSSP 1
@@ -27,6 +27,11 @@ struct smb_settings {
    unsigned    num_contexts;
    unsigned    auth_mode;
    const char *subdir;
+   /* Kerberos (built-in client): the realm, and the KDC when it is not
+    * the server itself; empty realm means NTLMSSP only */
+   const char *realm;
+   const char *kdc;
+   unsigned    readahead;       /* KiB per open file; 0: the client's default */
 };
 
 typedef struct smb_settings smb_settings_t;
@@ -49,6 +54,8 @@ typedef struct {
    char **shares;
    unsigned share_count;
    unsigned share_index;
+   struct smbc_dirent ent;   /* the entry readdir returns; per handle, so
+                              * listings on different threads never share it */
 } smb_dir_handle;
 
 bool smb_init_cfg(const struct smb_settings *new_cfg);

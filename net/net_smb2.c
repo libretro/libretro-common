@@ -26,6 +26,7 @@
 #include <time.h>
 
 #include <net/net_smb2.h>
+#include <net/net_krb5.h>
 #include <net/net_compat.h>
 #include <net/net_socket.h>
 #include <crypto/crypto.h>
@@ -118,6 +119,12 @@ struct rsmb_file
    uint64_t offset;
    uint64_t size;
    uint8_t  fid[16];
+   /* read-ahead: the last fetched window, so a run of small
+    * sequential reads costs one round trip per window */
+   uint8_t *ra;
+   uint64_t ra_off;
+   size_t   ra_len;
+   size_t   ra_cap;
 };
 
 struct rsmb_dir
@@ -141,6 +148,8 @@ struct rsmb_ctx
    uint64_t message_id;
    uint32_t tree_id;
    uint32_t max_read;
+   uint32_t readahead;          /* window per file, 0 = off */
+   uint8_t  readahead_set;      /* the caller chose; keep it at negotiate */
    uint32_t max_write;
    uint32_t io_size;            /* largest single read or write */
    size_t   buf_size;           /* rx and tx capacity */
@@ -164,16 +173,23 @@ struct rsmb_ctx
    uint8_t  connected;
    char     server[256];
    char     error[128];
+   /* Kerberos: set, the session is authenticated with a ticket for
+    * cifs/@server from @krb_kdc, falling back to NTLMSSP when the
+    * KDC cannot be reached or refuses */
+   char     krb_realm[128];
+   char     krb_kdc[256];
+   uint16_t krb_port;
+   uint8_t  krb_used;           /* the session came from Kerberos */
 };
 
 /* ---- little-endian helpers ---------------------------------------- */
 
-static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-static void put32(uint8_t *p, uint32_t v) { crypto_store32_le(p, v); }
-static void put64(uint8_t *p, uint64_t v) { crypto_store64_le(p, v); }
-static unsigned get16(const uint8_t *p)   { return p[0] | ((unsigned)p[1] << 8); }
-static uint32_t get32(const uint8_t *p)   { return crypto_load32_le(p); }
-static uint64_t get64(const uint8_t *p)
+static void smb_put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void smb_put32(uint8_t *p, uint32_t v) { crypto_store32_le(p, v); }
+static void smb_put64(uint8_t *p, uint64_t v) { crypto_store64_le(p, v); }
+static unsigned smb_get16(const uint8_t *p)   { return p[0] | ((unsigned)p[1] << 8); }
+static uint32_t smb_get32(const uint8_t *p)   { return crypto_load32_le(p); }
+static uint64_t smb_get64(const uint8_t *p)
 {
    return (uint64_t)crypto_load32_le(p) | ((uint64_t)crypto_load32_le(p + 4) << 32);
 }
@@ -200,15 +216,15 @@ static size_t rsmb_utf16(const char *s, uint8_t *out, size_t cap, int path)
          if (n + 4 > cap)
             break;
          cp -= 0x10000;
-         put16(out + n,     0xd800 | (cp >> 10));
-         put16(out + n + 2, 0xdc00 | (cp & 0x3ff));
+         smb_put16(out + n,     0xd800 | (cp >> 10));
+         smb_put16(out + n + 2, 0xdc00 | (cp & 0x3ff));
          n += 4;
       }
       else
       {
          if (n + 2 > cap)
             break;
-         put16(out + n, cp);
+         smb_put16(out + n, cp);
          n += 2;
       }
    }
@@ -221,11 +237,11 @@ static void rsmb_utf8(const uint8_t *in, size_t in_len, char *out, size_t cap)
    size_t i = 0, o = 0;
    while (i + 1 < in_len && o + 4 < cap)
    {
-      uint32_t cp = get16(in + i);
+      uint32_t cp = smb_get16(in + i);
       i += 2;
       if (cp >= 0xd800 && cp < 0xdc00 && i + 1 < in_len)
       {
-         uint32_t lo = get16(in + i);
+         uint32_t lo = smb_get16(in + i);
          i += 2;
          cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
       }
@@ -314,7 +330,7 @@ static int rsmb_recv_raw(struct rsmb_ctx *c, size_t *len)
 static void rsmb_sign(struct rsmb_ctx *c, uint8_t *msg, size_t len)
 {
    uint8_t mac[32];
-   put32(msg + 16, get32(msg + 16) | SMB2_FLAGS_SIGNED);
+   smb_put32(msg + 16, smb_get32(msg + 16) | SMB2_FLAGS_SIGNED);
    memset(msg + 48, 0, 16);
    if (c->dialect >= DIALECT_300)
    {
@@ -331,7 +347,7 @@ static void rsmb_sign(struct rsmb_ctx *c, uint8_t *msg, size_t len)
 static int rsmb_verify_sig(struct rsmb_ctx *c, uint8_t *msg, size_t len)
 {
    uint8_t got[16], mac[32];
-   if (!(get32(msg + 16) & SMB2_FLAGS_SIGNED))
+   if (!(smb_get32(msg + 16) & SMB2_FLAGS_SIGNED))
       return -1;
    memcpy(got, msg + 48, 16);
    memset(msg + 48, 0, 16);
@@ -361,10 +377,10 @@ static int rsmb_seal(struct rsmb_ctx *c, uint8_t *frame, size_t msg_len)
    memset(th, 0, SMB2_TRANSFORM_HDR_SIZE);
    th[0] = 0xfd; th[1] = 'S'; th[2] = 'M'; th[3] = 'B';
    /* nonce: counter, 11 or 12 octets used */
-   put64(th + 20, ++c->nonce_counter);
-   put32(th + 36, (uint32_t)msg_len);
-   put16(th + 42, 1);                      /* Flags / EncryptionAlgorithm */
-   put64(th + 44, c->session_id);
+   smb_put64(th + 20, ++c->nonce_counter);
+   smb_put32(th + 36, (uint32_t)msg_len);
+   smb_put16(th + 42, 1);                      /* Flags / EncryptionAlgorithm */
+   smb_put64(th + 44, c->session_id);
 
    if (aes_init(&a, c->enc_key, 16) != 0)
       return -1;
@@ -395,8 +411,8 @@ static int rsmb_unseal(struct rsmb_ctx *c, size_t *len)
 
    if (*len < SMB2_TRANSFORM_HDR_SIZE)
       return -1;
-   mlen = get32(th + 36);
-   if (mlen != *len - SMB2_TRANSFORM_HDR_SIZE || get64(th + 44) != c->session_id)
+   mlen = smb_get32(th + 36);
+   if (mlen != *len - SMB2_TRANSFORM_HDR_SIZE || smb_get64(th + 44) != c->session_id)
       return -1;
    if (aes_init(&a, c->dec_key, 16) != 0)
       return -1;
@@ -426,14 +442,14 @@ static uint8_t *rsmb_begin(struct rsmb_ctx *c, unsigned cmd)
    uint8_t *h = c->tx + SMB2_TRANSFORM_HDR_SIZE;
    memset(h, 0, SMB2_HDR_SIZE);
    h[0] = 0xfe; h[1] = 'S'; h[2] = 'M'; h[3] = 'B';
-   put16(h + 4, 64);
-   put16(h + 6, (unsigned)(c->charge ? c->charge : 1));   /* CreditCharge */
-   put16(h + 12, cmd);
-   put16(h + 14, 64);                      /* CreditRequest: keep a pool */
-   put64(h + 24, c->message_id);
-   put32(h + 32, 0xfeff);                  /* ProcessId */
-   put32(h + 36, c->tree_id);
-   put64(h + 40, c->session_id);
+   smb_put16(h + 4, 64);
+   smb_put16(h + 6, (unsigned)(c->charge ? c->charge : 1));   /* CreditCharge */
+   smb_put16(h + 12, cmd);
+   smb_put16(h + 14, 64);                      /* CreditRequest: keep a pool */
+   smb_put64(h + 24, c->message_id);
+   smb_put32(h + 32, 0xfeff);                  /* ProcessId */
+   smb_put32(h + 36, c->tree_id);
+   smb_put64(h + 40, c->session_id);
    return h + SMB2_HDR_SIZE;
 }
 
@@ -441,14 +457,16 @@ static uint8_t *rsmb_begin(struct rsmb_ctx *c, unsigned cmd)
  * and reads the reply into c->rx; *body / *body_len describe the
  * reply body, c->status the NT status. Signs and seals per session
  * state; the preauth chain is fed when @preauth is set. */
-static int rsmb_call(struct rsmb_ctx *c, size_t body_len,
-      uint8_t **body, size_t *body_len_out, int preauth)
+/* Sign, seal and send the message in @c->tx; returns its id in @mid
+ * and spends its credit charge, which is cleared. */
+static int rsmb_send_msg(struct rsmb_ctx *c, size_t body_len, int preauth,
+      uint64_t *mid, unsigned *charge)
 {
    uint8_t *msg  = c->tx + SMB2_TRANSFORM_HDR_SIZE;
    size_t   len  = SMB2_HDR_SIZE + body_len;
-   size_t   rlen;
-   uint64_t mid  = c->message_id;
 
+   *mid    = c->message_id;
+   *charge = c->charge ? c->charge : 1;
    if (c->signing && c->session_ready && !c->encrypt)
       rsmb_sign(c, msg, len);
    if (preauth && c->dialect == DIALECT_311)
@@ -460,7 +478,9 @@ static int rsmb_call(struct rsmb_ctx *c, size_t body_len,
       sha512_stream_final(&s, c->preauth);
    }
    /* a multi-credit message consumes as many ids as its charge */
-   c->message_id += c->charge ? c->charge : 1;
+   c->message_id += *charge;
+   c->credits    -= (int)*charge;
+   c->charge      = 0;
 
    if (c->encrypt)
    {
@@ -469,47 +489,63 @@ static int rsmb_call(struct rsmb_ctx *c, size_t body_len,
          rsmb_err(c, "seal failed");
          return -1;
       }
-      if (rsmb_send_raw(c, c->tx, SMB2_TRANSFORM_HDR_SIZE + len) != 0)
-         return -1;
+      return rsmb_send_raw(c, c->tx, SMB2_TRANSFORM_HDR_SIZE + len);
    }
-   else if (rsmb_send_raw(c, msg, len) != 0)
-      return -1;
+   return rsmb_send_raw(c, msg, len);
+}
 
+/* Receive the next real reply (interim STATUS_PENDING ones are
+ * skipped) into @c->rx, unsealed and verified; its id in @mid, its
+ * status in c->status, its credit grant added to the balance. */
+static int rsmb_recv_msg(struct rsmb_ctx *c, size_t *rlen, uint64_t *mid)
+{
    for (;;)
    {
-      if (rsmb_recv_raw(c, &rlen) != 0)
+      if (rsmb_recv_raw(c, rlen) != 0)
          return -1;
       if (c->rx[0] == 0xfd)
       {
-         if (!c->encrypt || rsmb_unseal(c, &rlen) != 0)
+         if (!c->encrypt || rsmb_unseal(c, rlen) != 0)
          {
             rsmb_err(c, "unseal failed");
             return -1;
          }
       }
-      if (rlen < SMB2_HDR_SIZE || c->rx[0] != 0xfe)
+      if (*rlen < SMB2_HDR_SIZE || c->rx[0] != 0xfe)
       {
          rsmb_err(c, "bad response");
          return -1;
       }
-      /* STATUS_PENDING interim replies carry our id and 0x103. */
-      if (get64(c->rx + 24) != mid)
-         continue;
-      if (get32(c->rx + 8) == 0x00000103 && (get32(c->rx + 16) & 0x2))
+      if (smb_get32(c->rx + 8) == 0x00000103 && (smb_get32(c->rx + 16) & 0x2))
          continue;
       break;
    }
-
-   c->status = get32(c->rx + 8);
-   /* credit balance: what this reply grants, less what the message spent */
-   c->credits += (int)get16(c->rx + 14) - (int)(c->charge ? c->charge : 1);
-   c->charge   = 0;
+   *mid      = smb_get64(c->rx + 24);
+   c->status = smb_get32(c->rx + 8);
+   c->credits += (int)smb_get16(c->rx + 14);
    if (c->signing && c->session_ready && !c->encrypt
-         && rsmb_verify_sig(c, c->rx, rlen) != 0)
+         && rsmb_verify_sig(c, c->rx, *rlen) != 0)
    {
       rsmb_err(c, "bad signature");
       return -1;
    }
+   return 0;
+}
+
+static int rsmb_call(struct rsmb_ctx *c, size_t body_len,
+      uint8_t **body, size_t *body_len_out, int preauth)
+{
+   size_t   rlen;
+   uint64_t mid, got;
+   unsigned charge;
+
+   if (rsmb_send_msg(c, body_len, preauth, &mid, &charge) != 0)
+      return -1;
+   do
+   {
+      if (rsmb_recv_msg(c, &rlen, &got) != 0)
+         return -1;
+   } while (got != mid);
    if (preauth && c->dialect == DIALECT_311
          && c->status == STATUS_MORE_PROCESSING_REQUIRED)
    {
@@ -535,29 +571,29 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
    unsigned i;
 
    memset(b, 0, 36);
-   put16(b, 36);
-   put16(b + 2, 5);                        /* DialectCount */
-   put16(b + 4, 1);                        /* SecurityMode: signing enabled */
-   put32(b + 8, 0x40);                     /* Capabilities: ENCRYPTION */
+   smb_put16(b, 36);
+   smb_put16(b + 2, 5);                        /* DialectCount */
+   smb_put16(b + 4, 1);                        /* SecurityMode: signing enabled */
+   smb_put32(b + 8, 0x40);                     /* Capabilities: ENCRYPTION */
    crypto_random_bytes(b + 12, 16);        /* ClientGuid */
    for (i = 0; i < 5; i++)
-      put16(b + 36 + 2 * i, dialects[i]);
+      smb_put16(b + 36 + 2 * i, dialects[i]);
    off = 36 + 10;
    /* 3.1.1 contexts, 8-byte aligned from the header start */
    while ((SMB2_HDR_SIZE + off) & 7)
       b[off++] = 0;
-   put32(b + 28, (uint32_t)(SMB2_HDR_SIZE + off));   /* NegotiateContextOffset */
-   put16(b + 32, 2);                                 /* NegotiateContextCount */
+   smb_put32(b + 28, (uint32_t)(SMB2_HDR_SIZE + off));   /* NegotiateContextOffset */
+   smb_put16(b + 32, 2);                                 /* NegotiateContextCount */
    /* PREAUTH_INTEGRITY_CAPABILITIES */
-   put16(b + off, 1); put16(b + off + 2, 38); put32(b + off + 4, 0);
-   put16(b + off + 8, 1); put16(b + off + 10, 32); put16(b + off + 12, 1);
+   smb_put16(b + off, 1); smb_put16(b + off + 2, 38); smb_put32(b + off + 4, 0);
+   smb_put16(b + off + 8, 1); smb_put16(b + off + 10, 32); smb_put16(b + off + 12, 1);
    crypto_random_bytes(b + off + 14, 32);
    off += 8 + 38;
    while ((SMB2_HDR_SIZE + off) & 7)
       b[off++] = 0;
    /* ENCRYPTION_CAPABILITIES: GCM preferred, CCM */
-   put16(b + off, 2); put16(b + off + 2, 6); put32(b + off + 4, 0);
-   put16(b + off + 8, 2); put16(b + off + 10, CIPHER_AES128_GCM); put16(b + off + 12, CIPHER_AES128_CCM);
+   smb_put16(b + off, 2); smb_put16(b + off + 2, 6); smb_put32(b + off + 4, 0);
+   smb_put16(b + off + 8, 2); smb_put16(b + off + 10, CIPHER_AES128_GCM); smb_put16(b + off + 12, CIPHER_AES128_CCM);
    off += 8 + 6;
 
    memset(c->preauth, 0, 64);
@@ -569,9 +605,11 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
       rsmb_err(c, "negotiate refused");
       return -1;
    }
-   c->dialect   = get16(r + 4);
-   c->max_read  = get32(r + 32);
-   c->max_write = get32(r + 36);
+   c->dialect   = smb_get16(r + 4);
+   c->max_read  = smb_get32(r + 32);
+   if (!c->readahead_set)
+      c->readahead = SMB2_LARGE_IO;
+   c->max_write = smb_get32(r + 36);
    /* Large I/O needs multi-credit requests, which 2.0.2 does not have. */
    {
       uint32_t cap = c->dialect == DIALECT_202 ? SMB2_MAX_IO : SMB2_LARGE_IO;
@@ -590,8 +628,8 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
       /* preauth: the response is chained too (status was SUCCESS so
        * rsmb_call did not do it) */
       struct sha512_state s;
-      unsigned n = get16(r + 6);
-      size_t   coff = get32(r + 60);
+      unsigned n = smb_get16(r + 6);
+      size_t   coff = smb_get32(r + 60);
       sha512_stream_init(&s, 0);
       sha512_stream_update(&s, c->preauth, 64);
       sha512_stream_update(&s, c->rx, rlen + SMB2_HDR_SIZE);
@@ -599,9 +637,9 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
       for (i = 0; i < n && coff + 8 <= rlen + SMB2_HDR_SIZE; i++)
       {
          const uint8_t *ctx = c->rx + coff;
-         unsigned type = get16(ctx), dlen = get16(ctx + 2);
+         unsigned type = smb_get16(ctx), dlen = smb_get16(ctx + 2);
          if (type == 2 && dlen >= 4)
-            c->cipher = get16(ctx + 10);
+            c->cipher = smb_get16(ctx + 10);
          coff += 8 + dlen;
          while (coff & 7)
             coff++;
@@ -642,6 +680,7 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
 
 static const uint8_t oid_spnego[] = {0x06,0x06,0x2b,0x06,0x01,0x05,0x05,0x02};
 static const uint8_t oid_ntlmssp[] = {0x06,0x0a,0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x02,0x0a};
+static const uint8_t oid_krb5[]    = {0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x12,0x01,0x02,0x02};
 
 /* DER length: short form or 0x82 nn nn (nothing here exceeds 64K). */
 static size_t der_len(uint8_t *p, size_t n)
@@ -652,11 +691,13 @@ static size_t der_len(uint8_t *p, size_t n)
 }
 
 /* NegTokenInit: [APPLICATION 0] { OID spnego, [0] { SEQ { [0] mechTypes
- * { OID ntlmssp }, [2] mechToken OCTET STRING } } } */
-static size_t spnego_init(uint8_t *out, const uint8_t *tok, size_t tok_len)
+ * { OID mech }, [2] mechToken OCTET STRING } } }; @mech is ntlmssp or
+ * krb5 (the token being NTLMSSP NEGOTIATE or the RFC 4121 AP-REQ). */
+static size_t spnego_init_mech(uint8_t *out, const uint8_t *mech, size_t mech_len,
+      const uint8_t *tok, size_t tok_len)
 {
    uint8_t  tmp[16];
-   size_t   mech_types = 2 + sizeof(oid_ntlmssp);          /* 30 len OID */
+   size_t   mech_types = 2 + mech_len;                     /* 30 len OID */
    size_t   a0 = 2 + mech_types;                           /* a0 len SEQ */
    size_t   octet = 1 + der_len(tmp, tok_len) + tok_len;   /* 04 len tok */
    size_t   a2 = 1 + der_len(tmp, octet) + octet;
@@ -671,12 +712,146 @@ static size_t spnego_init(uint8_t *out, const uint8_t *tok, size_t tok_len)
    *p++ = 0xa0; p += der_len(p, inner);
    *p++ = 0x30; p += der_len(p, seq);
    *p++ = 0xa0; *p++ = (uint8_t)mech_types;
-   *p++ = 0x30; *p++ = (uint8_t)sizeof(oid_ntlmssp);
-   memcpy(p, oid_ntlmssp, sizeof(oid_ntlmssp)); p += sizeof(oid_ntlmssp);
+   *p++ = 0x30; *p++ = (uint8_t)mech_len;
+   memcpy(p, mech, mech_len); p += mech_len;
    *p++ = 0xa2; p += der_len(p, octet);
    *p++ = 0x04; p += der_len(p, tok_len);
    memcpy(p, tok, tok_len); p += tok_len;
    return (size_t)(p - out);
+}
+
+static size_t spnego_init(uint8_t *out, const uint8_t *tok, size_t tok_len)
+{
+   return spnego_init_mech(out, oid_ntlmssp, sizeof(oid_ntlmssp), tok, tok_len);
+}
+
+/* The Kerberos reply inside a NegTokenResp: the responseToken is the
+ * RFC 4121 AP-REP token, 0x60 len { OID krb5, 02 00, ... }; find it by
+ * its OID and TOK_ID. */
+static const uint8_t *spnego_find_krb5_rep(const uint8_t *blob, size_t len, size_t *tok_len)
+{
+   size_t i;
+   for (i = 0; i + 4 + sizeof(oid_krb5) + 2 <= len; i++)
+   {
+      size_t h, n;
+      if (blob[i] != 0x60)
+         continue;
+      n = blob[i + 1];
+      if (n & 0x80)
+      {
+         unsigned k = n & 0x7f, j;
+         if (k > 2 || i + 2 + k > len)
+            continue;
+         n = 0;
+         for (j = 0; j < k; j++)
+            n = (n << 8) | blob[i + 2 + j];
+         h = 2 + k;
+      }
+      else
+         h = 2;
+      if (i + h + n > len || n < sizeof(oid_krb5) + 2)
+         continue;
+      if (memcmp(blob + i + h, oid_krb5, sizeof(oid_krb5)) != 0
+            || blob[i + h + sizeof(oid_krb5)] != 0x02 || blob[i + h + sizeof(oid_krb5) + 1] != 0x00)
+         continue;
+      *tok_len = h + n;
+      return blob + i;
+   }
+   return NULL;
+}
+
+/* Signing and sealing keys from the 16-octet session key, per dialect. */
+static void rsmb_derive_session_keys(struct rsmb_ctx *c)
+{
+   if (c->dialect == DIALECT_311)
+   {
+      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBSigningKey", 14, c->preauth, 64, c->signing_key, 16);
+      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBC2SCipherKey", 16, c->preauth, 64, c->enc_key, 16);
+      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBS2CCipherKey", 16, c->preauth, 64, c->dec_key, 16);
+   }
+   else if (c->dialect >= DIALECT_300)
+   {
+      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMB2AESCMAC", 12, (const uint8_t*)"SmbSign", 8, c->signing_key, 16);
+      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMB2AESCCM", 11, (const uint8_t*)"ServerIn ", 10, c->enc_key, 16);
+      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMB2AESCCM", 11, (const uint8_t*)"ServerOut", 10, c->dec_key, 16);
+   }
+   else
+      memcpy(c->signing_key, c->session_key, 16);
+}
+
+/* One SESSION_SETUP with a Kerberos ticket. Returns 0 with the session
+ * key set, 1 when Kerberos could not be used (the caller falls back to
+ * NTLMSSP), -1 on a transport failure. */
+static int rsmb_session_setup_krb5(struct rsmb_ctx *c)
+{
+   struct krb5_ctx *k;
+   uint8_t *b, *r, *tok;
+   size_t   rlen, blen, tok_len = 0;
+   char     service[300];
+   uint8_t  key[32];
+   size_t   key_len;
+   int      rc = 1;
+
+   if (!(k = krb5_new()))
+      return 1;
+   if (!(tok = (uint8_t*)malloc(4096)))
+   {
+      krb5_free(k);
+      return 1;
+   }
+   krb5_set_kdc(k, c->krb_realm, c->krb_kdc[0] ? c->krb_kdc : c->server, c->krb_port);
+   krb5_set_timeout(k, c->timeout);
+   strlcpy(service, "cifs/", sizeof(service));
+   strlcat(service, c->server, sizeof(service));
+   if (krb5_get_tgt(k, c->user ? c->user : "", c->password ? c->password : "") != 0
+         || krb5_get_service_ticket(k, service) != 0
+         || krb5_gss_init_token(k, tok, 4096, &tok_len) != 0)
+   {
+      rsmb_err(c, krb5_get_error(k));
+      goto out;
+   }
+
+   b = rsmb_begin(c, SMB2_SESSION_SETUP);
+   memset(b, 0, 24);
+   smb_put16(b, 25);
+   b[3] = 1;
+   smb_put16(b + 12, SMB2_HDR_SIZE + 24);
+   blen = spnego_init_mech(b + 24, oid_krb5, sizeof(oid_krb5), tok, tok_len);
+   smb_put16(b + 14, (unsigned)blen);
+   if (rsmb_call(c, 24 + blen, &r, &rlen, 1) != 0)
+   {
+      rc = -1;
+      goto out;
+   }
+   if (c->status != STATUS_SUCCESS || rlen < 8)
+   {
+      rsmb_err(c, c->status == STATUS_LOGON_FAILURE ? "Kerberos logon refused" : "Kerberos session setup failed");
+      goto out;
+   }
+   c->session_id = smb_get64(c->rx + 40);
+   {
+      size_t boff = smb_get16(r + 4), bl = smb_get16(r + 6);
+      const uint8_t *rep;
+      size_t rep_len;
+      if (boff < SMB2_HDR_SIZE || boff + bl > rlen + SMB2_HDR_SIZE
+            || !(rep = spnego_find_krb5_rep(c->rx + boff, bl, &rep_len))
+            || krb5_gss_accept_token(k, rep, rep_len) != 0
+            || krb5_gss_session_key(k, key, &key_len) != 0)
+      {
+         rsmb_err(c, "server did not prove itself (no valid AP-REP)");
+         goto out;
+      }
+   }
+   /* MS-SMB2 3.2.5.3.1: the first 16 octets of the GSS key */
+   memcpy(c->session_key, key, 16);
+   crypto_memzero(key, sizeof(key));
+   c->krb_used = 1;
+   rc = 0;
+out:
+   crypto_memzero(tok, 4096);
+   free(tok);
+   krb5_free(k);
+   return rc;
 }
 
 /* NegTokenResp: [1] { SEQ { [2] responseToken OCTET STRING } } */
@@ -710,7 +885,43 @@ static const uint8_t *spnego_find_ntlm(const uint8_t *blob, size_t len, size_t *
    return NULL;
 }
 
+static int rsmb_session_setup_ntlm(struct rsmb_ctx *c);
+
+/* Kerberos first when a realm is configured; a KDC that cannot be
+ * reached or a refused ticket falls through to NTLMSSP, and if that
+ * fails too the error names both reasons. */
 static int rsmb_session_setup(struct rsmb_ctx *c)
+{
+   char krb_err[128];
+   int  kr, nr;
+
+   if (!c->krb_realm[0])
+      return rsmb_session_setup_ntlm(c);
+   kr = rsmb_session_setup_krb5(c);
+   if (kr == 0)
+   {
+      rsmb_derive_session_keys(c);
+      c->session_ready = 1;
+      return 0;
+   }
+   if (kr < 0)
+      return -1;
+   strlcpy(krb_err, c->error, sizeof(krb_err));
+   c->session_id = 0;
+   nr = rsmb_session_setup_ntlm(c);
+   if (nr != 0)
+   {
+      char both[128];
+      strlcpy(both, "Kerberos: ", sizeof(both));
+      strlcat(both, krb_err, sizeof(both));
+      strlcat(both, "; NTLMSSP: ", sizeof(both));
+      strlcat(both, c->error, sizeof(both));
+      strlcpy(c->error, both, sizeof(c->error));
+   }
+   return nr;
+}
+
+static int rsmb_session_setup_ntlm(struct rsmb_ctx *c)
 {
    uint8_t *b, *r;
    size_t   rlen, blen;
@@ -734,22 +945,22 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
    /* --- NEGOTIATE_MESSAGE --- */
    memset(neg, 0, sizeof(neg));
    memcpy(neg, "NTLMSSP", 8);
-   put32(neg + 8, 1);
+   smb_put32(neg + 8, 1);
    /* No NTLMSSP_NEGOTIATE_SIGN: SMB2 signs with the session key
     * itself, and asking NTLMSSP for integrity makes SPNEGO demand a
     * third leg carrying a mechListMIC (NTLMSSP signatures, RC4). */
-   put32(neg + 12, NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_REQUEST_TARGET
+   smb_put32(neg + 12, NTLMSSP_NEGOTIATE_UNICODE | NTLMSSP_REQUEST_TARGET
          | NTLMSSP_NEGOTIATE_NTLM | NTLMSSP_NEGOTIATE_ALWAYS_SIGN | NTLMSSP_NEGOTIATE_EXT_SESSSEC
          | NTLMSSP_NEGOTIATE_128 | NTLMSSP_NEGOTIATE_56);
-   put32(neg + 20, 40); put32(neg + 28, 40);   /* empty domain / workstation at offset 40 */
+   smb_put32(neg + 20, 40); smb_put32(neg + 28, 40);   /* empty domain / workstation at offset 40 */
 
    b = rsmb_begin(c, SMB2_SESSION_SETUP);
    memset(b, 0, 24);
-   put16(b, 25);
+   smb_put16(b, 25);
    b[3] = 1;                                   /* SecurityMode: signing enabled */
-   put16(b + 12, SMB2_HDR_SIZE + 24);
+   smb_put16(b + 12, SMB2_HDR_SIZE + 24);
    blen = spnego_init(b + 24, neg, 32);
-   put16(b + 14, (unsigned)blen);
+   smb_put16(b + 14, (unsigned)blen);
    if (rsmb_call(c, 24 + blen, &r, &rlen, 1) != 0)
       return -1;
    if (c->status != STATUS_MORE_PROCESSING_REQUIRED || rlen < 8)
@@ -757,9 +968,9 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
       rsmb_err(c, "session setup refused");
       return -1;
    }
-   c->session_id = get64(c->rx + 40);
+   c->session_id = smb_get64(c->rx + 40);
    {
-      size_t boff = get16(r + 4), bl = get16(r + 6);
+      size_t boff = smb_get16(r + 4), bl = smb_get16(r + 6);
       if (boff < SMB2_HDR_SIZE || boff + bl > rlen + SMB2_HDR_SIZE)
       {
          rsmb_err(c, "bad challenge");
@@ -767,19 +978,19 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
       }
       chal = (uint8_t*)spnego_find_ntlm(c->rx + boff, bl, &chal_len);
    }
-   if (!chal || chal_len < 56 || get32(chal + 8) != 2)
+   if (!chal || chal_len < 56 || smb_get32(chal + 8) != 2)
    {
       rsmb_err(c, "bad challenge");
       return -1;
    }
    /* --- CHALLENGE_MESSAGE --- */
    memcpy(server_chal, chal + 24, 8);
-   chal_flags = get32(chal + 20);
+   chal_flags = smb_get32(chal + 20);
    if (chal_flags & NTLMSSP_NEGOTIATE_TARGET_INFO)
    {
-      tinfo_len = get16(chal + 40);
+      tinfo_len = smb_get16(chal + 40);
       {
-         size_t toff = get32(chal + 44);
+         size_t toff = smb_get32(chal + 44);
          if (toff + tinfo_len > chal_len)
          {
             rsmb_err(c, "bad challenge");
@@ -798,7 +1009,7 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
    }
    /* tinfo pointed into c->rx; point it at the copy */
    if (tinfo_len)
-      tinfo = chal + get32(chal + 44);
+      tinfo = chal + smb_get32(chal + 44);
 
    /* --- AUTHENTICATE_MESSAGE --- */
    if (ntlm_ntowf_v2(c->password ? c->password : "", c->user ? c->user : "",
@@ -823,21 +1034,21 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
       blob = auth + 88 + 24 + 16;  /* NT response goes right after LM (24) and NTProof (16) */
       memset(blob, 0, bl);
       blob[0] = 1; blob[1] = 1;
-      put64(blob + 8, ft);
+      smb_put64(blob + 8, ft);
       memcpy(blob + 16, client_chal, 8);
       /* target info with MsvAvFlags (0x0002 = MIC present) inserted before MsvAvEOL */
       if (tinfo_len >= 4)
       {
          memcpy(blob + 28, tinfo, tinfo_len - 4);        /* all but EOL */
-         put16(blob + 28 + tinfo_len - 4, 6);              /* MsvAvFlags */
-         put16(blob + 28 + tinfo_len - 2, 4);
-         put32(blob + 28 + tinfo_len, 0x2);
-         put32(blob + 28 + tinfo_len + 4, 0);              /* MsvAvEOL */
+         smb_put16(blob + 28 + tinfo_len - 4, 6);              /* MsvAvFlags */
+         smb_put16(blob + 28 + tinfo_len - 2, 4);
+         smb_put32(blob + 28 + tinfo_len, 0x2);
+         smb_put32(blob + 28 + tinfo_len + 4, 0);              /* MsvAvEOL */
          blob_len = 28 + tinfo_len + 8 + 4;
       }
       else
       {
-         put32(blob + 28, 0);
+         smb_put32(blob + 28, 0);
          blob_len = 28 + 4 + 4;
       }
       /* NTProofStr = HMAC-MD5(ntowf, serverchal || blob) */
@@ -870,14 +1081,14 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
 
       memset(auth, 0, 88);
       memcpy(auth, "NTLMSSP", 8);
-      put32(auth + 8, 3);
-      put16(auth + 12, 24); put16(auth + 14, 24); put32(auth + 16, 88);            /* LM */
-      put16(auth + 20, (unsigned)nt_len); put16(auth + 22, (unsigned)nt_len); put32(auth + 24, 88 + 24);
-      put16(auth + 28, (unsigned)dom_len); put16(auth + 30, (unsigned)dom_len); put32(auth + 32, (uint32_t)(88 + 24 + nt_len));
-      put16(auth + 36, (unsigned)user_len); put16(auth + 38, (unsigned)user_len); put32(auth + 40, (uint32_t)(88 + 24 + nt_len + dom_len));
-      put16(auth + 44, 0); put16(auth + 46, 0); put32(auth + 48, (uint32_t)auth_len);   /* workstation */
-      put16(auth + 52, 0); put16(auth + 54, 0); put32(auth + 56, (uint32_t)auth_len);   /* session key */
-      put32(auth + 60, (chal_flags & ~(uint32_t)0x40000000) | NTLMSSP_NEGOTIATE_UNICODE);
+      smb_put32(auth + 8, 3);
+      smb_put16(auth + 12, 24); smb_put16(auth + 14, 24); smb_put32(auth + 16, 88);            /* LM */
+      smb_put16(auth + 20, (unsigned)nt_len); smb_put16(auth + 22, (unsigned)nt_len); smb_put32(auth + 24, 88 + 24);
+      smb_put16(auth + 28, (unsigned)dom_len); smb_put16(auth + 30, (unsigned)dom_len); smb_put32(auth + 32, (uint32_t)(88 + 24 + nt_len));
+      smb_put16(auth + 36, (unsigned)user_len); smb_put16(auth + 38, (unsigned)user_len); smb_put32(auth + 40, (uint32_t)(88 + 24 + nt_len + dom_len));
+      smb_put16(auth + 44, 0); smb_put16(auth + 46, 0); smb_put32(auth + 48, (uint32_t)auth_len);   /* workstation */
+      smb_put16(auth + 52, 0); smb_put16(auth + 54, 0); smb_put32(auth + 56, (uint32_t)auth_len);   /* session key */
+      smb_put32(auth + 60, (chal_flags & ~(uint32_t)0x40000000) | NTLMSSP_NEGOTIATE_UNICODE);
       memset(auth + 88, 0, 24);   /* LM response: zeros */
       /* MIC over NEGOTIATE || CHALLENGE || AUTHENTICATE(MIC = 0) */
       {
@@ -898,11 +1109,11 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
 
    b = rsmb_begin(c, SMB2_SESSION_SETUP);
    memset(b, 0, 24);
-   put16(b, 25);
+   smb_put16(b, 25);
    b[3] = 1;
-   put16(b + 12, SMB2_HDR_SIZE + 24);
+   smb_put16(b + 12, SMB2_HDR_SIZE + 24);
    blen = spnego_resp(b + 24, auth, auth_len);
-   put16(b + 14, (unsigned)blen);
+   smb_put16(b + 14, (unsigned)blen);
    free(auth);
    free(chal);
    crypto_memzero(ntowf, sizeof(ntowf));
@@ -920,22 +1131,7 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
       goto done;
    }
 
-   /* keys */
-   if (c->dialect == DIALECT_311)
-   {
-      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBSigningKey", 14, c->preauth, 64, c->signing_key, 16);
-      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBC2SCipherKey", 16, c->preauth, 64, c->enc_key, 16);
-      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBS2CCipherKey", 16, c->preauth, 64, c->dec_key, 16);
-   }
-   else if (c->dialect >= DIALECT_300)
-   {
-      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMB2AESCMAC", 12, (const uint8_t*)"SmbSign", 8, c->signing_key, 16);
-      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMB2AESCCM", 11, (const uint8_t*)"ServerIn ", 10, c->enc_key, 16);
-      kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMB2AESCCM", 11, (const uint8_t*)"ServerOut", 10, c->dec_key, 16);
-   }
-   else
-      memcpy(c->signing_key, c->session_key, 16);
-
+   rsmb_derive_session_keys(c);
    c->session_ready = 1;
 
    /* SessionFlags. A guest (0x0001) or anonymous/null (0x0002) session
@@ -943,9 +1139,9 @@ static int rsmb_session_setup(struct rsmb_ctx *c)
     * is turned off for it and the final response is not checked - the
     * server returns SUCCESS on it unsigned, which would otherwise read
     * as a bad signature (MS-SMB2 3.2.5.3.1). */
-   if (get16(r + 2) & 0x3)
+   if (smb_get16(r + 2) & 0x3)
       c->signing = 0;
-   if ((get16(r + 2) & 0x4) && c->cipher)
+   if ((smb_get16(r + 2) & 0x4) && c->cipher)
       c->encrypt = 1;
 
    /* the final response is signed with the new key: check it now */
@@ -977,10 +1173,10 @@ static int rsmb_tree_connect(struct rsmb_ctx *c, const char *share)
    pl = strlcat(path, share, sizeof(path));
    (void)pl;
    memset(b, 0, 8);
-   put16(b, 9);
-   put16(b + 4, SMB2_HDR_SIZE + 8);
+   smb_put16(b, 9);
+   smb_put16(b + 4, SMB2_HDR_SIZE + 8);
    plen = rsmb_utf16(path, b + 8, 1024, 0);
-   put16(b + 6, (unsigned)plen);
+   smb_put16(b + 6, (unsigned)plen);
    if (rsmb_call(c, 8 + plen, &r, &rlen, 0) != 0)
       return -1;
    if (c->status != STATUS_SUCCESS || rlen < 16)
@@ -988,8 +1184,8 @@ static int rsmb_tree_connect(struct rsmb_ctx *c, const char *share)
       rsmb_err(c, "tree connect refused");
       return -1;
    }
-   c->tree_id = get32(c->rx + 36);
-   if ((get32(r + 4) & 0x8000) && c->cipher)   /* SMB2_SHAREFLAG_ENCRYPT_DATA */
+   c->tree_id = smb_get32(c->rx + 36);
+   if ((smb_get32(r + 4) & 0x8000) && c->cipher)   /* SMB2_SHAREFLAG_ENCRYPT_DATA */
       c->encrypt = 1;
    return 0;
 }
@@ -1058,6 +1254,15 @@ void rsmb_set_domain(struct rsmb_ctx *c, const char *domain)     { rsmb_set_str(
 
 void rsmb_set_port(struct rsmb_ctx *c, uint16_t port) { c->port = port; }
 
+void rsmb_set_kerberos(struct rsmb_ctx *c, const char *realm, const char *kdc, uint16_t port)
+{
+   strlcpy(c->krb_realm, realm ? realm : "", sizeof(c->krb_realm));
+   strlcpy(c->krb_kdc, kdc ? kdc : "", sizeof(c->krb_kdc));
+   c->krb_port = port;
+}
+
+int rsmb_used_kerberos(const struct rsmb_ctx *c) { return c->krb_used; }
+
 void rsmb_set_timeout(struct rsmb_ctx *c, unsigned seconds)
 {
    c->timeout = seconds ? seconds : 10;
@@ -1121,11 +1326,11 @@ void rsmb_disconnect(struct rsmb_ctx *c)
    if (c->connected)
    {
       uint8_t *b = rsmb_begin(c, SMB2_TREE_DISCONNECT);
-      put16(b, 4); put16(b + 2, 0);
+      smb_put16(b, 4); smb_put16(b + 2, 0);
       rsmb_call(c, 4, &r, &rlen, 0);
       c->tree_id = 0;
       b = rsmb_begin(c, SMB2_LOGOFF);
-      put16(b, 4); put16(b + 2, 0);
+      smb_put16(b, 4); smb_put16(b + 2, 0);
       rsmb_call(c, 4, &r, &rlen, 0);
    }
    socket_close(c->fd);
@@ -1167,17 +1372,17 @@ static int rsmb_create(struct rsmb_ctx *c, const char *path,
    while (*path == '/' || *path == '\\')
       path++;
    memset(b, 0, 56);
-   put16(b, 57);
+   smb_put16(b, 57);
    b[3] = 0;                                 /* oplock: none */
-   put32(b + 4, 2);                          /* impersonation: impersonation */
-   put32(b + 24, access);
-   put32(b + 28, 0x80);                      /* FILE_ATTRIBUTE_NORMAL */
-   put32(b + 32, SMB2_FILE_SHARE_ALL);
-   put32(b + 36, disposition);
-   put32(b + 40, options);
-   put16(b + 44, SMB2_HDR_SIZE + 56);
+   smb_put32(b + 4, 2);                          /* impersonation: impersonation */
+   smb_put32(b + 24, access);
+   smb_put32(b + 28, 0x80);                      /* FILE_ATTRIBUTE_NORMAL */
+   smb_put32(b + 32, SMB2_FILE_SHARE_ALL);
+   smb_put32(b + 36, disposition);
+   smb_put32(b + 40, options);
+   smb_put16(b + 44, SMB2_HDR_SIZE + 56);
    nlen = rsmb_utf16(path, b + 56, 2048, 1);
-   put16(b + 46, (unsigned)nlen);
+   smb_put16(b + 46, (unsigned)nlen);
    if (!nlen)
       b[56] = 0;                             /* empty name: the share root */
    if (rsmb_call(c, 56 + (nlen ? nlen : 1), &r, &rlen, 0) != 0)
@@ -1189,9 +1394,9 @@ static int rsmb_create(struct rsmb_ctx *c, const char *path,
    }
    memcpy(fid, r + 64, 16);
    if (size)
-      *size = get64(r + 48);
+      *size = smb_get64(r + 48);
    if (is_dir)
-      *is_dir = (get32(r + 56) & SMB2_FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+      *is_dir = (smb_get32(r + 56) & SMB2_FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
    return 0;
 }
 
@@ -1201,7 +1406,7 @@ static int rsmb_close_fid(struct rsmb_ctx *c, const uint8_t *fid)
    uint8_t *r;
    size_t   rlen;
    memset(b, 0, 24);
-   put16(b, 24);
+   smb_put16(b, 24);
    memcpy(b + 8, fid, 16);
    if (rsmb_call(c, 24, &r, &rlen, 0) != 0)
       return -1;
@@ -1235,62 +1440,185 @@ struct rsmb_file *rsmb_open(struct rsmb_ctx *c, const char *path, int flags)
    return f;
 }
 
+/* Up to this many READ requests in flight at once: the fetch of a
+ * window runs near line rate instead of one round trip per chunk. */
+#define RSMB_PIPELINE 8
+
+/* Fetch @len octets at @off into @out with pipelined READs. Returns
+ * the octets read (short at end of file), -1 on a failure. Requests
+ * are issued while credits last and replies matched by id, so a
+ * server answering out of order is fine. */
+static int64_t rsmb_fetch(struct rsmb_ctx *c, struct rsmb_file *f,
+      uint64_t off, uint8_t *out, size_t len)
+{
+   uint64_t mids[RSMB_PIPELINE];
+   size_t   offs[RSMB_PIPELINE], lens[RSMB_PIPELINE];
+   unsigned inflight = 0, i;
+   size_t   sent = 0, end = 0;     /* contiguous data: up to the first short reply */
+   int      eof = 0, fail = 0, short_at = 0;
+
+   while ((sent < len && !eof && !fail) || inflight)
+   {
+      /* issue while there is room, work and credit */
+      while (inflight < RSMB_PIPELINE && sent < len && !eof && !fail)
+      {
+         size_t   n = len - sent;
+         unsigned charge;
+         uint8_t *b;
+         if (n > c->max_read)
+            n = c->max_read;
+         charge = (unsigned)((n + SMB2_MAX_IO - 1) / SMB2_MAX_IO);
+         if (charge > 1 && c->credits < (int)charge)
+         {
+            if (inflight)
+               break;                        /* wait for grants */
+            charge = c->credits > 0 ? (unsigned)c->credits : 1;
+            n = (size_t)charge * SMB2_MAX_IO;
+            if (n > len - sent)
+               n = len - sent;
+         }
+         else if (charge <= 1 && c->credits < 1 && inflight)
+            break;
+         c->charge = charge;
+         b = rsmb_begin(c, SMB2_READ);
+         memset(b, 0, 49);
+         smb_put16(b, 49);
+         b[2] = 0x50;                          /* Padding */
+         smb_put32(b + 4, (uint32_t)n);
+         smb_put64(b + 8, off + sent);
+         memcpy(b + 16, f->fid, 16);
+         if (rsmb_send_msg(c, 49, 0, &mids[inflight], &charge) != 0)
+         {
+            fail = 1;
+            break;
+         }
+         offs[inflight] = sent;
+         lens[inflight] = n;
+         inflight++;
+         sent += n;
+      }
+      if (!inflight)
+         break;
+      /* take one reply and match it */
+      {
+         size_t   rlen;
+         uint64_t mid;
+         unsigned slot = RSMB_PIPELINE;
+         if (rsmb_recv_msg(c, &rlen, &mid) != 0)
+            return -1;
+         for (i = 0; i < inflight; i++)
+            if (mids[i] == mid)
+               slot = i;
+         if (slot == RSMB_PIPELINE)
+            continue;                          /* not ours: a stray */
+         if (c->status == STATUS_END_OF_FILE)
+         {
+            eof = 1;
+            if (!short_at || offs[slot] < end)
+            {
+               end      = offs[slot];
+               short_at = 1;
+            }
+         }
+         else if (c->status != STATUS_SUCCESS || rlen < SMB2_HDR_SIZE + 16)
+         {
+            rsmb_err(c, "read failed");
+            fail = 1;
+         }
+         else
+         {
+            const uint8_t *r = c->rx + SMB2_HDR_SIZE;
+            uint32_t doff = r[2], got = smb_get32(r + 4);
+            if (doff < SMB2_HDR_SIZE || doff + got > rlen || got > lens[slot])
+            {
+               rsmb_err(c, "bad read reply");
+               fail = 1;
+            }
+            else
+            {
+               memcpy(out + offs[slot], c->rx + doff, got);
+               /* a short or empty reply ends the contiguous run
+                * there, whatever later chunks answered */
+               if (got < lens[slot])
+               {
+                  eof = 1;
+                  if (!short_at || offs[slot] + got < end)
+                  {
+                     end      = offs[slot] + got;
+                     short_at = 1;
+                  }
+               }
+            }
+         }
+         /* drop the slot; order among the rest is irrelevant */
+         mids[slot] = mids[inflight - 1];
+         offs[slot] = offs[inflight - 1];
+         lens[slot] = lens[inflight - 1];
+         inflight--;
+      }
+   }
+   if (fail)
+      return -1;
+   return (int64_t)(short_at ? end : sent);
+}
+
 int64_t rsmb_read(struct rsmb_ctx *c, struct rsmb_file *f, void *buf, size_t len)
 {
-   uint8_t *out  = (uint8_t*)buf;
-   size_t   done = 0;
+   uint8_t *out = (uint8_t*)buf;
+   int64_t  n;
 
-   while (done < len)
+   if (!len)
+      return 0;
+   /* large reads go straight to the caller's buffer */
+   if (!c->readahead || len >= c->readahead)
    {
-      uint8_t *b;
-      uint8_t *r;
-      size_t   rlen, n = len - done;
-      uint32_t got, doff;
-      if (n > c->max_read)
-         n = c->max_read;
-      /* one credit per 64 KiB; never more than the server has granted */
-      c->charge = (unsigned)((n + SMB2_MAX_IO - 1) / SMB2_MAX_IO);
-      if (c->charge > 1 && c->credits < (int)c->charge)
-      {
-         c->charge = c->credits > 0 ? (unsigned)c->credits : 1;
-         n = (size_t)c->charge * SMB2_MAX_IO;
-      }
-      b = rsmb_begin(c, SMB2_READ);
-      memset(b, 0, 49);
-      put16(b, 49);
-      b[2] = 0x50;                          /* Padding */
-      put32(b + 4, (uint32_t)n);
-      put64(b + 8, f->offset);
-      memcpy(b + 16, f->fid, 16);
-      if (rsmb_call(c, 49, &r, &rlen, 0) != 0)
-         return -1;
-      if (c->status == STATUS_END_OF_FILE)
-         break;
-      if (c->status != STATUS_SUCCESS || rlen < 16)
-      {
-         rsmb_err(c, "read failed");
-         return -1;
-      }
-      doff = r[2];
-      got  = get32(r + 4);
-      if (doff < SMB2_HDR_SIZE || doff + got > rlen + SMB2_HDR_SIZE)
-      {
-         rsmb_err(c, "bad read reply");
-         return -1;
-      }
-      memcpy(out + done, c->rx + doff, got);
-      done      += got;
-      f->offset += got;
-      if (got < n)
-         break;
+      f->ra_len = 0;
+      n = rsmb_fetch(c, f, f->offset, out, len);
+      if (n > 0)
+         f->offset += (uint64_t)n;
+      return n;
    }
-   return (int64_t)done;
+   /* served from the window when it holds the range */
+   if (f->ra_len && f->offset >= f->ra_off && f->offset + len <= f->ra_off + f->ra_len)
+   {
+      memcpy(out, f->ra + (f->offset - f->ra_off), len);
+      f->offset += len;
+      return (int64_t)len;
+   }
+   /* otherwise refill the window from here; the tail of a previous
+    * window is not reused, one fetch is cheaper than the bookkeeping */
+   if (!f->ra)
+   {
+      f->ra_cap = c->readahead;
+      if (!(f->ra = (uint8_t*)malloc(f->ra_cap)))
+      {
+         n = rsmb_fetch(c, f, f->offset, out, len);
+         if (n > 0)
+            f->offset += (uint64_t)n;
+         return n;
+      }
+   }
+   n = rsmb_fetch(c, f, f->offset, f->ra, f->ra_cap);
+   if (n < 0)
+   {
+      f->ra_len = 0;
+      return -1;
+   }
+   f->ra_off = f->offset;
+   f->ra_len = (size_t)n;
+   if ((size_t)n < len)
+      len = (size_t)n;
+   memcpy(out, f->ra, len);
+   f->offset += len;
+   return (int64_t)len;
 }
 
 int64_t rsmb_write(struct rsmb_ctx *c, struct rsmb_file *f, const void *buf, size_t len)
 {
    const uint8_t *in = (const uint8_t*)buf;
    size_t done = 0;
+
+   f->ra_len = 0;                  /* the window is stale past a write */
 
    while (done < len)
    {
@@ -1308,10 +1636,10 @@ int64_t rsmb_write(struct rsmb_ctx *c, struct rsmb_file *f, const void *buf, siz
       }
       b = rsmb_begin(c, SMB2_WRITE);
       memset(b, 0, 48);
-      put16(b, 49);
-      put16(b + 2, SMB2_HDR_SIZE + 48);
-      put32(b + 4, (uint32_t)n);
-      put64(b + 8, f->offset);
+      smb_put16(b, 49);
+      smb_put16(b + 2, SMB2_HDR_SIZE + 48);
+      smb_put32(b + 4, (uint32_t)n);
+      smb_put64(b + 8, f->offset);
       memcpy(b + 16, f->fid, 16);
       memcpy(b + 48, in + done, n);
       if (rsmb_call(c, 48 + n, &r, &rlen, 0) != 0)
@@ -1321,7 +1649,7 @@ int64_t rsmb_write(struct rsmb_ctx *c, struct rsmb_file *f, const void *buf, siz
          rsmb_err(c, "write failed");
          return -1;
       }
-      count      = get32(r + 4);
+      count      = smb_get32(r + 4);
       done      += count;
       f->offset += count;
       if (f->offset > f->size)
@@ -1353,6 +1681,7 @@ int rsmb_close(struct rsmb_ctx *c, struct rsmb_file *f)
    if (!f)
       return -1;
    r = rsmb_close_fid(c, f->fid);
+   free(f->ra);
    free(f);
    return r;
 }
@@ -1364,25 +1693,32 @@ int rsmb_ftruncate(struct rsmb_ctx *c, struct rsmb_file *f, uint64_t size)
    uint8_t *r;
    size_t   rlen;
    memset(b, 0, 40);
-   put16(b, 33);
+   smb_put16(b, 33);
    b[2] = 1;
    b[3] = 20;
-   put32(b + 4, 8);
-   put16(b + 8, SMB2_HDR_SIZE + 32);
+   smb_put32(b + 4, 8);
+   smb_put16(b + 8, SMB2_HDR_SIZE + 32);
    memcpy(b + 16, f->fid, 16);
-   put64(b + 32, size);
+   smb_put64(b + 32, size);
    if (rsmb_call(c, 40, &r, &rlen, 0) != 0 || c->status != STATUS_SUCCESS)
    {
       rsmb_err(c, "truncate failed");
       return -1;
    }
-   f->size = size;
+   f->size   = size;
+   f->ra_len = 0;
    if (f->offset > size)
       f->offset = size;
    return 0;
 }
 
 uint32_t rsmb_max_read(const struct rsmb_ctx *c)  { return c->max_read; }
+
+void rsmb_set_readahead(struct rsmb_ctx *c, uint32_t bytes)
+{
+   c->readahead     = bytes;
+   c->readahead_set = 1;
+}
 uint32_t rsmb_max_write(const struct rsmb_ctx *c) { return c->max_write; }
 
 int rsmb_stat(struct rsmb_ctx *c, const char *path, struct rsmb_stat *st)
@@ -1396,7 +1732,7 @@ int rsmb_stat(struct rsmb_ctx *c, const char *path, struct rsmb_stat *st)
    /* mtime from the CREATE reply: LastWriteTime at offset 32 */
    st->size   = size;
    st->is_dir = is_dir;
-   st->mtime  = rsmb_filetime(get64(c->rx + SMB2_HDR_SIZE + 32));
+   st->mtime  = rsmb_filetime(smb_get64(c->rx + SMB2_HDR_SIZE + 32));
    rsmb_close_fid(c, fid);
    return 0;
 }
@@ -1434,16 +1770,16 @@ int rsmb_rename(struct rsmb_ctx *c, const char *from, const char *to)
       to++;
    b = rsmb_begin(c, SMB2_SET_INFO);
    memset(b, 0, 32);
-   put16(b, 33);
+   smb_put16(b, 33);
    b[2] = 1;                                  /* InfoType: FILE */
    b[3] = 10;                                 /* FileRenameInformation */
-   put16(b + 8, SMB2_HDR_SIZE + 32);          /* BufferOffset */
+   smb_put16(b + 8, SMB2_HDR_SIZE + 32);          /* BufferOffset */
    memcpy(b + 16, fid, 16);
    memset(b + 32, 0, 20);
    b[32] = 1;                                 /* ReplaceIfExists */
    nlen = rsmb_utf16(to, b + 52, 2048, 1);
-   put32(b + 48, (uint32_t)nlen);
-   put32(b + 4, (uint32_t)(20 + nlen));       /* BufferLength */
+   smb_put32(b + 48, (uint32_t)nlen);
+   smb_put32(b + 4, (uint32_t)(20 + nlen));       /* BufferLength */
    if (rsmb_call(c, 52 + nlen, &r, &rlen, 0) == 0 && c->status == STATUS_SUCCESS)
       ret = 0;
    else
@@ -1484,14 +1820,14 @@ static int rsmb_query_dir(struct rsmb_ctx *c, struct rsmb_dir *d)
    uint32_t ooff, olen;
 
    memset(b, 0, 32);
-   put16(b, 33);
+   smb_put16(b, 33);
    b[2] = 0x01;                              /* FileDirectoryInformation */
    b[3] = 0;                                 /* Flags */
    memcpy(b + 8, d->fid, 16);
-   put16(b + 24, SMB2_HDR_SIZE + 32);
-   put16(b + 26, 2);
-   put32(b + 28, SMB2_MAX_IO);
-   put16(b + 32, '*');
+   smb_put16(b + 24, SMB2_HDR_SIZE + 32);
+   smb_put16(b + 26, 2);
+   smb_put32(b + 28, SMB2_MAX_IO);
+   smb_put16(b + 32, '*');
    if (rsmb_call(c, 34, &r, &rlen, 0) != 0)
       return -1;
    if (c->status == STATUS_NO_MORE_FILES)
@@ -1504,8 +1840,8 @@ static int rsmb_query_dir(struct rsmb_ctx *c, struct rsmb_dir *d)
       rsmb_err(c, "query directory failed");
       return -1;
    }
-   ooff = get16(r + 2);
-   olen = get32(r + 4);
+   ooff = smb_get16(r + 2);
+   olen = smb_get32(r + 4);
    if (ooff < SMB2_HDR_SIZE || ooff + olen > rlen + SMB2_HDR_SIZE || olen > SMB2_MAX_IO)
    {
       rsmb_err(c, "bad directory reply");
@@ -1534,13 +1870,13 @@ const struct rsmb_dirent *rsmb_readdir(struct rsmb_ctx *c, struct rsmb_dir *d)
       e = d->buf + d->buf_off;
       if (d->buf_len - d->buf_off < 64)
          return NULL;
-      next     = get32(e);
-      name_len = get32(e + 60);
+      next     = smb_get32(e);
+      name_len = smb_get32(e + 60);
       if (64 + name_len > d->buf_len - d->buf_off)
          return NULL;
-      d->ent.st.size   = get64(e + 40);
-      d->ent.st.mtime  = rsmb_filetime(get64(e + 24));
-      d->ent.st.is_dir = (get32(e + 56) & SMB2_FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+      d->ent.st.size   = smb_get64(e + 40);
+      d->ent.st.mtime  = rsmb_filetime(smb_get64(e + 24));
+      d->ent.st.is_dir = (smb_get32(e + 56) & SMB2_FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
       rsmb_utf8(e + 64, name_len, d->ent.name, sizeof(d->ent.name));
       d->buf_off = next ? d->buf_off + next : d->buf_len;
       if (strcmp(d->ent.name, ".") == 0 || strcmp(d->ent.name, "..") == 0)
@@ -1565,7 +1901,7 @@ int rsmb_echo(struct rsmb_ctx *c)
    size_t   rlen;
    if (c->fd < 0)
       return -1;
-   put16(b, 4); put16(b + 2, 0);
+   smb_put16(b, 4); smb_put16(b + 2, 0);
    if (rsmb_call(c, 4, &r, &rlen, 0) != 0)
       return -1;
    return c->status == STATUS_SUCCESS ? 0 : -1;
@@ -1576,6 +1912,42 @@ int rsmb_echo(struct rsmb_ctx *c)
 /* DCERPC on the named pipe: a bind, then one request; both PDUs and
  * the NDR stub are built and picked apart by hand, this being the one
  * RPC the frontend makes. */
+/* One READ on a pipe: whatever the server has, no window, nothing
+ * else in flight (a pipe holds extra reads pending). */
+static int64_t rsmb_pipe_read(struct rsmb_ctx *c, struct rsmb_file *pipe,
+      uint8_t *out, size_t len)
+{
+   uint8_t *b, *r;
+   size_t   rlen;
+   uint32_t got, doff;
+   if (len > c->max_read)
+      len = c->max_read;
+   c->charge = (unsigned)((len + SMB2_MAX_IO - 1) / SMB2_MAX_IO);
+   if (c->charge > 1 && c->credits < (int)c->charge)
+   {
+      c->charge = c->credits > 0 ? (unsigned)c->credits : 1;
+      len = (size_t)c->charge * SMB2_MAX_IO;
+   }
+   b = rsmb_begin(c, SMB2_READ);
+   memset(b, 0, 49);
+   smb_put16(b, 49);
+   b[2] = 0x50;
+   smb_put32(b + 4, (uint32_t)len);
+   memcpy(b + 16, pipe->fid, 16);
+   if (rsmb_call(c, 49, &r, &rlen, 0) != 0)
+      return -1;
+   if (c->status == STATUS_END_OF_FILE)
+      return 0;
+   if (c->status != STATUS_SUCCESS || rlen < 16)
+      return -1;
+   doff = r[2];
+   got  = smb_get32(r + 4);
+   if (doff < SMB2_HDR_SIZE || doff + got > rlen + SMB2_HDR_SIZE || got > len)
+      return -1;
+   memcpy(out, c->rx + doff, got);
+   return (int64_t)got;
+}
+
 static int rsmb_pipe_transceive(struct rsmb_ctx *c, struct rsmb_file *pipe,
       const uint8_t *req, size_t req_len, uint8_t *resp, size_t resp_cap,
       size_t *resp_len)
@@ -1585,16 +1957,13 @@ static int rsmb_pipe_transceive(struct rsmb_ctx *c, struct rsmb_file *pipe,
    pipe->offset = 0;
    if (rsmb_write(c, pipe, req, req_len) != (int64_t)req_len)
       return -1;
-   pipe->offset = 0;
-   n = rsmb_read(c, pipe, resp, resp_cap);
+   n = rsmb_pipe_read(c, pipe, resp, resp_cap);
    if (n < 16)
       return -1;
-   frag = get16(resp + 8);
+   frag = smb_get16(resp + 8);
    while ((size_t)n < frag && (size_t)n < resp_cap)
    {
-      int64_t m;
-      pipe->offset = 0;
-      m = rsmb_read(c, pipe, resp + n, resp_cap - (size_t)n);
+      int64_t m = rsmb_pipe_read(c, pipe, resp + n, resp_cap - (size_t)n);
       if (m <= 0)
          break;
       n += m;
@@ -1627,15 +1996,15 @@ int rsmb_enum_shares(struct rsmb_ctx *c, struct rsmb_share *out, unsigned max)
    /* bind */
    memset(req, 0, sizeof(req));
    req[0] = 5; req[1] = 0; req[2] = 11; req[3] = 3;
-   put32(req + 4, 0x10);                      /* data rep: LE, ASCII, IEEE */
-   put16(req + 8, 72);                        /* frag length */
-   put32(req + 12, 1);                        /* call id */
-   put16(req + 16, 4280); put16(req + 18, 4280);
-   put32(req + 20, 0);                        /* assoc group */
+   smb_put32(req + 4, 0x10);                      /* data rep: LE, ASCII, IEEE */
+   smb_put16(req + 8, 72);                        /* frag length */
+   smb_put32(req + 12, 1);                        /* call id */
+   smb_put16(req + 16, 4280); smb_put16(req + 18, 4280);
+   smb_put32(req + 20, 0);                        /* assoc group */
    req[24] = 1;                               /* one context */
-   put16(req + 28, 0); req[30] = 1;           /* ctx 0, one transfer syntax */
-   memcpy(req + 32, srvsvc_uuid, 16); put16(req + 48, 3); put16(req + 50, 0);
-   memcpy(req + 52, ndr_uuid, 16);    put32(req + 68, 2);
+   smb_put16(req + 28, 0); req[30] = 1;           /* ctx 0, one transfer syntax */
+   memcpy(req + 32, srvsvc_uuid, 16); smb_put16(req + 48, 3); smb_put16(req + 50, 0);
+   memcpy(req + 52, ndr_uuid, 16);    smb_put32(req + 68, 2);
    if (rsmb_pipe_transceive(c, pipe, req, 72, buf, SMB2_MAX_IO, &rlen) != 0
          || rlen < 16 || buf[2] != 12)
    {
@@ -1646,22 +2015,22 @@ int rsmb_enum_shares(struct rsmb_ctx *c, struct rsmb_share *out, unsigned max)
    /* NetrShareEnum(NULL server, level 1, empty container, max length, resume 0) */
    memset(req, 0, sizeof(req));
    req[0] = 5; req[2] = 0; req[3] = 3;
-   put32(req + 4, 0x10);
-   put16(req + 8, 24 + 36);
-   put32(req + 12, 2);
-   put32(req + 16, 36);                       /* alloc hint */
-   put16(req + 20, 0);                        /* context id */
-   put16(req + 22, 15);                       /* opnum NetrShareEnum */
+   smb_put32(req + 4, 0x10);
+   smb_put16(req + 8, 24 + 36);
+   smb_put32(req + 12, 2);
+   smb_put32(req + 16, 36);                       /* alloc hint */
+   smb_put16(req + 20, 0);                        /* context id */
+   smb_put16(req + 22, 15);                       /* opnum NetrShareEnum */
    off = 24;
-   put32(req + off, 0);              off += 4; /* ServerName: NULL */
-   put32(req + off, 1);              off += 4; /* Level */
-   put32(req + off, 1);              off += 4; /* union switch */
-   put32(req + off, 0x00020000);     off += 4; /* container pointer */
-   put32(req + off, 0);              off += 4; /*   EntriesRead */
-   put32(req + off, 0);              off += 4; /*   Buffer: NULL */
-   put32(req + off, 0xffffffffu);    off += 4; /* PreferedMaximumLength */
-   put32(req + off, 0x00020004);     off += 4; /* ResumeHandle pointer */
-   put32(req + off, 0);              off += 4; /*   value */
+   smb_put32(req + off, 0);              off += 4; /* ServerName: NULL */
+   smb_put32(req + off, 1);              off += 4; /* Level */
+   smb_put32(req + off, 1);              off += 4; /* union switch */
+   smb_put32(req + off, 0x00020000);     off += 4; /* container pointer */
+   smb_put32(req + off, 0);              off += 4; /*   EntriesRead */
+   smb_put32(req + off, 0);              off += 4; /*   Buffer: NULL */
+   smb_put32(req + off, 0xffffffffu);    off += 4; /* PreferedMaximumLength */
+   smb_put32(req + off, 0x00020004);     off += 4; /* ResumeHandle pointer */
+   smb_put32(req + off, 0);              off += 4; /*   value */
    if (rsmb_pipe_transceive(c, pipe, req, off, buf, SMB2_MAX_IO, &rlen) != 0
          || rlen < 24 + 24 || buf[2] != 2)
    {
@@ -1671,19 +2040,19 @@ int rsmb_enum_shares(struct rsmb_ctx *c, struct rsmb_share *out, unsigned max)
 
    /* stub: Level, switch, container ptr, EntriesRead, Buffer ptr, MaxCount */
    off = 24;
-   if (get32(buf + off + 8) == 0 || get32(buf + off + 16) == 0)
+   if (smb_get32(buf + off + 8) == 0 || smb_get32(buf + off + 16) == 0)
    {
       ret = 0;                                /* no container / buffer */
       goto done;
    }
-   count = get32(buf + off + 12);
+   count = smb_get32(buf + off + 12);
    off  += 24;
    if (count > 4096 || off + count * 12 > rlen)
       goto done;
    for (i = 0; i < count; i++)
       if (i < max)
       {
-         out[i].type    = get32(buf + off + i * 12 + 4);
+         out[i].type    = smb_get32(buf + off + i * 12 + 4);
          out[i].name[0] = '\0';
       }
    off += count * 12;
@@ -1696,7 +2065,7 @@ int rsmb_enum_shares(struct rsmb_ctx *c, struct rsmb_share *out, unsigned max)
          uint32_t actual;
          if (off + 12 > rlen)
             goto done;
-         actual = get32(buf + off + 8);
+         actual = smb_get32(buf + off + 8);
          off   += 12;
          if (actual > 512 || off + actual * 2 > rlen)
             goto done;

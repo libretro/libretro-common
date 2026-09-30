@@ -112,12 +112,24 @@
  *                        be had - no ntdll entry points and no TLS index
  *                        left for the event - the object falls back to
  *                        the scond backend below rather than failing.
+ *   Switch               the Horizon address arbiter (svcWaitForAddress /
+ *                        svcSignalToAddress), the futex shape, on
+ *                        firmware 4.0.0 and newer; the scond backend
+ *                        below on older firmware, decided at init.
  *   macOS / iOS / BSDs   the same waiter list, slept on with a semaphore
  *                        of the waiting thread's own - a Mach semaphore
  *                        on Darwin, a POSIX one on the BSDs - kept for
  *                        the thread's life.  Every call is in Mac OS X
  *                        10.4's headers, so one binary runs from there
  *                        up; no mutex, and one signal per parked waiter.
+ *   3DS                  the 3DS address arbiter (svcArbitrateAddress),
+ *                        the futex shape with a less-than comparison,
+ *                        which the climbing epoch turns into an equal.
+ *   Vita / PS3 / Wii U   the same list, slept on with a kernel semaphore
+ *                        (an auto-reset OSEvent on the Wii U) drawn from
+ *                        a lock-free pool for the length of the park,
+ *                        since their threads have no storage of their
+ *                        own to keep one in.
  *   everything else      rthreads scond, with the lock taken only across
  *                        the sleep itself
  *

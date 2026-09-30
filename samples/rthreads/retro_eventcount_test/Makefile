@@ -52,6 +52,33 @@ ifneq ($(SEM),)
    CFLAGS += -DRETRO_EVENTCOUNT_FORCE_SEM
    TARGET := retro_eventcount_test_sem
 endif
+# SEMPOOL=1 builds the pooled variant of the semaphore backend, the
+# one the Vita takes because its threads have no storage of their own
+# to keep a semaphore in: the same list, the semaphores drawn from a
+# lock-free pool per park.  Over POSIX semaphores here; the Vita
+# spelling differs in the three semaphore calls only.
+ifneq ($(SEMPOOL),)
+   CFLAGS += -DRETRO_EVENTCOUNT_FORCE_SEM_POOL
+   TARGET := retro_eventcount_test_sempool
+endif
+# CTR=1 builds the 3DS address-arbiter backend on this host, against
+# hostctr/3ds - the slice of libctru it uses - with the two arbiter
+# wrappers stood in for over futex in ctr_arbiter_shim.c.
+ifneq ($(CTR),)
+   CFLAGS += -DRETRO_EVENTCOUNT_FORCE_3DS -Ihostctr
+   SOURCES += ctr_arbiter_shim.c
+   TARGET := retro_eventcount_test_ctr
+endif
+# SWITCH=1 builds the Horizon address-arbiter backend on this host,
+# against hostnx/switch.h - the slice of libnx it uses - with the two
+# system calls and the firmware query stood in for over futex in
+# switch_arbiter_shim.c.  check runs it as current firmware and as
+# firmware before 4.0.0, where it must fall back to scond.
+ifneq ($(SWITCH),)
+   CFLAGS += -DRETRO_EVENTCOUNT_FORCE_SWITCH -Ihostnx
+   SOURCES += switch_arbiter_shim.c
+   TARGET := retro_eventcount_test_switch
+endif
 
 OBJS := $(SOURCES:.c=.o)
 
@@ -79,9 +106,21 @@ check: all
 	@$(MAKE) -s clean
 	@$(MAKE) -s SEM=1 $(if $(SANITIZER),SANITIZER=$(SANITIZER))
 	./retro_eventcount_test_sem
+	@$(MAKE) -s clean
+	@$(MAKE) -s SEMPOOL=1 $(if $(SANITIZER),SANITIZER=$(SANITIZER))
+	./retro_eventcount_test_sempool
+	@$(MAKE) -s clean
+	@$(MAKE) -s SWITCH=1 $(if $(SANITIZER),SANITIZER=$(SANITIZER))
+	./retro_eventcount_test_switch
+	HOSTNX_OLD_FIRMWARE=1 ./retro_eventcount_test_switch
+	@$(MAKE) -s clean
+	@$(MAKE) -s CTR=1 $(if $(SANITIZER),SANITIZER=$(SANITIZER))
+	./retro_eventcount_test_ctr
 
 clean:
-	rm -f $(OBJS) retro_eventcount_test retro_eventcount_test_scond \
-	      retro_eventcount_test_sem
+	rm -f $(OBJS) switch_arbiter_shim.o ctr_arbiter_shim.o retro_eventcount_test \
+	      retro_eventcount_test_scond retro_eventcount_test_sem \
+	      retro_eventcount_test_sempool retro_eventcount_test_switch \
+	      retro_eventcount_test_ctr
 
 .PHONY: all check clean
