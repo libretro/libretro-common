@@ -28,6 +28,9 @@
 #include <net/net_compat.h>
 #include <net/net_socket.h>
 #include <compat/strl.h>
+#ifdef RARCH_CONSOLE
+#include <retro_timers.h>
+#endif
 #include <string/stdstring.h>
 #include <retro_miscellaneous.h>
 #include <features/features_cpu.h>
@@ -77,6 +80,11 @@
 #define OP_PUTFH          22
 #define OP_PUTROOTFH      24
 #define OP_READ           25
+/* NFSv4.2 (RFC 7862): a read that says which runs are holes */
+#define OP_READ_PLUS      68
+#define NFS4_CONTENT_DATA 0
+#define NFS4_CONTENT_HOLE 1
+#define OP_ILLEGAL        10044
 #define OP_READDIR        26
 #define OP_REMOVE         28
 #define OP_RENAME         29
@@ -87,12 +95,25 @@
 #define OP_SETCLIENTID_CONFIRM 36
 #define OP_RESTOREFH      31
 #define OP_WRITE_OP       38
+/* NFSv4.1 (RFC 8881): sessions */
+#define OP_EXCHANGE_ID    42
+#define OP_CREATE_SESSION 43
+#define OP_DESTROY_SESSION 44
+#define OP_SEQUENCE       53
+#define OP_DESTROY_CLIENTID 57
+#define OP_RECLAIM_COMPLETE 58
 #define NFS4ERR_STALE_CLIENTID 10022
 #define NFS4ERR_EXPIRED        10011
 #define NFS4ERR_BAD_STATEID    10025
 #define NFS4ERR_OLD_STATEID    10024
 #define NFS4ERR_GRACE          10013
 #define NFS4ERR_DELAY          10008
+#define NFS4ERR_STALE_STATEID  10023
+#define NFS4ERR_ADMIN_REVOKED  10047
+#define NFS4ERR_MINOR_VERS_MISMATCH 10021
+#define NFS4ERR_BADSESSION     10052
+#define NFS4ERR_COMPLETE_ALREADY 10054
+#define NFS4ERR_DEADSESSION    10078
 #define NF4DIR            2
 /* attribute bits: type(1) size(4) in word 0, time_modify(53) in word 1 */
 #define FATTR4_W0_TYPE    (1u << 1)
@@ -109,7 +130,14 @@
 /* Default transfer size; FSINFO raises it to what the server allows,
  * up to NFS3_LARGE_IO, and the buffers grow with it. */
 #define NFS3_MAX_IO      (64 * 1024)
+/* The largest transfer asked for once the server allows it. The 3DS
+ * keeps the 64 KiB start: its RAM is small, four connections at 1 MiB
+ * would hold 8 MiB of buffers, and its Wi-Fi gains nothing from them. */
+#ifdef _3DS
+#define NFS3_LARGE_IO    (64 * 1024)
+#else
 #define NFS3_LARGE_IO    (1024 * 1024)
+#endif
 #define RNFS_BUF_SIZE(io) ((io) + 4096)
 #define RNFS_RX_SIZE     RNFS_BUF_SIZE(NFS3_MAX_IO)
 #define NFS_FSINFO       19
@@ -130,6 +158,11 @@ struct rnfs_file
    uint64_t size;
    uint8_t  stateid[16];     /* v4: from OPEN, all-zero for the anonymous one */
    uint8_t  opened;          /* v4: an OPEN state to CLOSE */
+   char    *path;            /* v4, opened: to open again if the server lost it */
+   /* v4, opened: on its context's list of files holding open state,
+    * which the context takes back whenever it identifies itself anew */
+   struct rnfs_ctx  *owner;
+   struct rnfs_file *next, *prev;
    /* read-ahead: the last fetched window, so a run of small
     * sequential reads costs one round trip per window */
    uint8_t *ra;
@@ -152,6 +185,9 @@ struct rnfs_dir
 };
 
 #define RNFS_DCACHE_SIZE 16
+/* NFSv4.1 session slots asked for: one per READ the pipeline keeps in
+ * flight (RNFS_PIPELINE). */
+#define RNFS_SLOTS 8
 #define RNFS_DCACHE_PATH 256
 
 struct rnfs_ctx
@@ -177,6 +213,27 @@ struct rnfs_ctx
    uint64_t clientid;
    uint32_t open_seq;
    uint8_t  owner[8];
+   /* NFSv4.1 and later: the minor version in use, and the session every
+    * request after its setup runs in - one slot per request in flight,
+    * each with its own sequence number */
+   uint8_t  minor;
+   uint8_t  have_session;
+   /* the client's identity, made once per context and kept across
+    * reconnects, so a server that held on to this client's state (a
+    * courteous server, or one that lost only the session) gives it
+    * back instead of starting a stranger */
+   uint8_t  verf[8];
+   uint8_t  have_identity;
+   struct rnfs_file *stateful;      /* v4 files holding open state */
+   uint8_t  reclaiming;
+   uint8_t  redialing;
+   /* why the last READ or WRITE failed, for its one retry */
+   uint8_t  lost_session;
+   uint8_t  stale_state;
+   uint8_t  sessionid[16];
+   uint32_t slots;                  /* granted, at most RNFS_SLOTS */
+   uint8_t  read_plus;              /* 4.2: READ_PLUS, until the server refuses it */
+   uint32_t slot_seq[RNFS_SLOTS];
    char     server[256];
    char     export_path[512];
    char     error[128];
@@ -192,6 +249,7 @@ struct rnfs_ctx
    } dcache[RNFS_DCACHE_SIZE];
    uint32_t dcache_tick;
    uint32_t calls;                  /* RPCs made, for tests */
+   uint64_t rx_bytes;               /* RPC replies received, for tests */
 };
 
 static void rnfs_err(struct rnfs_ctx *c, const char *msg)
@@ -423,6 +481,7 @@ static int rnfs_rpc_recv(struct rnfs_ctx *c, int fd, uint32_t *xid_out, struct x
          return -1;
       }
       rlen += frag;
+      c->rx_bytes += frag;
       if (last)
          break;
    }
@@ -447,37 +506,72 @@ static int rnfs_rpc_recv(struct rnfs_ctx *c, int fd, uint32_t *xid_out, struct x
    return 0;
 }
 
+static void rnfs_drop(struct rnfs_ctx *c);
+
 static int rnfs_rpc(struct rnfs_ctx *c, int fd, uint32_t prog, uint32_t vers,
       uint32_t proc, const uint8_t *args, size_t args_len, struct xdr *reply)
 {
    uint32_t xid, got;
    if (rnfs_rpc_send(c, fd, prog, vers, proc, args, args_len, &xid) != 0)
-      return -1;
+      goto fail;
    do
    {
       if (rnfs_rpc_recv(c, fd, &got, reply) != 0)
-         return -1;
+         goto fail;
    } while (got != xid);
    return 0;
+fail:
+   /* a connection that failed a call is not trusted again: a reply
+    * arriving late would answer the next call. The next call dials
+    * afresh. */
+   if (fd == c->fd)
+      rnfs_drop(c);
+   return -1;
 }
 
 /* NFS call; on success the nfsstat3 is in c->status and @reply sits
  * after it. */
 static void rnfs_dcache_flush(struct rnfs_ctx *c);
 
+static int rnfs_redial(struct rnfs_ctx *c);
+static int rnfs_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
+      struct rnfs_stat *st, int parent, char *last, size_t last_len);
+
 static int rnfs_call(struct rnfs_ctx *c, uint32_t proc,
       const uint8_t *args, size_t args_len, struct xdr *reply)
 {
+   uint8_t *held = NULL;
+   int      ret  = 0;
    c->calls++;
    if (c->fd < 0)
    {
-      rnfs_err(c, "not connected");
-      return -1;
+      /* dialling again talks through c->rx and c->tx: arguments a
+       * caller built there (WRITE builds in place, saving a copy) are
+       * set aside first, or they go out as whatever the dial left */
+      if (     (args >= c->rx && args < c->rx + c->buf_size)
+            || (args >= c->tx && args < c->tx + c->buf_size))
+      {
+         if (!(held = (uint8_t*)malloc(args_len)))
+            return -1;
+         memcpy(held, args, args_len);
+         args = held;
+      }
+      if (rnfs_redial(c) != 0)
+      {
+         free(held);
+         rnfs_err(c, "not connected");
+         return -1;
+      }
    }
    if (rnfs_rpc(c, c->fd, NFS_PROG, NFS_VERS, proc, args, args_len, reply) != 0)
-      return -1;
-   c->status = xdr_get_u32(reply);
-   return reply->fail ? -1 : 0;
+      ret = -1;
+   else
+   {
+      c->status = xdr_get_u32(reply);
+      ret       = reply->fail ? -1 : 0;
+   }
+   free(held);
+   return ret;
 }
 
 static uint16_t rnfs_getport(struct rnfs_ctx *c, uint32_t prog, uint32_t vers)
@@ -503,14 +597,20 @@ static uint16_t rnfs_getport(struct rnfs_ctx *c, uint32_t prog, uint32_t vers)
 
 /* ---- NFSv4.0 -------------------------------------------------------- */
 
-/* A short wait without dragging in the timer header (which pulls
- * platform threading includes): an empty select with a timeout. */
+/* A short wait. On a desktop an empty select with a timeout, without
+ * dragging in the timer header (which pulls platform threading
+ * includes); the consoles' socket layers do not all sleep in a select
+ * with no descriptors, so there the platform's own sleep. */
 static void nfs4_wait_ms(unsigned ms)
 {
+#ifdef RARCH_CONSOLE
+   retro_sleep(ms);
+#else
    struct timeval tv;
    tv.tv_sec  = ms / 1000;
    tv.tv_usec = (ms % 1000) * 1000;
    select(0, NULL, NULL, NULL, &tv);
+#endif
 }
 
 /* Client verifier and open-owner: these need to be unique per client
@@ -533,61 +633,127 @@ static void nfs4_unique(uint8_t *out, size_t len)
    }
 }
 
+static int nfs4_session_setup(struct rnfs_ctx *c);
+
+/* The COMPOUND header: an empty tag, the minor version in use, and the
+ * operation count - one more when a SEQUENCE leads. */
+static void nfs4_head(struct xdr *x, const struct rnfs_ctx *c, unsigned nops,
+      int sequenced)
+{
+   xdr_u32(x, 0);                       /* tag: empty */
+   xdr_u32(x, c->minor);
+   xdr_u32(x, nops + (sequenced ? 1 : 0));
+}
+
+/* SEQUENCE on @slot, whose sequence number advances; the server holds
+ * each slot's last request, so a number reused is answered from that
+ * reply instead of carried out. */
+static void nfs4_sequence(struct xdr *x, struct rnfs_ctx *c, unsigned slot)
+{
+   xdr_u32(x, OP_SEQUENCE);
+   memcpy(x->p, c->sessionid, 16); x->p += 16;
+   xdr_u32(x, ++c->slot_seq[slot]);
+   xdr_u32(x, slot);
+   xdr_u32(x, c->slots - 1);            /* highest slot in use */
+   xdr_u32(x, 0);                       /* cachethis: no */
+}
+
+/* The SEQUENCE result: its status. When the server refused the
+ * SEQUENCE itself it did not take the number, so it is given back. */
+static uint32_t nfs4_sequence_res(struct xdr *r, struct rnfs_ctx *c,
+      unsigned slot)
+{
+   uint32_t st;
+   xdr_get_u32(r);                      /* opnum */
+   st = xdr_get_u32(r);
+   if (st != NFS3_OK)
+   {
+      c->slot_seq[slot]--;
+      return st;
+   }
+   r->p += 16;                          /* sessionid */
+   xdr_get_u32(r); xdr_get_u32(r);      /* sequenceid, slotid */
+   xdr_get_u32(r); xdr_get_u32(r);      /* highest, target highest */
+   xdr_get_u32(r);                      /* status flags */
+   return r->fail ? 1 : NFS3_OK;
+}
+
+/* Session setup operations run outside a session; everything else in
+ * one, once there is one. */
+static int nfs4_sequenced(const struct rnfs_ctx *c, const uint8_t *ops)
+{
+   uint32_t op;
+   if (!c->have_session)
+      return 0;
+   op = ((uint32_t)ops[0] << 24) | ((uint32_t)ops[1] << 16)
+      | ((uint32_t)ops[2] << 8) | ops[3];
+   return op != OP_EXCHANGE_ID && op != OP_CREATE_SESSION
+       && op != OP_DESTROY_SESSION && op != OP_DESTROY_CLIENTID;
+}
+
 /* One COMPOUND: @ops is the body after tag / minorversion / numops.
- * The reply is positioned after the tag and numres; each result's
- * opnum and status are read by the callers with nfs4_res(). */
+ * The reply is positioned after the tag and numres - and, in a session,
+ * after the SEQUENCE result, so callers read their own results the same
+ * in every minor version with nfs4_res(). */
 static int nfs4_compound(struct rnfs_ctx *c, const uint8_t *ops, size_t ops_len,
       unsigned nops, struct xdr *reply)
 {
-   uint8_t *args = c->rx;               /* free until the reply lands */
-   struct xdr x;
-   size_t tl;
-   x.p = args; x.end = c->rx + c->buf_size; x.fail = 0;
-   xdr_u32(&x, 0);                      /* tag: empty */
-   xdr_u32(&x, 0);                      /* minorversion */
-   xdr_u32(&x, nops);
-   if (x.fail || (size_t)(x.end - x.p) < ops_len)
-      return -1;
-   memcpy(x.p, ops, ops_len); x.p += ops_len;
-   if (c->fd < 0)
+   /* NFS4ERR_GRACE while the server recovers after a restart and
+    * NFS4ERR_DELAY are "ask again shortly", not failures: the request
+    * is repeated a second apart, on a fixed bound so a stuck server
+    * still cannot block a caller forever - the one wait a v4 client
+    * cannot avoid, and only ever right after a server came up. A lost
+    * session (the lease ran out while idle) is set up again, once. */
+   unsigned tries   = 15;
+   int      renewed = 0;
+
+   if (c->fd < 0 && rnfs_redial(c) != 0)
    {
       rnfs_err(c, "not connected");
       return -1;
    }
+   for (;;)
    {
-      /* NFS4ERR_GRACE while the server recovers after a restart and
-       * NFS4ERR_DELAY are "ask again shortly", not failures: the
-       * request is repeated, a second apart, for as long as the
-       * context timeout allows - the one wait a v4 client cannot
-       * avoid, and only ever right after a server came up. */
-      /* GRACE/DELAY is a transient, self-clearing server state (only
-       * ever just after the server started); retry on a fixed bound
-       * so a stuck server still cannot block a caller forever. */
-      unsigned tries = 15;
-      size_t   alen  = (size_t)(x.p - args);
-      uint8_t *keep  = (uint8_t*)malloc(alen);
-      if (!keep)
+      uint8_t *args      = c->rx;       /* free until the reply lands */
+      int      sequenced = nfs4_sequenced(c, ops);
+      struct xdr x;
+      size_t   tl;
+      uint32_t sst       = NFS3_OK;
+
+      x.p = args; x.end = c->rx + c->buf_size; x.fail = 0;
+      nfs4_head(&x, c, nops, sequenced);
+      if (sequenced)
+         nfs4_sequence(&x, c, 0);
+      if (x.fail || (size_t)(x.end - x.p) < ops_len)
          return -1;
-      memcpy(keep, args, alen);
-      for (;;)
+      memcpy(x.p, ops, ops_len); x.p += ops_len;
+
+      if (rnfs_rpc(c, c->fd, NFS_PROG, 4, NFS4_COMPOUND, args,
+               (size_t)(x.p - args), reply) != 0)
+         return -1;
+      c->status = xdr_get_u32(reply);   /* overall status */
+      xdr_get_opaque(reply, &tl);       /* tag */
+      xdr_get_u32(reply);               /* numres */
+      if (sequenced)
+         sst = nfs4_sequence_res(reply, c, 0);
+
+      if (     sequenced && !renewed
+            && (sst == NFS4ERR_BADSESSION || sst == NFS4ERR_DEADSESSION
+               || sst == NFS4ERR_EXPIRED  || sst == NFS4ERR_STALE_CLIENTID))
       {
-         if (rnfs_rpc(c, c->fd, NFS_PROG, 4, NFS4_COMPOUND, keep, alen, reply) != 0)
-         {
-            free(keep);
+         renewed          = 1;
+         c->have_session  = 0;
+         if (nfs4_session_setup(c) != 0)
             return -1;
-         }
-         c->status = xdr_get_u32(reply);   /* overall status */
-         if ((c->status == NFS4ERR_GRACE || c->status == NFS4ERR_DELAY) && tries--)
-         {
-            nfs4_wait_ms(1000);
-            continue;
-         }
-         break;
+         continue;
       }
-      free(keep);
+      if ((c->status == NFS4ERR_GRACE || c->status == NFS4ERR_DELAY) && tries--)
+      {
+         nfs4_wait_ms(1000);
+         continue;
+      }
+      break;
    }
-   xdr_get_opaque(reply, &tl);          /* tag */
-   xdr_get_u32(reply);                  /* numres */
    return reply->fail ? -1 : 0;
 }
 
@@ -642,6 +808,63 @@ static int nfs4_get_fattr(struct xdr *r, struct rnfs_stat *st)
 }
 
 /* Client id for this connection: SETCLIENTID then its CONFIRM. */
+static void nfs4_state_link(struct rnfs_ctx *c, struct rnfs_file *f)
+{
+   if (f->owner)
+      return;
+   f->owner = c;
+   f->prev  = NULL;
+   f->next  = c->stateful;
+   if (c->stateful)
+      c->stateful->prev = f;
+   c->stateful = f;
+}
+
+static void nfs4_state_unlink(struct rnfs_file *f)
+{
+   struct rnfs_ctx *c = f->owner;
+   if (!c)
+      return;
+   if (f->prev)
+      f->prev->next = f->next;
+   else
+      c->stateful = f->next;
+   if (f->next)
+      f->next->prev = f->prev;
+   f->owner = NULL;
+   f->next  = f->prev = NULL;
+}
+
+static int nfs4_open_reclaim(struct rnfs_ctx *c, struct rnfs_file *f);
+
+/* After a restart the server grants a client it knew its opens back
+ * during its grace period - and refuses new ones until grace ends
+ * (90 seconds on Linux). Each file holding open state is claimed back
+ * as soon as the client has identified itself again; where the server
+ * did not restart this fails harmlessly (NO_GRACE) and the state it
+ * kept goes on working. */
+static void nfs4_reclaim_all(struct rnfs_ctx *c)
+{
+   struct rnfs_file *f;
+   if (c->reclaiming)
+      return;                          /* a session set up again mid-reclaim */
+   c->reclaiming = 1;
+   for (f = c->stateful; f; f = f->next)
+      nfs4_open_reclaim(c, f);
+   c->reclaiming = 0;
+}
+
+/* The verifier and open-owner, made the first time this context
+ * identifies itself and kept for its life. */
+static void nfs4_identity(struct rnfs_ctx *c)
+{
+   if (c->have_identity)
+      return;
+   nfs4_unique(c->verf, 8);
+   nfs4_unique(c->owner, 8);
+   c->have_identity = 1;
+}
+
 static int nfs4_setclientid(struct rnfs_ctx *c)
 {
    uint8_t ops[256];
@@ -653,10 +876,10 @@ static int nfs4_setclientid(struct rnfs_ctx *c)
    unsigned i;
    static const char hex[] = "0123456789abcdef";
 
-   nfs4_unique(verf, 8);
-   nfs4_unique(c->owner, 8);
+   nfs4_identity(c);
+   memcpy(verf, c->verf, 8);
    /* client id string: "retroarch-" and the verifier in hex, unique
-    * per connection, no secrecy needed */
+    * per context, no secrecy needed */
    memcpy(id, "retroarch-", 10);
    for (i = 0; i < 8; i++)
    {
@@ -695,7 +918,139 @@ static int nfs4_setclientid(struct rnfs_ctx *c)
    }
    c->clientid = clientid;
    c->open_seq = 0;
+   nfs4_reclaim_all(c);
    return 0;
+}
+
+/* NFSv4.1+: the client's identity (EXCHANGE_ID), a session to run in
+ * (CREATE_SESSION) and the word that it reclaims nothing from before
+ * (RECLAIM_COMPLETE, which servers wait for before new opens).
+ *
+ * Returns: 0; 1 when the server does not speak this minor version;
+ * -1 on any other failure. */
+static int nfs4_session_setup(struct rnfs_ctx *c)
+{
+   uint8_t  ops[256];
+   struct xdr x, r;
+   uint8_t  verf[8];
+   char     id[32];
+   uint32_t seq, st, i;
+   size_t   n;
+   static const char hex[] = "0123456789abcdef";
+
+   c->have_session = 0;
+   nfs4_identity(c);
+   memcpy(verf, c->verf, 8);
+   memcpy(id, "retroarch-", 10);
+   for (i = 0; i < 8; i++)
+   {
+      id[10 + i * 2]     = hex[verf[i] >> 4];
+      id[10 + i * 2 + 1] = hex[verf[i] & 15];
+   }
+   id[26] = '\0';
+
+   x.p = ops; x.end = ops + sizeof(ops); x.fail = 0;
+   xdr_u32(&x, OP_EXCHANGE_ID);
+   memcpy(x.p, verf, 8); x.p += 8;      /* co_verifier */
+   xdr_string(&x, id);                  /* co_ownerid */
+   xdr_u32(&x, 0x00010000);             /* EXCHGID4_FLAG_USE_NON_PNFS */
+   xdr_u32(&x, 0);                      /* state protection: none */
+   xdr_u32(&x, 0);                      /* client implementation id: none */
+   if (x.fail || nfs4_compound(c, ops, (size_t)(x.p - ops), 1, &r) != 0)
+      return -1;
+   if (c->status == NFS4ERR_MINOR_VERS_MISMATCH)
+      return 1;
+   if (c->status != NFS3_OK || nfs4_res(&r) != NFS3_OK)
+   {
+      rnfs_err(c, "exchange_id refused");
+      return -1;
+   }
+   c->clientid = xdr_get_u64(&r);
+   seq         = xdr_get_u32(&r);
+
+   x.p = ops; x.fail = 0;
+   xdr_u32(&x, OP_CREATE_SESSION);
+   xdr_u64(&x, c->clientid);
+   xdr_u32(&x, seq);
+   xdr_u32(&x, 0);                      /* flags: no persistence, no back channel use */
+   /* fore channel: this client's buffers, one slot per pipelined READ */
+   xdr_u32(&x, 0);                      /* header padding */
+   xdr_u32(&x, (uint32_t)c->buf_size);  /* max request */
+   xdr_u32(&x, (uint32_t)c->buf_size);  /* max response */
+   xdr_u32(&x, 4096);                   /* max response cached */
+   xdr_u32(&x, 16);                     /* max operations */
+   xdr_u32(&x, RNFS_SLOTS);             /* max requests */
+   xdr_u32(&x, 0);                      /* no RDMA */
+   /* back channel: not served, kept small */
+   xdr_u32(&x, 0);
+   xdr_u32(&x, 4096);
+   xdr_u32(&x, 4096);
+   xdr_u32(&x, 0);
+   xdr_u32(&x, 2);
+   xdr_u32(&x, 1);
+   xdr_u32(&x, 0);
+   xdr_u32(&x, 0x40000000);             /* callback program: none we serve */
+   xdr_u32(&x, 1);                      /* one callback security flavor: */
+   xdr_u32(&x, 0);                      /* AUTH_NONE */
+   if (x.fail || nfs4_compound(c, ops, (size_t)(x.p - ops), 1, &r) != 0)
+      return -1;
+   if (c->status != NFS3_OK || nfs4_res(&r) != NFS3_OK)
+   {
+      rnfs_err(c, "create_session refused");
+      return -1;
+   }
+   memcpy(c->sessionid, r.p, 16); r.p += 16;
+   xdr_get_u32(&r);                     /* sequence */
+   xdr_get_u32(&r);                     /* flags */
+   xdr_get_u32(&r);                     /* fore: header padding */
+   xdr_get_u32(&r); xdr_get_u32(&r);    /* max request, max response */
+   xdr_get_u32(&r); xdr_get_u32(&r);    /* max cached, max operations */
+   n = xdr_get_u32(&r);                 /* max requests: the slots granted */
+   if (r.fail || !n)
+   {
+      rnfs_err(c, "create_session reply");
+      return -1;
+   }
+   c->slots     = (uint32_t)(n < RNFS_SLOTS ? n : RNFS_SLOTS);
+   c->read_plus = c->minor >= 2;
+   for (i = 0; i < RNFS_SLOTS; i++)
+      c->slot_seq[i] = 0;
+   c->have_session = 1;
+   c->open_seq     = 0;
+   /* opens this client held are claimed back before it says it has
+    * reclaimed all it will */
+   nfs4_reclaim_all(c);
+
+   x.p = ops; x.fail = 0;
+   xdr_u32(&x, OP_RECLAIM_COMPLETE);
+   xdr_u32(&x, 0);                      /* for every file system */
+   if (nfs4_compound(c, ops, (size_t)(x.p - ops), 1, &r) != 0)
+      return -1;
+   st = nfs4_res(&r);
+   if (st != NFS3_OK && st != NFS4ERR_COMPLETE_ALREADY)
+   {
+      rnfs_err(c, "reclaim_complete refused");
+      return -1;
+   }
+   return 0;
+}
+
+/* The newest minor version the server speaks, down to 4.0. */
+static int nfs4_establish(struct rnfs_ctx *c)
+{
+   static const uint8_t minors[] = { 2, 1 };
+   unsigned i;
+   for (i = 0; i < sizeof(minors); i++)
+   {
+      int ret;
+      c->minor = minors[i];
+      if ((ret = nfs4_session_setup(c)) == 0)
+         return 0;
+      if (ret < 0)
+         return -1;
+   }
+   c->minor = 0;
+   return nfs4_setclientid(c);
 }
 
 /* The export root: PUTROOTFH then LOOKUP down the pseudo path. */
@@ -797,10 +1152,13 @@ static int nfs4_mount(struct rnfs_ctx *c)
    return -1;
 }
 
+static int nfs4_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
+      struct rnfs_stat *st, int parent, char *last, size_t last_len);
+
 /* Walk @path from the root with LOOKUPs in one COMPOUND, ending with
  * GETFH and GETATTR; with @parent the last component is left for the
  * caller in @last. */
-static int nfs4_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
+static int nfs4_walk_once(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
       struct rnfs_stat *st, int parent, char *last, size_t last_len)
 {
    /* PUTFH, a LOOKUP per path component, GETFH, GETATTR: sized for the
@@ -950,6 +1308,7 @@ static int nfs4_open_create(struct rnfs_ctx *c, const struct rnfs_fh *dir,
          f->size = st.size;
    }
    f->opened = 1;
+   nfs4_state_link(c, f);
    if (rflags & 2)                      /* OPEN4_RESULT_CONFIRM */
    {
       x.p = ops; x.fail = 0;
@@ -969,6 +1328,126 @@ static int nfs4_open_create(struct rnfs_ctx *c, const struct rnfs_fh *dir,
    }
    (void)sl;
    return 0;
+}
+
+/* Open state the server no longer has: its lease ran out on a server
+ * that reclaims, or it restarted. Read-only files carry none. */
+static int nfs4_state_lost(uint32_t st)
+{
+   return st == NFS4ERR_STALE_STATEID || st == NFS4ERR_BAD_STATEID
+       || st == NFS4ERR_EXPIRED       || st == NFS4ERR_ADMIN_REVOKED;
+}
+
+/* NFSv4.0 after a server restart: take the open back (CLAIM_PREVIOUS)
+ * by its handle, as the same client the server knew before, which it
+ * grants during its grace period - when an ordinary open is refused
+ * until grace ends, which on Linux is 90 seconds.
+ *
+ * Returns: 0; -1 with c->status NFS4ERR_NO_GRACE when the server is
+ * not in grace (the open goes by path then), or another failure. */
+static int nfs4_open_reclaim(struct rnfs_ctx *c, struct rnfs_file *f)
+{
+   uint8_t  ops[NFS3_FHSIZE + 96];
+   struct xdr x, r;
+   uint32_t rflags, st;
+
+   x.p = ops; x.end = ops + sizeof(ops); x.fail = 0;
+   nfs4_put_fh(&x, &f->fh);
+   xdr_u32(&x, OP_OPEN);
+   xdr_u32(&x, c->open_seq);
+   xdr_u32(&x, 2);                      /* OPEN4_SHARE_ACCESS_WRITE, as opened */
+   xdr_u32(&x, 0);                      /* share_deny none */
+   xdr_u64(&x, c->clientid);
+   xdr_opaque(&x, c->owner, 8);         /* open_owner */
+   xdr_u32(&x, 0);                      /* OPEN4_NOCREATE */
+   xdr_u32(&x, 1);                      /* CLAIM_PREVIOUS */
+   xdr_u32(&x, 0);                      /* delegation: none */
+   if (x.fail || nfs4_compound(c, ops, (size_t)(x.p - ops), 2, &r) != 0)
+      return -1;
+   if (nfs4_res(&r) != NFS3_OK || (st = nfs4_res(&r)) != NFS3_OK)
+      return -1;
+   c->open_seq++;
+   memcpy(f->stateid, r.p, 16); r.p += 16;
+   xdr_get_u32(&r); xdr_get_u64(&r); xdr_get_u64(&r);   /* change_info */
+   rflags = xdr_get_u32(&r);
+   {
+      uint32_t nb = xdr_get_u32(&r);    /* attrset */
+      while (nb-- && !r.fail)
+         xdr_get_u32(&r);
+   }
+   if (r.fail || xdr_get_u32(&r) != 0)  /* no delegation asked, none taken */
+      return -1;
+   f->opened = 1;
+   nfs4_state_link(c, f);
+   if (rflags & 2)                      /* OPEN4_RESULT_CONFIRM */
+   {
+      x.p = ops; x.fail = 0;
+      nfs4_put_fh(&x, &f->fh);
+      xdr_u32(&x, OP_OPEN_CONFIRM);
+      memcpy(x.p, f->stateid, 16); x.p += 16;
+      xdr_u32(&x, c->open_seq);
+      if (nfs4_compound(c, ops, (size_t)(x.p - ops), 2, &r) != 0
+            || nfs4_res(&r) != NFS3_OK || nfs4_res(&r) != NFS3_OK)
+         return -1;
+      c->open_seq++;
+      memcpy(f->stateid, r.p, 16);
+   }
+   return 0;
+}
+
+/* Open @f again by the path it was opened with, keeping its position:
+ * a fresh OPEN state for one the server lost. */
+static int nfs4_reopen(struct rnfs_ctx *c, struct rnfs_file *f)
+{
+   struct rnfs_fh dir;
+   char   last[256];
+   uint64_t offset = f->offset, size = f->size;
+   if (!f->path)
+      return -1;
+   /* 4.0 after a restart: the server is in grace and refuses a new
+    * open until it ends, but grants this client its old ones back. A
+    * server that restarted knows the client no more until it says who
+    * it is again - the same identity, which the server remembers. 4.1
+    * says RECLAIM_COMPLETE when it sets up a session, so its server
+    * can end grace for it at once and the open below goes through. */
+   if (!c->minor)
+   {
+      if (nfs4_open_reclaim(c, f) == 0)
+         goto done;
+      if (     (c->status == NFS4ERR_STALE_CLIENTID || c->status == NFS4ERR_EXPIRED)
+            && nfs4_setclientid(c) == 0 && nfs4_open_reclaim(c, f) == 0)
+         goto done;
+   }
+   if (nfs4_walk(c, f->path, &dir, NULL, 1, last, sizeof(last)) != 0 || !last[0])
+      return -1;
+   if (nfs4_open_create(c, &dir, last, 0, f) != 0)
+   {
+      /* the client itself expired, not only its open: identify again
+       * - the same identity, so a server that kept anything keeps it -
+       * then open */
+      if (c->status != NFS4ERR_EXPIRED && c->status != NFS4ERR_STALE_CLIENTID)
+         return -1;
+      if ((c->minor ? nfs4_session_setup(c) : nfs4_setclientid(c)) != 0
+            || nfs4_open_create(c, &dir, last, 0, f) != 0)
+         return -1;
+   }
+done:
+   f->offset = offset;
+   if (size > f->size)
+      f->size = size;
+   return 0;
+}
+
+/* As rnfs_walk(): walked again on a new connection when the old one
+ * went. */
+static int nfs4_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
+      struct rnfs_stat *st, int parent, char *last, size_t last_len)
+{
+   if (nfs4_walk_once(c, path, fh, st, parent, last, last_len) == 0)
+      return 0;
+   if (c->fd >= 0 || c->redialing)
+      return -1;
+   return nfs4_walk_once(c, path, fh, st, parent, last, last_len);
 }
 
 static int nfs4_close(struct rnfs_ctx *c, struct rnfs_file *f)
@@ -1001,6 +1480,7 @@ static int64_t nfs4_write(struct rnfs_ctx *c, struct rnfs_file *f, const void *b
       /* the COMPOUND is assembled in rx and the RPC in tx, so the ops
        * need a buffer of their own for a payload this size */
       uint8_t *ops;
+      uint8_t  sid[16];                 /* the state this WRITE goes with */
       struct xdr x, r;
       uint32_t count;
       size_t n = len - done;
@@ -1011,7 +1491,8 @@ static int64_t nfs4_write(struct rnfs_ctx *c, struct rnfs_file *f, const void *b
       x.p = ops; x.end = ops + n + NFS3_FHSIZE + 64; x.fail = 0;
       nfs4_put_fh(&x, &f->fh);
       xdr_u32(&x, OP_WRITE_OP);
-      memcpy(x.p, f->stateid, 16); x.p += 16;
+      memcpy(sid, f->stateid, 16);
+      memcpy(x.p, sid, 16); x.p += 16;
       xdr_u64(&x, f->offset);
       xdr_u32(&x, 2);                   /* FILE_SYNC4 */
       xdr_opaque(&x, in + done, n);
@@ -1020,6 +1501,31 @@ static int64_t nfs4_write(struct rnfs_ctx *c, struct rnfs_file *f, const void *b
          free(ops);
          return -1;
       }
+      if (     f->opened && nfs4_state_lost(c->status) && !c->stale_state
+            && memcmp(sid, f->stateid, 16) != 0)
+      {
+         /* the call found the connection gone and the dial that mended
+          * it took the open back (a reclaim): the state is fresh, only
+          * this WRITE carried the old one */
+         c->stale_state = 1;
+         free(ops);
+         continue;
+      }
+      if (f->opened && nfs4_state_lost(c->status) && !c->stale_state)
+      {
+         /* the same octets at the same offset, FILE_SYNC: safe to send
+          * again once the file is open again */
+         c->stale_state = 1;
+         free(ops);
+         if (nfs4_reopen(c, f) != 0)
+         {
+            c->stale_state = 0;
+            rnfs_err(c, "write: open state lost");
+            return -1;
+         }
+         continue;
+      }
+      c->stale_state = 0;
       free(ops);
       if (nfs4_res(&r) != NFS3_OK || nfs4_res(&r) != NFS3_OK)
       {
@@ -1188,6 +1694,9 @@ void rnfs_free(struct rnfs_ctx *c)
 {
    if (!c)
       return;
+   /* files still open are the caller's: they only leave this list */
+   while (c->stateful)
+      nfs4_state_unlink(c->stateful);
    rnfs_disconnect(c);
    free(c->rx);
    free(c->tx);
@@ -1232,7 +1741,7 @@ int rnfs_connect(struct rnfs_ctx *c, const char *server, const char *export_path
          return -1;
       c->connected = 1;
       c->io_size   = NFS3_MAX_IO;
-      if (nfs4_setclientid(c) != 0 || nfs4_mount(c) != 0)
+      if (nfs4_establish(c) != 0 || nfs4_mount(c) != 0)
       {
          rnfs_disconnect(c);
          return -1;
@@ -1307,12 +1816,41 @@ int rnfs_connect(struct rnfs_ctx *c, const char *server, const char *export_path
    return 0;
 }
 
+/* The connection is gone; the server and export stay, so the next
+ * call can dial again. */
+static void rnfs_drop(struct rnfs_ctx *c)
+{
+   if (c->fd >= 0)
+      socket_close(c->fd);
+   c->fd           = -1;
+   c->connected    = 0;
+   c->have_session = 0;
+}
+
+/* Dial the server and export this context last connected to - after a
+ * server restart, a dropped link, a timeout. Not from inside a dial. */
+static int rnfs_redial(struct rnfs_ctx *c)
+{
+   char server[256];
+   char export_path[512];
+   int  ret;
+   if (c->redialing || !c->server[0])
+      return -1;
+   strlcpy(server, c->server, sizeof(server));
+   strlcpy(export_path, c->export_path, sizeof(export_path));
+   c->redialing = 1;
+   ret          = rnfs_connect(c, server, export_path);
+   c->redialing = 0;
+   return ret;
+}
+
 void rnfs_disconnect(struct rnfs_ctx *c)
 {
    if (c->fd >= 0)
       socket_close(c->fd);
-   c->fd        = -1;
-   c->connected = 0;
+   c->fd           = -1;
+   c->connected    = 0;
+   c->have_session = 0;   /* the server lets it lapse with the lease */
 }
 
 /* ---- path resolution ---------------------------------------------- */
@@ -1487,7 +2025,7 @@ static int rnfs_walk_from(struct rnfs_ctx *c, const char *norm, size_t start,
 /* Walk @path from the root (or the nearest directory cached on the
  * way) with LOOKUPs; with @parent the last component is left for the
  * caller in @last. */
-static int rnfs_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
+static int rnfs_walk_once(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
       struct rnfs_stat *st, int parent, char *last, size_t last_len)
 {
    char   norm[RNFS_DCACHE_PATH + 256];
@@ -1524,6 +2062,37 @@ static int rnfs_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
    }
    *fh = c->root;
    return rnfs_walk_from(c, norm, 0, fh, st, parent, last, last_len, &stale);
+}
+
+/* The NFSv4 minor version the connection settled on (0, 1 or 2). */
+unsigned rnfs_get_minor_version(const struct rnfs_ctx *c)
+{
+   return c->minor;
+}
+
+/* A walk looks things up and changes nothing: one that failed because
+ * the connection went is walked again on a new one. */
+static int rnfs_walk(struct rnfs_ctx *c, const char *path, struct rnfs_fh *fh,
+      struct rnfs_stat *st, int parent, char *last, size_t last_len)
+{
+   if (rnfs_walk_once(c, path, fh, st, parent, last, last_len) == 0)
+      return 0;
+   if (c->fd >= 0 || c->redialing)
+      return -1;
+   return rnfs_walk_once(c, path, fh, st, parent, last, last_len);
+}
+
+/* Octets of RPC replies this connection has received: for tests that
+ * check what crossed the network. */
+uint64_t rnfs_get_rx_bytes(const struct rnfs_ctx *c)
+{
+   return c->rx_bytes;
+}
+
+/* READ_PLUS in use for reads (NFSv4.2, until a server refuses it). */
+int rnfs_get_read_plus(const struct rnfs_ctx *c)
+{
+   return c->read_plus;
 }
 
 /* RPCs this connection has made: for tests that count round trips. */
@@ -1573,6 +2142,11 @@ struct rnfs_file *rnfs_open(struct rnfs_ctx *c, const char *path, int flags)
          {
             free(f);
             return NULL;
+         }
+         {
+            size_t plen = strlen(path) + 1;
+            if ((f->path = (char*)malloc(plen)))
+               memcpy(f->path, path, plen);
          }
          return f;
       }
@@ -1671,20 +2245,22 @@ struct rnfs_file *rnfs_open(struct rnfs_ctx *c, const char *path, int flags)
 #define RNFS_PIPELINE 8
 
 /* Send one READ for @n octets at @off: v3 as its own call, v4 as a
- * PUTFH+READ compound. */
+ * PUTFH+READ compound - in a session led by a SEQUENCE on @slot. */
 static int rnfs_send_read(struct rnfs_ctx *c, struct rnfs_file *f,
-      uint64_t off, size_t n, uint32_t *xid)
+      uint64_t off, size_t n, unsigned slot, uint32_t *xid)
 {
-   uint8_t args[NFS3_FHSIZE + 64];
+   uint8_t args[NFS3_FHSIZE + 128];
    struct xdr x;
    x.p = args; x.end = args + sizeof(args); x.fail = 0;
    if (c->version == 4)
    {
-      xdr_u32(&x, 0);                      /* tag: empty */
-      xdr_u32(&x, 0);                      /* minorversion */
-      xdr_u32(&x, 2);                      /* PUTFH, READ */
+      nfs4_head(&x, c, 2, c->have_session);   /* PUTFH, READ */
+      if (c->have_session)
+         nfs4_sequence(&x, c, slot);
       nfs4_put_fh(&x, &f->fh);
-      xdr_u32(&x, OP_READ);
+      /* READ_PLUS takes READ's arguments; its reply sends holes as
+       * their extent rather than as zeros */
+      xdr_u32(&x, c->read_plus ? OP_READ_PLUS : OP_READ);
       memcpy(x.p, f->stateid, 16); x.p += 16;
       xdr_u64(&x, off);
       xdr_u32(&x, (uint32_t)n);
@@ -1702,27 +2278,110 @@ static int rnfs_send_read(struct rnfs_ctx *c, struct rnfs_file *f,
 
 /* Parse a READ reply at the cursor: data span in @d/@dl, @eof; 1 on
  * success, 0 for a v4 GRACE/DELAY (ask again), -1 on failure. */
-static int rnfs_parse_read(struct rnfs_ctx *c, struct xdr *r,
-      const uint8_t **d, size_t *dl, uint32_t *eof)
+static int rnfs_parse_read(struct rnfs_ctx *c, struct xdr *r, unsigned slot,
+      uint64_t at, uint64_t size, uint8_t *dst, size_t want, size_t *got,
+      uint32_t *eof)
 {
    struct rnfs_stat st;
+   const uint8_t *d;
+   size_t   dl;
    uint32_t count;
    if (c->version == 4)
    {
-      size_t tl;
+      size_t   tl;
+      uint32_t op, ost;
       c->status = xdr_get_u32(r);
       xdr_get_opaque(r, &tl);              /* tag */
       xdr_get_u32(r);                      /* numres */
-      if (c->status == 10013 || c->status == 10008)
+      if (c->have_session)
+      {
+         uint32_t sst = nfs4_sequence_res(r, c, slot);
+         if (sst == NFS4ERR_DELAY)
+            return 0;
+         if (sst != NFS3_OK)
+         {
+            if (sst == NFS4ERR_BADSESSION || sst == NFS4ERR_DEADSESSION)
+               c->lost_session = 1;
+            rnfs_err(c, "read: session refused");
+            return -1;
+         }
+      }
+      if (nfs4_state_lost(c->status))
+         c->stale_state = 1;
+      if (c->status == NFS4ERR_GRACE || c->status == NFS4ERR_DELAY)
          return 0;
-      if (c->status != NFS3_OK || nfs4_res(r) != NFS3_OK || nfs4_res(r) != NFS3_OK)
+      if (nfs4_res(r) != NFS3_OK)          /* PUTFH */
+      {
+         rnfs_err(c, "read failed");
+         return -1;
+      }
+      op  = xdr_get_u32(r);
+      ost = xdr_get_u32(r);
+      /* a server that has no READ_PLUS after all: plain READ from
+       * here on, and this one asked again as that */
+      if (     (op == OP_READ_PLUS || op == OP_ILLEGAL)
+            && (ost == NFS3ERR_NOTSUPP || ost == OP_ILLEGAL))
+      {
+         c->read_plus = 0;
+         return 2;
+      }
+      if (c->status != NFS3_OK || ost != NFS3_OK)
       {
          rnfs_err(c, "read failed");
          return -1;
       }
       *eof = xdr_get_u32(r);
-      *d   = xdr_get_opaque(r, dl);
-      return *d ? 1 : -1;
+      if (op == OP_READ_PLUS)
+      {
+         /* runs of data and holes, in order from @at: data copied in,
+          * holes zeroed here instead of crossing the network */
+         uint32_t n     = xdr_get_u32(r);
+         size_t   pos   = 0;
+         while (n-- && !r->fail)
+         {
+            uint32_t type = xdr_get_u32(r);
+            uint64_t sof  = xdr_get_u64(r);
+            uint64_t slen;
+            if (sof != at + pos)
+               goto broken;               /* runs out of order */
+            if (type == NFS4_CONTENT_DATA)
+            {
+               if (!(d = xdr_get_opaque(r, &dl)) || dl > want - pos)
+                  goto broken;
+               memcpy(dst + pos, d, dl);
+               pos += dl;
+            }
+            else if (type == NFS4_CONTENT_HOLE)
+            {
+               slen = xdr_get_u64(r);
+               if (slen > want - pos)
+                  slen = want - pos;         /* a hole may run on past the request */
+               memset(dst + pos, 0, (size_t)slen);
+               pos += (size_t)slen;
+            }
+            else
+               goto broken;
+         }
+         /* nothing read and not at the end: no progress to make; or the
+          * end claimed short of the size the file was opened with */
+         if (     r->fail || (!pos && want && !*eof)
+               || (*eof && at + pos < size))
+            goto broken;
+         *got = pos;
+         return 1;
+broken:
+         /* a reply no READ could have given - servers exist whose
+          * READ_PLUS is broken (nfs-ganesha 4.3 answers every range
+          * with one empty data run): plain READ from here on, and this
+          * range asked again as that */
+         c->read_plus = 0;
+         return 2;
+      }
+      if (!(d = xdr_get_opaque(r, &dl)) || dl > want)
+         return -1;
+      memcpy(dst, d, dl);
+      *got = dl;
+      return 1;
    }
    c->status = xdr_get_u32(r);
    if (c->status != NFS3_OK)
@@ -1733,20 +2392,27 @@ static int rnfs_parse_read(struct rnfs_ctx *c, struct xdr *r,
    xdr_get_post_op_attr(r, &st);
    count = xdr_get_u32(r);
    *eof  = xdr_get_u32(r);
-   *d    = xdr_get_opaque(r, dl);
-   if (!*d || *dl != count)
+   d     = xdr_get_opaque(r, &dl);
+   if (!d || dl != count || dl > want)
       return -1;
+   memcpy(dst, d, dl);
+   *got = dl;
    return 1;
 }
 
 /* Fetch @len octets at @off into @out with pipelined READs; the
  * octets read (short at end of file), -1 on failure. */
-static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
+static int64_t rnfs_fetch_once(struct rnfs_ctx *c, struct rnfs_file *f,
       uint64_t off, uint8_t *out, size_t len)
 {
    uint32_t xids[RNFS_PIPELINE];
    size_t   offs[RNFS_PIPELINE], lens[RNFS_PIPELINE];
+   unsigned sslot[RNFS_PIPELINE];       /* the session slot each READ is on */
    unsigned inflight = 0, i, grace = 0, short_at = 0;
+   /* in a session no more READs than slots, each on its own */
+   unsigned depth    = (c->version == 4 && c->have_session && c->slots < RNFS_PIPELINE)
+      ? c->slots : RNFS_PIPELINE;
+   uint32_t busy     = 0;
    size_t   sent = 0, end = 0;     /* contiguous data: up to the first short reply */
    int      eof = 0, fail = 0;
 
@@ -1757,16 +2423,22 @@ static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
    }
    while ((sent < len && !eof && !fail) || inflight)
    {
-      while (inflight < RNFS_PIPELINE && sent < len && !eof && !fail)
+      while (inflight < depth && sent < len && !eof && !fail)
       {
-         size_t n = len - sent;
+         size_t   n  = len - sent;
+         unsigned sl = 0;
          if (n > c->io_size)
             n = c->io_size;
-         if (rnfs_send_read(c, f, off + sent, n, &xids[inflight]) != 0)
+         while (sl < RNFS_PIPELINE - 1 && (busy & (1u << sl)))
+            sl++;
+         if (rnfs_send_read(c, f, off + sent, n, sl, &xids[inflight]) != 0)
          {
+            rnfs_drop(c);                /* the link went: dial again */
             fail = 1;
             break;
          }
+         busy            |= 1u << sl;
+         sslot[inflight]  = sl;
          offs[inflight] = sent;
          lens[inflight] = n;
          inflight++;
@@ -1777,18 +2449,32 @@ static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
       {
          struct xdr r;
          uint32_t xid, reof = 0;
-         const uint8_t *d = NULL;
          size_t dl = 0;
          unsigned slot = RNFS_PIPELINE;
          int pr;
          if (rnfs_rpc_recv(c, c->fd, &xid, &r) != 0)
+         {
+            rnfs_drop(c);                /* the link went: dial again */
             return -1;
+         }
          for (i = 0; i < inflight; i++)
             if (xids[i] == xid)
                slot = i;
          if (slot == RNFS_PIPELINE)
             continue;
-         pr = rnfs_parse_read(c, &r, &d, &dl, &reof);
+         pr = rnfs_parse_read(c, &r, sslot[slot], off + offs[slot], f->size,
+               out + offs[slot], lens[slot], &dl, &reof);
+         if (pr == 2)
+         {
+            /* READ_PLUS refused: this chunk again, now as READ */
+            if (rnfs_send_read(c, f, off + offs[slot], lens[slot],
+                     sslot[slot], &xids[slot]) != 0)
+            {
+               rnfs_drop(c);
+               fail = 1;
+            }
+            continue;
+         }
          if (pr == 0)
          {
             /* v4 GRACE/DELAY: wait and reissue this chunk, bounded */
@@ -1800,8 +2486,12 @@ static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
             else
             {
                nfs4_wait_ms(1000);
-               if (rnfs_send_read(c, f, off + offs[slot], lens[slot], &xids[slot]) != 0)
+               if (rnfs_send_read(c, f, off + offs[slot], lens[slot],
+                        sslot[slot], &xids[slot]) != 0)
+               {
+                  rnfs_drop(c);
                   fail = 1;
+               }
                continue;
             }
          }
@@ -1812,7 +2502,7 @@ static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
          }
          else
          {
-            memcpy(out + offs[slot], d, dl);
+            /* the data is in place: the parser wrote it there */
             /* a short or empty reply ends the contiguous run there,
              * whatever later chunks answered; only the run counts */
             if (reof || dl < lens[slot])
@@ -1825,15 +2515,69 @@ static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
                }
             }
          }
-         xids[slot] = xids[inflight - 1];
-         offs[slot] = offs[inflight - 1];
-         lens[slot] = lens[inflight - 1];
+         busy       &= ~(1u << sslot[slot]);
+         xids[slot]  = xids[inflight - 1];
+         offs[slot]  = offs[inflight - 1];
+         lens[slot]  = lens[inflight - 1];
+         sslot[slot] = sslot[inflight - 1];
          inflight--;
       }
    }
    if (fail)
       return -1;
    return (int64_t)(short_at ? end : sent);
+}
+
+/* rnfs_fetch_once(), and again after what broke it is mended - READ
+ * changes nothing, so asking twice is safe: a dropped connection is
+ * dialled again (a server restart, a timeout), a lost session set up
+ * again, a lost open state opened again. At most twice, since a new
+ * connection can show the open state went with the old one. */
+static int64_t rnfs_fetch(struct rnfs_ctx *c, struct rnfs_file *f,
+      uint64_t off, uint8_t *out, size_t len)
+{
+   unsigned mend;
+   int64_t  r = -1;
+   for (mend = 0; mend <= 2; mend++)
+   {
+      c->lost_session = 0;
+      c->stale_state  = 0;
+      if (c->fd < 0 && rnfs_redial(c) != 0)
+         return -1;
+      if ((r = rnfs_fetch_once(c, f, off, out, len)) >= 0 || c->redialing)
+         break;
+      if (c->fd >= 0 && c->lost_session)
+      {
+         if (nfs4_session_setup(c) != 0)
+            break;
+      }
+      else if (c->fd >= 0 && c->stale_state && f->opened)
+      {
+         if (nfs4_reopen(c, f) != 0)
+            break;
+      }
+      else if (c->fd >= 0)
+         break;                         /* the server said no: final */
+   }
+   c->lost_session = 0;
+   c->stale_state  = 0;
+   return r;
+}
+
+static int64_t rnfs_write_once(struct rnfs_ctx *c, struct rnfs_file *f,
+      const void *buf, size_t len);
+
+/* A write goes to an explicit offset, so sending the same octets there
+ * again changes nothing: one that failed because the connection went
+ * is written again, from where it began, on a new one. */
+int64_t rnfs_write(struct rnfs_ctx *c, struct rnfs_file *f, const void *buf, size_t len)
+{
+   uint64_t start = f->offset;
+   int64_t  r     = rnfs_write_once(c, f, buf, len);
+   if (r >= 0 || c->fd >= 0 || c->redialing)
+      return r;
+   f->offset = start;
+   return rnfs_write_once(c, f, buf, len);
 }
 
 int64_t rnfs_read(struct rnfs_ctx *c, struct rnfs_file *f, void *buf, size_t len)
@@ -1883,7 +2627,8 @@ int64_t rnfs_read(struct rnfs_ctx *c, struct rnfs_file *f, void *buf, size_t len
    return (int64_t)len;
 }
 
-int64_t rnfs_write(struct rnfs_ctx *c, struct rnfs_file *f, const void *buf, size_t len)
+static int64_t rnfs_write_once(struct rnfs_ctx *c, struct rnfs_file *f,
+      const void *buf, size_t len)
 {
    const uint8_t *in = (const uint8_t*)buf;
    size_t done = 0;
@@ -1958,7 +2703,11 @@ int rnfs_close(struct rnfs_ctx *c, struct rnfs_file *f)
    if (c && f && c->version == 4 && f->opened)
       ret = nfs4_close(c, f);
    if (f)
+   {
       free(f->ra);
+      free(f->path);
+      nfs4_state_unlink(f);
+   }
    free(f);
    return ret;
 }

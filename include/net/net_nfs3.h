@@ -121,6 +121,15 @@ const char *rnfs_get_error(const struct rnfs_ctx *c);
 /* Remote calls this connection has made, for tests that count round
  * trips. */
 uint32_t rnfs_get_call_count(const struct rnfs_ctx *c);
+
+/* For NFSv4: the minor version in use - the newest of 2, 1 and 0 the
+ * server speaks, chosen when connecting. */
+unsigned rnfs_get_minor_version(const struct rnfs_ctx *c);
+
+/* Octets of replies received, and whether reads go as NFSv4.2
+ * READ_PLUS (holes sent as their extent): for tests. */
+uint64_t rnfs_get_rx_bytes(const struct rnfs_ctx *c);
+int rnfs_get_read_plus(const struct rnfs_ctx *c);
 /* Last nfsstat3, for callers that map them. */
 uint32_t rnfs_get_status(const struct rnfs_ctx *c);
 int rnfs_get_fd(const struct rnfs_ctx *c);

@@ -219,9 +219,12 @@ static void task_queue_push_progress(retro_task_t *task)
 #endif
 
    /* Retirement must reach an attached frontend even when text is
-    * suppressed or a replacement title allocation failed. */
-   if (impl_current->msg_push &&
-         (have_msg || (finished && task->frontend_userdata)))
+    * suppressed or a replacement title allocation failed. Whether one
+    * is attached is the frontend's to read: frontend_userdata is its
+    * link, cleared on whatever thread it frees its side on, so a
+    * finished task always pushes and the frontend ignores an empty
+    * message with nothing attached. */
+   if (impl_current->msg_push && (have_msg || finished))
       impl_current->msg_push(task, buf, 1, 60, flush);
 }
 
@@ -655,6 +658,11 @@ static void retro_task_threaded_run_main(unsigned due);
 static unsigned retro_task_threaded_due_main(retro_task_t *task,
       retro_time_t *now);
 
+/* The running tasks gather() reports on after dropping running_lock;
+ * main thread only, grown as needed and freed at deinit. */
+static retro_task_t **task_report    = NULL;
+static unsigned       task_report_cap = 0;
+
 static void retro_task_threaded_gather(void)
 {
    retro_task_t *task = NULL;
@@ -667,17 +675,42 @@ static void retro_task_threaded_gather(void)
       return;
 
    {
-      /* One pass under the lock: publish progress, and count the
-       * main-thread tasks that are due. */
-      retro_time_t now = 0;
-      unsigned     due = 0;
+      /* One pass under the lock counts the main-thread tasks that are
+       * due and takes down which tasks to report on; the reports -
+       * formatting, and the push into the frontend's message path -
+       * are made after it, so a worker picking up or settling a task
+       * never waits on them. A task in the running list is freed only
+       * by a retire on this thread, so the pointers stay good until
+       * the retire below. The list they are taken down in grows to the
+       * number running, before the lock; a task pushed in between
+       * waits for the next pass. */
+      retro_time_t now     = 0;
+      unsigned     due     = 0;
+      unsigned     reports = 0;
+      unsigned     want    = (unsigned)retro_atomic_load_acquire_int(
+            &tasks_running_count) + 8;
+      unsigned     i;
+      if (want > task_report_cap)
+      {
+         retro_task_t **grown = (retro_task_t**)realloc(task_report,
+               want * sizeof(*grown));
+         if (grown)
+         {
+            task_report     = grown;
+            task_report_cap = want;
+         }
+      }
       slock_lock(running_lock);
       for (task = tasks_running.front; task; task = task->next)
       {
-         task_queue_push_progress(task);
+         if (reports < task_report_cap)
+            task_report[reports++] = task;
          due += retro_task_threaded_due_main(task, &now);
       }
       slock_unlock(running_lock);
+
+      for (i = 0; i < reports; i++)
+         task_queue_push_progress(task_report[i]);
 
       if (due)
          retro_task_threaded_run_main(due);
@@ -908,11 +941,14 @@ static void retro_task_threaded_retrieve(task_retriever_data_t *data)
    slock_unlock(running_lock);
 }
 
-static bool task_worker_prefer_fast_cores;
+/* Set on the main thread, read by the worker as it starts */
+static retro_atomic_int_t task_worker_prefer_fast_cores =
+   RETRO_ATOMIC_INT_INITIALIZER(0);
 
 void task_queue_set_prefer_fast_cores(bool prefer)
 {
-   task_worker_prefer_fast_cores = prefer;
+   retro_atomic_store_release_int(&task_worker_prefer_fast_cores,
+         prefer ? 1 : 0);
 }
 
 /* Main-thread tasks are run by retro_task_threaded_gather(), never by
@@ -1005,9 +1041,20 @@ static unsigned retro_task_threaded_due_main(retro_task_t *task,
  * a handler meanwhile waits for the next check. */
 static void retro_task_threaded_run_main(unsigned due)
 {
+   /* A main-thread handler that waits on the queue gathers again from
+    * inside this pass.  The task it runs in, and every other one this
+    * pass took, is still on the running list; running them from the
+    * nested gather would run them twice and settle them twice.  The
+    * pass further up the stack runs them.  Only the checking thread
+    * gets here, so a plain flag does. */
+   static bool in_run_main = false;
    retro_time_t started = 0;
    unsigned     n_ran   = 0;
    retro_task_t *task   = NULL;
+
+   if (in_run_main)
+      return;
+   in_run_main = true;
 
    if (task_handler_budget_usec)
       started = cpu_features_get_time_usec();
@@ -1049,6 +1096,8 @@ static void retro_task_threaded_run_main(unsigned due)
       n_ran++;
       retro_task_threaded_settle(task);
    }
+
+   in_run_main = false;
 }
 
 static void threaded_worker(void *userdata)
@@ -1056,7 +1105,7 @@ static void threaded_worker(void *userdata)
    struct task_worker *self = (struct task_worker*)userdata;
 
    sthread_setname("ra-task");
-   if (task_worker_prefer_fast_cores)
+   if (retro_atomic_load_acquire_int(&task_worker_prefer_fast_cores))
       sthread_prefer_fast_cores();
 
    for (;;)
@@ -1294,6 +1343,9 @@ static void retro_task_threaded_deinit(void)
                   TASK_WORKER_IN_HANDLER, TASK_WORKER_ORPHANED))
          {
             retro_task_threaded_orphan_worker(task);
+            free(task_report);
+            task_report     = NULL;
+            task_report_cap = 0;
             return;
          }
       }
@@ -1311,6 +1363,10 @@ static void retro_task_threaded_deinit(void)
 
    worker_thread   = NULL;
    worker_self     = NULL;
+
+   free(task_report);
+   task_report     = NULL;
+   task_report_cap = 0;
 }
 
 static struct retro_task_impl impl_threaded = {

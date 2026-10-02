@@ -70,6 +70,10 @@
 
 #define CIPHER_AES128_CCM 0x0001
 #define CIPHER_AES128_GCM 0x0002
+/* 3.1.1 signing algorithms (SIGNING_CAPABILITIES) */
+#define SIGN_AES_CMAC     0x0001
+#define SIGN_AES_GMAC     0x0002
+#define SMB2_CANCEL_CMD   0x000C
 
 #define SMB2_HDR_SIZE 64
 #define SMB2_TRANSFORM_HDR_SIZE 52
@@ -78,7 +82,13 @@
  * SMB2_LARGE_IO once the server has granted the credits; the
  * connection's buffers are sized to what it negotiated. */
 #define SMB2_MAX_IO   (64 * 1024)
+/* The 3DS keeps the 64 KiB start: its RAM is small, four connections
+ * at 1 MiB would hold 8 MiB of buffers, and its Wi-Fi gains nothing. */
+#ifdef _3DS
+#define SMB2_LARGE_IO (64 * 1024)
+#else
 #define SMB2_LARGE_IO (1024 * 1024)
+#endif
 #define SMB2_BUF_SIZE(io) (SMB2_TRANSFORM_HDR_SIZE + SMB2_HDR_SIZE + (io) + 4096)
 #define SMB2_RX_SIZE  SMB2_BUF_SIZE(SMB2_MAX_IO)
 
@@ -116,6 +126,7 @@
 
 struct rsmb_file
 {
+   struct rsmb_file *next, *prev;   /* the context's open files */
    uint64_t offset;
    uint64_t size;
    uint8_t  fid[16];
@@ -139,6 +150,10 @@ struct rsmb_dir
 
 struct rsmb_ctx
 {
+   /* files open on this context: freed with it, as libsmb2 frees a
+    * context's handles, so a caller dropping a dead connection does
+    * not have to close each one over it first */
+   struct rsmb_file *files;
    uint8_t *rx;                 /* SMB2_RX_SIZE */
    uint8_t *tx;                 /* SMB2_RX_SIZE */
    char    *user;
@@ -163,6 +178,10 @@ struct rsmb_ctx
    int      fd;
    uint8_t  session_key[16];
    uint8_t  signing_key[16];
+   /* 3.1.1: the algorithm the server chose, SIGN_AES_CMAC unless it
+    * took GMAC; the GMAC key schedule, set up with the keys */
+   unsigned sign_alg;
+   struct aes_gcm_ctx sign_gcm;
    uint8_t  enc_key[16];        /* client -> server */
    uint8_t  dec_key[16];        /* server -> client */
    uint8_t  preauth[64];        /* 3.1.1 hash chain */
@@ -327,12 +346,22 @@ static int rsmb_recv_raw(struct rsmb_ctx *c, size_t *len)
 
 /* ---- signing and sealing ------------------------------------------ */
 
-static void rsmb_sign(struct rsmb_ctx *c, uint8_t *msg, size_t len)
+/* The 16-octet signature of msg (its signature field zeroed), by the
+ * connection's algorithm: HMAC-SHA256 on 2.x, AES-CMAC on 3.x, AES-GMAC
+ * on 3.1.1 when the server chose it - the nonce being the MessageId and
+ * then the sender (1 for the server) and CANCEL bits. */
+static void rsmb_mac(struct rsmb_ctx *c, const uint8_t *msg, size_t len,
+      int from_server, uint8_t *mac)
 {
-   uint8_t mac[32];
-   smb_put32(msg + 16, smb_get32(msg + 16) | SMB2_FLAGS_SIGNED);
-   memset(msg + 48, 0, 16);
-   if (c->dialect >= DIALECT_300)
+   if (c->dialect == DIALECT_311 && c->sign_alg == SIGN_AES_GMAC)
+   {
+      uint8_t nonce[12];
+      memcpy(nonce, msg + 24, 8);
+      smb_put32(nonce + 8, (from_server ? 1u : 0u)
+            | (smb_get16(msg + 12) == SMB2_CANCEL_CMD ? 2u : 0u));
+      aes_gcm_encrypt(&c->sign_gcm, nonce, 12, msg, len, NULL, 0, NULL, mac);
+   }
+   else if (c->dialect >= DIALECT_300)
    {
       struct aes_ctx a;
       aes_init(&a, c->signing_key, 16);
@@ -341,6 +370,14 @@ static void rsmb_sign(struct rsmb_ctx *c, uint8_t *msg, size_t len)
    }
    else
       hmac_sha256(c->signing_key, 16, msg, len, mac);
+}
+
+static void rsmb_sign(struct rsmb_ctx *c, uint8_t *msg, size_t len)
+{
+   uint8_t mac[32];
+   smb_put32(msg + 16, smb_get32(msg + 16) | SMB2_FLAGS_SIGNED);
+   memset(msg + 48, 0, 16);
+   rsmb_mac(c, msg, len, 0, mac);
    memcpy(msg + 48, mac, 16);
 }
 
@@ -351,15 +388,7 @@ static int rsmb_verify_sig(struct rsmb_ctx *c, uint8_t *msg, size_t len)
       return -1;
    memcpy(got, msg + 48, 16);
    memset(msg + 48, 0, 16);
-   if (c->dialect >= DIALECT_300)
-   {
-      struct aes_ctx a;
-      aes_init(&a, c->signing_key, 16);
-      aes_cmac(&a, msg, len, mac);
-      crypto_memzero(&a, sizeof(a));
-   }
-   else
-      hmac_sha256(c->signing_key, 16, msg, len, mac);
+   rsmb_mac(c, msg, len, 1, mac);
    memcpy(msg + 48, got, 16);
    return crypto_memeq_ct(got, mac, 16) ? 0 : -1;
 }
@@ -583,7 +612,7 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
    while ((SMB2_HDR_SIZE + off) & 7)
       b[off++] = 0;
    smb_put32(b + 28, (uint32_t)(SMB2_HDR_SIZE + off));   /* NegotiateContextOffset */
-   smb_put16(b + 32, 2);                                 /* NegotiateContextCount */
+   smb_put16(b + 32, 3);                                 /* NegotiateContextCount */
    /* PREAUTH_INTEGRITY_CAPABILITIES */
    smb_put16(b + off, 1); smb_put16(b + off + 2, 38); smb_put32(b + off + 4, 0);
    smb_put16(b + off + 8, 1); smb_put16(b + off + 10, 32); smb_put16(b + off + 12, 1);
@@ -594,6 +623,13 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
    /* ENCRYPTION_CAPABILITIES: GCM preferred, CCM */
    smb_put16(b + off, 2); smb_put16(b + off + 2, 6); smb_put32(b + off + 4, 0);
    smb_put16(b + off + 8, 2); smb_put16(b + off + 10, CIPHER_AES128_GCM); smb_put16(b + off + 12, CIPHER_AES128_CCM);
+   off += 8 + 6;
+   while ((SMB2_HDR_SIZE + off) & 7)
+      b[off++] = 0;
+   /* SIGNING_CAPABILITIES: GMAC preferred - it runs on the GCM code,
+    * blocks in parallel, where CMAC chains every block on the last */
+   smb_put16(b + off, 8); smb_put16(b + off + 2, 6); smb_put32(b + off + 4, 0);
+   smb_put16(b + off + 8, 2); smb_put16(b + off + 10, SIGN_AES_GMAC); smb_put16(b + off + 12, SIGN_AES_CMAC);
    off += 8 + 6;
 
    memset(c->preauth, 0, 64);
@@ -621,6 +657,7 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
    }
    c->signing   = 1;
    c->cipher    = 0;
+   c->sign_alg  = SIGN_AES_CMAC;
    if (c->dialect == DIALECT_300 || c->dialect == DIALECT_302)
       c->cipher = CIPHER_AES128_CCM;
    if (c->dialect == DIALECT_311)
@@ -640,6 +677,10 @@ static int rsmb_negotiate(struct rsmb_ctx *c)
          unsigned type = smb_get16(ctx), dlen = smb_get16(ctx + 2);
          if (type == 2 && dlen >= 4)
             c->cipher = smb_get16(ctx + 10);
+         else if (type == 8 && dlen >= 4
+               && (smb_get16(ctx + 10) == SIGN_AES_GMAC
+                  || smb_get16(ctx + 10) == SIGN_AES_CMAC))
+            c->sign_alg = smb_get16(ctx + 10);
          coff += 8 + dlen;
          while (coff & 7)
             coff++;
@@ -766,6 +807,8 @@ static void rsmb_derive_session_keys(struct rsmb_ctx *c)
    if (c->dialect == DIALECT_311)
    {
       kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBSigningKey", 14, c->preauth, 64, c->signing_key, 16);
+      if (c->sign_alg == SIGN_AES_GMAC)
+         aes_gcm_init(&c->sign_gcm, c->signing_key, 16);
       kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBC2SCipherKey", 16, c->preauth, 64, c->enc_key, 16);
       kbkdf_hmac_sha256(c->session_key, 16, (const uint8_t*)"SMBS2CCipherKey", 16, c->preauth, 64, c->dec_key, 16);
    }
@@ -1338,6 +1381,7 @@ void rsmb_disconnect(struct rsmb_ctx *c)
    c->connected = 0;
    crypto_memzero(c->session_key, 16);
    crypto_memzero(c->signing_key, 16);
+   crypto_memzero(&c->sign_gcm, sizeof(c->sign_gcm));
    crypto_memzero(c->enc_key, 16);
    crypto_memzero(c->dec_key, 16);
 }
@@ -1346,6 +1390,15 @@ void rsmb_free(struct rsmb_ctx *c)
 {
    if (!c)
       return;
+   /* files still open go with the context, without a word to the
+    * server: it is gone, or the caller has given the connection up */
+   while (c->files)
+   {
+      struct rsmb_file *f = c->files;
+      c->files = f->next;
+      free(f->ra);
+      free(f);
+   }
    rsmb_disconnect(c);
    rsmb_set_credentials(c, NULL, NULL, NULL);
    free(c->rx);
@@ -1356,6 +1409,12 @@ void rsmb_free(struct rsmb_ctx *c)
 
 const char *rsmb_get_error(const struct rsmb_ctx *c) { return c->error; }
 uint32_t    rsmb_get_status(const struct rsmb_ctx *c) { return c->status; }
+unsigned    rsmb_get_sign_alg(const struct rsmb_ctx *c)
+{
+   if (c->dialect < DIALECT_300)
+      return 0;
+   return c->dialect == DIALECT_311 ? c->sign_alg : SIGN_AES_CMAC;
+}
 int         rsmb_get_fd(const struct rsmb_ctx *c)     { return c->fd; }
 
 /* ---- files -------------------------------------------------------- */
@@ -1437,6 +1496,10 @@ struct rsmb_file *rsmb_open(struct rsmb_ctx *c, const char *path, int flags)
       return NULL;
    }
    f->size = size;
+   f->next = c->files;
+   if (c->files)
+      c->files->prev = f;
+   c->files = f;
    return f;
 }
 
@@ -1675,12 +1738,24 @@ int64_t rsmb_tell(const struct rsmb_file *f)
    return (int64_t)f->offset;
 }
 
+static void rsmb_file_unlink(struct rsmb_ctx *c, struct rsmb_file *f)
+{
+   if (f->prev)
+      f->prev->next = f->next;
+   else if (c->files == f)
+      c->files = f->next;
+   if (f->next)
+      f->next->prev = f->prev;
+   f->next = f->prev = NULL;
+}
+
 int rsmb_close(struct rsmb_ctx *c, struct rsmb_file *f)
 {
    int r;
    if (!f)
       return -1;
    r = rsmb_close_fid(c, f->fid);
+   rsmb_file_unlink(c, f);
    free(f->ra);
    free(f);
    return r;

@@ -131,25 +131,18 @@ static struct tls_session tls_cache[TLS_CACHE_SLOTS];
 #ifdef HAVE_THREADS
 #include <rthreads/rthreads.h>
 #include <retro_atomic.h>
-static retro_atomic_ptr_t tls_cache_lock_ptr;
-static slock_t *tls_cache_lock_get(void)
+/* A flag, not an slock: every section it guards is a lookup, a few
+ * copies and at most one allocation, nothing that waits on another
+ * thread, and with no lock object to make there is none that can fail
+ * to be made. */
+static retro_atomic_int_t tls_cache_busy;
+static void tls_cache_lock(void)
 {
-   slock_t *l = (slock_t*)retro_atomic_load_acquire_ptr(&tls_cache_lock_ptr);
-   if (!l)
-   {
-      slock_t *fresh = slock_new();
-      if (retro_atomic_cas_ptr(&tls_cache_lock_ptr, NULL, fresh))
-         l = fresh;
-      else
-      {
-         slock_free(fresh);
-         l = (slock_t*)retro_atomic_load_acquire_ptr(&tls_cache_lock_ptr);
-      }
-   }
-   return l;
+   while (!retro_atomic_cas_int(&tls_cache_busy, 0, 1))
+      sthread_yield();
 }
-#define TLS_CACHE_LOCK()   slock_lock(tls_cache_lock_get())
-#define TLS_CACHE_UNLOCK() slock_unlock(tls_cache_lock_get())
+#define TLS_CACHE_LOCK()   tls_cache_lock()
+#define TLS_CACHE_UNLOCK() retro_atomic_store_release_int(&tls_cache_busy, 0)
 #else
 #define TLS_CACHE_LOCK()   do { } while (0)
 #define TLS_CACHE_UNLOCK() do { } while (0)
@@ -193,21 +186,40 @@ static struct tls_session *tls_cache_slot(const char *host)
    return e;
 }
 
-/* The trust bundle is net/cacert.h unless a test swapped one in. */
-static const char *tls_trust_pem     = cacert_pem;
-static size_t      tls_trust_pem_len = sizeof(cacert_pem);
+/* The trust bundle is net/cacert.h's parts unless a test swapped one
+ * in, which is then the single part. */
+static const char         *tls_test_pem[1];
+static size_t              tls_test_pem_len[1];
+static const char *const  *tls_trust_parts = cacert_pem_parts;
+static const size_t       *tls_trust_sizes = cacert_pem_sizes;
+static unsigned            tls_trust_count = CACERT_PEM_PARTS;
 
 void ssl_socket_retro_set_trust_pem(const char *pem, size_t len)
 {
-   tls_trust_pem     = pem ? pem : cacert_pem;
-   tls_trust_pem_len = pem ? len : sizeof(cacert_pem);
+   if (pem)
+   {
+      tls_test_pem[0]     = pem;
+      tls_test_pem_len[0] = len;
+      tls_trust_parts     = (const char *const*)tls_test_pem;
+      tls_trust_sizes     = tls_test_pem_len;
+      tls_trust_count     = 1;
+   }
+   else
+   {
+      tls_trust_parts     = cacert_pem_parts;
+      tls_trust_sizes     = cacert_pem_sizes;
+      tls_trust_count     = CACERT_PEM_PARTS;
+   }
 }
 
 struct ssl_state
 {
    uint8_t *rx;             /* raw record buffer */
    uint8_t *hs;             /* handshake message accumulator */
-   uint8_t *pt;             /* decrypted application data pending */
+   /* decrypted application data pending: a record's plaintext where
+    * it was decrypted, in rx - the next record read comes only once
+    * this is drained, so it is handed out with no copy of its own */
+   const uint8_t *pt;
    const char *domain;
    size_t   rx_len;
    size_t   hs_len;
@@ -227,6 +239,14 @@ struct ssl_state
    uint8_t  master[48];
    uint8_t  cwk[32];
    uint8_t  swk[32];
+   /* AES-GCM key schedules for cwk / swk, built when a key is first
+    * used and again only when it changes, not once per record */
+   struct tls_gcm_cache
+   {
+      struct aes_gcm_ctx g;
+      uint8_t  key[32];
+      unsigned key_len;             /* 0: nothing built yet */
+   } wgcm, rgcm;
    uint8_t  civ[12];
    uint8_t  siv[12];
    uint8_t  priv[48];
@@ -242,6 +262,13 @@ struct ssl_state
    uint8_t *cork;
    size_t   cork_len;
    uint8_t  corked;
+   /* One sealed application-data record not yet fully on the wire,
+    * for ssl_socket_send_all_nonblocking(): bytes are sealed as they
+    * are accepted, and what the socket did not take waits here.
+    * Allocated on first use. */
+   uint8_t *tx;
+   size_t   tx_len;
+   size_t   tx_off;
    uint8_t  resumed;        /* this connection resumed a session */
    uint8_t  expect_ticket;  /* server said it will send a NewSessionTicket */
    uint8_t  offered_sid[32];
@@ -305,6 +332,25 @@ static int tls_suite_is_aes256(unsigned suite)
    return suite == TLS_SUITE_ECDHE_RSA_AES256_GCM
        || suite == TLS_SUITE_ECDHE_ECDSA_AES256_GCM
        || suite == TLS13_AES_256_GCM_SHA384;
+}
+
+/* The GCM context for @key (cwk or swk), rebuilt only when the key
+ * differs from the one it was built from. */
+static const struct aes_gcm_ctx *tls_gcm(struct ssl_state *s,
+      struct tls_gcm_cache *c, const uint8_t *key)
+{
+   unsigned klen = tls_suite_is_aes256(s->suite) ? 32 : 16;
+   if (c->key_len != klen || memcmp(c->key, key, klen) != 0)
+   {
+      if (aes_gcm_init(&c->g, key, klen) != 0)
+      {
+         c->key_len = 0;
+         return NULL;
+      }
+      memcpy(c->key, key, klen);
+      c->key_len = klen;
+   }
+   return &c->g;
 }
 
 /* The AES-256-GCM suites run their PRF and transcript on SHA-384. */
@@ -411,21 +457,17 @@ static int tls_uncork(struct ssl_state *s)
    return 0;
 }
 
-static int tls_send_record(struct ssl_state *s, uint8_t type,
-      const uint8_t *data, size_t len)
+/* Seal @len bytes of @type into @rec (room for 5 + len +
+ * TLS_REC_OVERHEAD), advancing the write sequence.  *@out_len is the
+ * record's length on the wire. */
+static int tls_seal_record(struct ssl_state *s, uint8_t type,
+      const uint8_t *data, size_t len, uint8_t *rec, size_t *out_len)
 {
-   uint8_t *rec;
    size_t   rec_len;
-   int      ok;
 
    if (len > TLS_REC_MAX)
       return -1;
 
-   if (!(rec = (uint8_t*)malloc(5 + len + TLS_REC_OVERHEAD)))
-   {
-      s->last_err = TLS_ERR_MEMORY;
-      return -1;
-   }
    rec[0] = type;
    rec[1] = 3;
    rec[2] = 3;
@@ -462,15 +504,10 @@ static int tls_send_record(struct ssl_state *s, uint8_t type,
       }
       else
       {
-         struct aes_gcm_ctx g;
-         if (aes_gcm_init(&g, s->cwk, tls_suite_is_aes256(s->suite) ? 32 : 16) != 0
-               || aes_gcm_encrypt(&g, nonce, 12, aad, 5, body, len + 1,
+         const struct aes_gcm_ctx *g = tls_gcm(s, &s->wgcm, s->cwk);
+         if (!g || aes_gcm_encrypt(g, nonce, 12, aad, 5, body, len + 1,
                      body, body + len + 1) != 0)
-         {
-            crypto_memzero(&g, sizeof(g));
             goto fail;
-         }
-         crypto_memzero(&g, sizeof(g));
       }
       tls_put16(rec + 3, (unsigned)(rec_len - 5));
       s->cseq++;
@@ -502,28 +539,75 @@ static int tls_send_record(struct ssl_state *s, uint8_t type,
       else
       {
          /* nonce = write_iv (4) || explicit (8) = seq; explicit sent */
-         struct aes_gcm_ctx g;
+         const struct aes_gcm_ctx *g = tls_gcm(s, &s->wgcm, s->cwk);
          memcpy(nonce, s->civ, 4);
          crypto_store64_be(nonce + 4, s->cseq);
          memcpy(body, nonce + 4, 8);
-         if (aes_gcm_init(&g, s->cwk, tls_suite_is_aes256(s->suite) ? 32 : 16) != 0
-               || aes_gcm_encrypt(&g, nonce, 12, aad, 13, data, len,
+         if (!g || aes_gcm_encrypt(g, nonce, 12, aad, 13, data, len,
                      body + 8, body + 8 + len) != 0)
-         {
-            crypto_memzero(&g, sizeof(g));
             goto fail;
-         }
-         crypto_memzero(&g, sizeof(g));
          rec_len = 5 + 8 + len + 16;
       }
       tls_put16(rec + 3, (unsigned)(rec_len - 5));
       s->cseq++;
    }
 
+   *out_len = rec_len;
+   return 0;
+
+fail:
+   s->last_err = TLS_ERR_CIPHER;
+   return -1;
+}
+
+/* Put a pending non-blocking record on the wire before anything else
+ * goes out, so records leave in sequence order. */
+static int tls_tx_drain_blocking(struct ssl_state *s)
+{
+   if (s->tx_off >= s->tx_len)
+      return 0;
+   socket_set_block(s->fd, true);
+   if (!socket_send_all_blocking(s->fd, s->tx + s->tx_off,
+            s->tx_len - s->tx_off, true))
+   {
+      s->last_err = TLS_ERR_SOCKET;
+      return -1;
+   }
+   s->tx_off = s->tx_len = 0;
+   return 0;
+}
+
+static int tls_send_record(struct ssl_state *s, uint8_t type,
+      const uint8_t *data, size_t len)
+{
+   uint8_t *rec;
+   size_t   rec_len;
+   int      ok;
+
+   if (len > TLS_REC_MAX)
+      return -1;
+   if (!s->corked && tls_tx_drain_blocking(s) != 0)
+      return -1;
+
+   if (!(rec = (uint8_t*)malloc(5 + len + TLS_REC_OVERHEAD)))
+   {
+      s->last_err = TLS_ERR_MEMORY;
+      return -1;
+   }
+   if (tls_seal_record(s, type, data, len, rec, &rec_len) != 0)
+   {
+      free(rec);
+      return -1;
+   }
+
    if (s->corked)
    {
       if (s->cork_len + rec_len > TLS_CORK_MAX)
-         goto fail;
+      {
+         free(rec);
+         s->last_err = TLS_ERR_CIPHER;
+         return -1;
+      }
       memcpy(s->cork + s->cork_len, rec, rec_len);
       s->cork_len += rec_len;
       free(rec);
@@ -537,18 +621,17 @@ static int tls_send_record(struct ssl_state *s, uint8_t type,
       return -1;
    }
    return 0;
-
-fail:
-   free(rec);
-   s->last_err = TLS_ERR_CIPHER;
-   return -1;
 }
 
 /* Reads one record into s->rx, decrypting in place once the server
  * write keys are in force. On return *type is the content type, and
  * *body / *len the plaintext. */
-static int tls_read_record(struct ssl_state *s, uint8_t *type,
-      const uint8_t **body, size_t *len)
+/* One record, its body in *body: decrypted in place in s->rx, or -
+ * when @dst is given and the record's plaintext fits @dst_cap - into
+ * @dst, so application data lands where the caller wants it with no
+ * copy. The AEADs check the tag before writing anything. */
+static int tls_read_record_to(struct ssl_state *s, uint8_t *type,
+      const uint8_t **body, size_t *len, uint8_t *dst, size_t dst_cap)
 {
    size_t rlen;
 
@@ -582,12 +665,14 @@ static int tls_read_record(struct ssl_state *s, uint8_t *type,
       uint8_t aad[5];
       uint8_t nonce[12];
       uint8_t *p = s->rx + 5;
+      uint8_t *o;
       size_t  plen, i;
       int     r;
 
       if (*type != TLS_CT_APPDATA || rlen < 17)
          goto bad;
       plen = rlen - 16;
+      o    = (dst && plen <= dst_cap) ? dst : p;
       aad[0] = s->rx[0]; aad[1] = 3; aad[2] = 3;
       tls_put16(aad + 3, (unsigned)rlen);
       memcpy(nonce, s->siv, 12);
@@ -595,25 +680,22 @@ static int tls_read_record(struct ssl_state *s, uint8_t *type,
          nonce[4 + i] ^= (uint8_t)(s->sseq >> (56 - 8 * i));
       if (tls_suite_is_chacha(s->suite))
          r = aead_decrypt(AEAD_CHACHA20_POLY1305, s->swk, 32, nonce, 12,
-               aad, 5, p, plen, p + plen, 16, p);
+               aad, 5, p, plen, p + plen, 16, o);
       else
       {
-         struct aes_gcm_ctx g;
-         r = aes_gcm_init(&g, s->swk, tls_suite_is_aes256(s->suite) ? 32 : 16);
-         if (r == 0)
-            r = aes_gcm_decrypt(&g, nonce, 12, aad, 5, p, plen, p + plen, p);
-         crypto_memzero(&g, sizeof(g));
+         const struct aes_gcm_ctx *g = tls_gcm(s, &s->rgcm, s->swk);
+         r = g ? aes_gcm_decrypt(g, nonce, 12, aad, 5, p, plen, p + plen, o) : -1;
       }
       if (r != 0)
          goto bad;
       s->sseq++;
       /* inner: content || type || zero padding */
-      while (plen && p[plen - 1] == 0)
+      while (plen && o[plen - 1] == 0)
          plen--;
       if (!plen)
          goto bad;
-      *type = p[plen - 1];
-      *body = p;
+      *type = o[plen - 1];
+      *body = o;
       *len  = plen - 1;
    }
    else
@@ -621,6 +703,7 @@ static int tls_read_record(struct ssl_state *s, uint8_t *type,
       uint8_t aad[13];
       uint8_t nonce[12];
       uint8_t *p = s->rx + 5;
+      uint8_t *o;
       size_t  plen;
       size_t  i;
 
@@ -643,6 +726,7 @@ static int tls_read_record(struct ssl_state *s, uint8_t *type,
          p += 8;
       }
 
+      o = (dst && *type == TLS_CT_APPDATA && plen <= dst_cap) ? dst : p;
       crypto_store64_be(aad, s->sseq);
       aad[8]  = *type;
       aad[9]  = 3;
@@ -652,21 +736,17 @@ static int tls_read_record(struct ssl_state *s, uint8_t *type,
       if (tls_suite_is_chacha(s->suite))
       {
          if (aead_decrypt(AEAD_CHACHA20_POLY1305, s->swk, 32, nonce, 12,
-                  aad, 13, p, plen, p + plen, 16, p) != 0)
+                  aad, 13, p, plen, p + plen, 16, o) != 0)
             goto bad;
       }
       else
       {
-         struct aes_gcm_ctx g;
-         int r = aes_gcm_init(&g, s->swk, tls_suite_is_aes256(s->suite) ? 32 : 16);
-         if (r == 0)
-            r = aes_gcm_decrypt(&g, nonce, 12, aad, 13, p, plen, p + plen, p);
-         crypto_memzero(&g, sizeof(g));
-         if (r != 0)
+         const struct aes_gcm_ctx *g = tls_gcm(s, &s->rgcm, s->swk);
+         if (!g || aes_gcm_decrypt(g, nonce, 12, aad, 13, p, plen, p + plen, o) != 0)
             goto bad;
       }
       s->sseq++;
-      *body = p;
+      *body = o;
       *len  = plen;
    }
 
@@ -683,6 +763,12 @@ static int tls_read_record(struct ssl_state *s, uint8_t *type,
 bad:
    s->last_err = TLS_ERR_CIPHER;
    return -1;
+}
+
+static int tls_read_record(struct ssl_state *s, uint8_t *type,
+      const uint8_t **body, size_t *len)
+{
+   return tls_read_record_to(s, type, body, len, NULL, 0);
 }
 
 static int tls_send_alert(struct ssl_state *s, uint8_t level, uint8_t desc)
@@ -777,13 +863,26 @@ static void tls13_empty_hash(size_t hlen, uint8_t *out);
 
 static int tls_send_client_hello(struct ssl_state *s)
 {
-   static const uint8_t suites[] = {
+   /* AES-GCM first where the CPU has AES instructions; ChaCha20-
+    * Poly1305 first where AES runs in software (3DS, Vita, older
+    * phones), as it costs several times less there. Servers that
+    * weigh the client's order pick accordingly. */
+   static const uint8_t suites_aes[] = {
       0x13, 0x01, 0x13, 0x03, 0x13, 0x02,              /* TLS 1.3 */
       0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x2c, 0xc0, 0x30
    };
+   static const uint8_t suites_chacha[] = {
+      0x13, 0x03, 0x13, 0x01, 0x13, 0x02,              /* TLS 1.3 */
+      0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30
+   };
+   const uint8_t *suites = crypto_aes_hw() ? suites_aes : suites_chacha;
    uint8_t *h;
    uint8_t *p;
-   size_t   dlen = s->domain ? strlen(s->domain) : 0;
+   uint8_t  iplit[16];
+   /* No server_name for an IP address: RFC 6066 3 allows host names
+    * only, and the certificate is checked against the address anyway. */
+   size_t   dlen = (s->domain && !x509_parse_ip(s->domain, iplit))
+      ? strlen(s->domain) : 0;
    size_t   ext_len;
    int      ret;
    const struct tls_session *cached;
@@ -858,8 +957,8 @@ static int tls_send_client_hello(struct ssl_state *s)
    }
    *p++ = (uint8_t)s->offered_sid_len;
    memcpy(p, s->offered_sid, s->offered_sid_len); p += s->offered_sid_len;
-   tls_put16(p, sizeof(suites)); p += 2;
-   memcpy(p, suites, sizeof(suites)); p += sizeof(suites);
+   tls_put16(p, sizeof(suites_aes)); p += 2;
+   memcpy(p, suites, sizeof(suites_aes)); p += sizeof(suites_aes);
    *p++ = 1; *p++ = 0;                             /* null compression */
 
    {
@@ -1159,7 +1258,7 @@ static int tls_recv_certificate(struct ssl_state *s, struct x509_cert *leaf)
       ssl_socket_log_verify_disabled(s->domain);
       return 0;
    }
-   x509_trust_load_pem(tls_trust_pem, tls_trust_pem_len);
+   x509_trust_load_pem_parts(tls_trust_parts, tls_trust_sizes, tls_trust_count);
    info[0] = '\0';
    if (x509_verify_chain(ders, lens, n, s->domain, time(NULL), info, sizeof(info)) != 0)
    {
@@ -1680,7 +1779,7 @@ static int tls13_recv_certificate(struct ssl_state *s, struct x509_cert *leaf)
       ssl_socket_log_verify_disabled(s->domain);
       return 0;
    }
-   x509_trust_load_pem(tls_trust_pem, tls_trust_pem_len);
+   x509_trust_load_pem_parts(tls_trust_parts, tls_trust_sizes, tls_trust_count);
    info[0] = '\0';
    if (x509_verify_chain(ders, lens, n, s->domain, time(NULL), info, sizeof(info)) != 0)
    {
@@ -2058,17 +2157,19 @@ void* ssl_socket_init(int fd, const char *domain)
    }
 #endif
    s->fd     = fd;
-   s->domain = domain;
+   /* A copy: the connection can outlive the caller's string - net_http
+    * pools it after the transfer that opened it is gone, and a TLS 1.3
+    * ticket arriving later is filed under this name. */
+   s->domain = domain ? strdup(domain) : NULL;
    s->rx     = (uint8_t*)malloc(TLS_RX_SIZE);
    s->hs     = (uint8_t*)malloc(TLS_HS_MAX);
-   s->pt     = (uint8_t*)malloc(TLS_REC_MAX);
    s->cork   = (uint8_t*)malloc(TLS_CORK_MAX);
-   if (!s->rx || !s->hs || !s->pt || !s->cork)
+   if (!s->rx || !s->hs || !s->cork || (domain && !s->domain))
    {
       free(s->cork);
       free(s->rx);
       free(s->hs);
-      free(s->pt);
+      free((char*)s->domain);
       free(s);
       return NULL;
    }
@@ -2081,6 +2182,14 @@ unsigned ssl_socket_retro_version(void *state_data)
    if (!s || !s->handshake_done)
       return 0;
    return s->v13 ? 0x0304 : 0x0303;
+}
+
+unsigned ssl_socket_retro_suite(void *state_data)
+{
+   const struct ssl_state *s = (const struct ssl_state*)state_data;
+   if (!s || !s->handshake_done)
+      return 0;
+   return s->suite;
 }
 
 int ssl_socket_retro_was_resumed(void *state_data)
@@ -2120,8 +2229,9 @@ int ssl_socket_connect(void *state_data,
    return 1;
 }
 
-/* Fills s->pt with the next application record. */
-static int tls_fill(struct ssl_state *s)
+/* Points s->pt at the next application record's plaintext: in @dst
+ * when given and the record fits @dst_cap, else in s->rx. */
+static int tls_fill(struct ssl_state *s, uint8_t *dst, size_t dst_cap)
 {
    uint8_t type;
    const uint8_t *b;
@@ -2129,11 +2239,11 @@ static int tls_fill(struct ssl_state *s)
 
    for (;;)
    {
-      if (tls_read_record(s, &type, &b, &len) != 0)
+      if (tls_read_record_to(s, &type, &b, &len, dst, dst_cap) != 0)
          return -1;
       if (type == TLS_CT_APPDATA)
       {
-         memcpy(s->pt, b, len);
+         s->pt     = b;
          s->pt_len = len;
          s->pt_off = 0;
          return 0;
@@ -2169,8 +2279,15 @@ int ssl_socket_receive_all_blocking(void *state_data, void *data_, size_t len)
       size_t avail = s->pt_len - s->pt_off;
       if (!avail)
       {
-         if (tls_fill(s) != 0)
+         if (tls_fill(s, data, len) != 0)
             return -1;
+         if (s->pt == data)
+         {
+            /* decrypted in place in the caller's buffer */
+            s->pt_off = s->pt_len;
+            data     += s->pt_len;
+            len      -= s->pt_len;
+         }
          continue;
       }
       if (avail > len)
@@ -2198,16 +2315,29 @@ ssize_t ssl_socket_receive_all_nonblocking(void *state_data,
    *error = false;
    if (s->pt_len == s->pt_off)
    {
+      /* The end of the stream - close_notify, or the connection gone -
+       * is -1 with *error set, as a plain socket and the library
+       * backends report it: net_http ends a body that runs to the close
+       * on it. A 0 here would read as "nothing yet", and such a body
+       * would never finish. */
       if (s->closed)
-         return 0;
+      {
+         *error = true;
+         return -1;
+      }
       if (!socket_wait(s->fd, &rd, &wr, 0) || !rd)
          return 0;
       socket_set_block(s->fd, true);
-      if (tls_fill(s) != 0)
+      if (tls_fill(s, data, len) != 0)
       {
-         if (!s->closed)
-            *error = true;
-         return s->closed ? 0 : -1;
+         *error = true;
+         return -1;
+      }
+      if (s->pt == data)
+      {
+         /* decrypted in place in the caller's buffer */
+         s->pt_off = s->pt_len;
+         return (ssize_t)s->pt_len;
       }
    }
    got = s->pt_len - s->pt_off;
@@ -2226,6 +2356,8 @@ int ssl_socket_send_all_blocking(void *state_data, const void *data_,
    (void)no_signal;
 
    socket_set_block(s->fd, true);
+   if (tls_tx_drain_blocking(s) != 0)
+      return -1;
    while (len)
    {
       size_t n = len < TLS_REC_MAX ? len : TLS_REC_MAX;
@@ -2237,20 +2369,74 @@ int ssl_socket_send_all_blocking(void *state_data, const void *data_,
    return 1;
 }
 
+/* Push the pending record as far as the socket takes it now.
+ * 1: nothing left pending, 0: the socket is full, -1: error. */
+static int tls_tx_push(struct ssl_state *s)
+{
+   ssize_t n;
+   if (s->tx_off >= s->tx_len)
+      return 1;
+   socket_set_block(s->fd, false);
+   if ((n = socket_send_all_nonblocking(s->fd, s->tx + s->tx_off,
+               s->tx_len - s->tx_off, true)) < 0)
+   {
+      s->last_err = TLS_ERR_SOCKET;
+      return -1;
+   }
+   s->tx_off += (size_t)n;
+   return s->tx_off >= s->tx_len;
+}
+
 ssize_t ssl_socket_send_all_nonblocking(void *state_data, const void *data_,
       size_t len, bool no_signal)
 {
-   /* A record is written whole or not at all; the socket is blocking
-    * for the duration of the write, as the other backends do. */
-   if (ssl_socket_send_all_blocking(state_data, data_, len, no_signal) < 0)
+   struct ssl_state *s = (struct ssl_state*)state_data;
+   const uint8_t *data = (const uint8_t*)data_;
+   size_t taken        = 0;
+   (void)no_signal;
+
+   if (!s->tx && !(s->tx = (uint8_t*)malloc(5 + TLS_REC_MAX + TLS_REC_OVERHEAD)))
+   {
+      s->last_err = TLS_ERR_MEMORY;
       return -1;
-   return (ssize_t)len;
+   }
+
+   /* Seal a record only once the previous one is fully on the wire, so
+    * at most one record is ever held back; what is taken is sealed,
+    * and what the socket has not taken yet goes out on the next call
+    * or ssl_socket_flush_nonblocking(). */
+   for (;;)
+   {
+      size_t n;
+      int    r = tls_tx_push(s);
+      if (r < 0)
+         return -1;
+      if (!r || taken == len)
+         break;
+      n = len - taken;
+      if (n > TLS_REC_MAX)
+         n = TLS_REC_MAX;
+      if (tls_seal_record(s, TLS_CT_APPDATA, data + taken, n,
+               s->tx, &s->tx_len) != 0)
+         return -1;
+      s->tx_off = 0;
+      taken    += n;
+   }
+   return (ssize_t)taken;
+}
+
+int ssl_socket_flush_nonblocking(void *state_data)
+{
+   return tls_tx_push((struct ssl_state*)state_data);
 }
 
 void ssl_socket_close(void *state_data)
 {
    struct ssl_state *s = (struct ssl_state*)state_data;
-   if (s->handshake_done && !s->closed)
+   /* Not behind a half-sent record: the alert would have to wait for
+    * it, and a peer that stopped reading is exactly when a transfer is
+    * abandoned mid-upload. */
+   if (s->handshake_done && !s->closed && s->tx_off >= s->tx_len)
       tls_send_alert(s, 1, 0);   /* warning close_notify */
    socket_close(s->fd);
 }
@@ -2263,10 +2449,13 @@ void ssl_socket_free(void *state_data)
    crypto_memzero(s->master, sizeof(s->master));
    crypto_memzero(s->cwk, sizeof(s->cwk));
    crypto_memzero(s->swk, sizeof(s->swk));
+   crypto_memzero(&s->wgcm, sizeof(s->wgcm));
+   crypto_memzero(&s->rgcm, sizeof(s->rgcm));
    free(s->rx);
    free(s->hs);
-   free(s->pt);
    free(s->cork);
+   free(s->tx);
+   free((char*)s->domain);
    free(s);
 }
 

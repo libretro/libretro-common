@@ -63,10 +63,20 @@ void net_http_connection_set_headers(struct http_connection_t *conn, const char 
 /**
  * net_http_init:
  *
- * Creates the locks guarding the process-global DNS cache and
- * connection pool.  Call once at startup, before any thread can reach
- * net_http_update(); they were previously created lazily on first
- * use, which raced.  Idempotent, but not safe to call concurrently.
+ * Call once at startup, before the first transfer; it creates the
+ * eventcount a DNS wait parks on, and nothing creates it lazily.
+ * Idempotent, but not safe to call concurrently.
+ *
+ * Threading: net_http takes no locks.  The DNS cache and connection
+ * pool belong to the thread that drives transfers - every
+ * net_http_new/update/wait/delete sharing them must come from one
+ * thread at a time, and net_http_init()/net_http_deinit() run on it or
+ * while it is stopped.  Handing that role to another thread needs an
+ * ordering point in between (a thread join, a queue handoff).  DNS
+ * lookups run on threads of their own and publish into the cache with
+ * an atomic store.  Building connection objects
+ * (net_http_connection_*) touches no shared state and is fine from any
+ * thread.
  **/
 void net_http_init(void);
 
@@ -202,22 +212,85 @@ bool net_http_error(struct http_t *state);
 const char *net_http_failure(struct http_t *state, int *code);
 
 /**
+ * net_http_headers_take:
+ * @accept_err : also return them when the transfer failed
+ *
+ * The response headers as one block: each "Name: value" line
+ * NUL-terminated, the block ending in an empty line ("\0\0" at its
+ * end; a response with no header lines is a single "\0").  Walk it
+ * with net_http_header_next(), or look a field up with
+ * net_http_header_value().
+ *
+ * Ownership moves to the caller, who frees it with free(); repeated
+ * calls return the same pointer.  NULL when no status line was parsed,
+ * and on a transport error unless @accept_err - headers are returned
+ * for any parsed response, HTTP error statuses such as 401 included
+ * (needed for auth challenges).
+ **/
+char *net_http_headers_take(struct http_t *state, bool accept_err);
+
+/**
+ * net_http_headers_compact:
+ * @raw : header text, one "Name: value" line per LF or CRLF, NUL-terminated,
+ *        with one spare byte after the terminator
+ *
+ * Rewrites @raw in place into the block net_http_headers_take()
+ * returns: each line NUL-terminated, trailing CR and spaces trimmed,
+ * blank lines dropped, an empty line at the end.  Output never outgrows
+ * input, except for that closing NUL, which is what the spare byte is
+ * for.  For backends that get the headers as text from somewhere else
+ * (the browser, under Emscripten).
+ *
+ * Returns: the block's length, closing NUL excluded.
+ **/
+size_t net_http_headers_compact(char *raw);
+
+/**
+ * net_http_header_next:
+ *
+ * The line after @line in the block @headers (the first line when
+ * @line is NULL), or NULL at the end:
+ *
+ *    for (h = net_http_header_next(hdrs, NULL); h;
+ *         h = net_http_header_next(hdrs, h))
+ **/
+const char *net_http_header_next(const char *headers, const char *line);
+
+/**
+ * net_http_header_value:
+ *
+ * The value of the first field named @name (case-insensitive, whole
+ * name), leading whitespace skipped; NULL if there is none.  Points
+ * into @headers.  Fields that may repeat (WWW-Authenticate) want
+ * net_http_header_next() instead.
+ **/
+const char *net_http_header_value(const char *headers, const char *name);
+
+/**
+ * net_http_header:
+ *
+ * The value of response header @name, looked up without taking the
+ * block: usable mid-transfer, from a sink callback, once the status line
+ * and headers are in.  Points into the handle's own storage, valid until
+ * the handle follows a redirect, is deleted, or its headers are taken.
+ * NULL before the headers arrive, after a transport failure, or when the
+ * field is absent.
+ **/
+const char *net_http_header(struct http_t *state, const char *name);
+
+/**
  * net_http_headers:
  *
- * Leaf function.
- *
- * @return the response headers. The returned buffer is owned by the
- * caller of net_http_new; it is not freed by net_http_delete.
- * On a transport error, NULL is returned unless accept_error is true.
- * Headers are returned for any response that was parsed successfully,
- * including HTTP error statuses such as 401 (needed for auth challenges).
+ * Legacy: the headers as a newly built string_list, owned by the
+ * caller.  Costs an allocation per line; nothing in RetroArch uses it.
+ * Same NULL rules as net_http_headers_take().
  **/
 struct string_list *net_http_headers(struct http_t *state);
 struct string_list *net_http_headers_ex(struct http_t *state, bool accept_error);
 
 /**
  * net_http_body_is_framed:
- * @headers : response headers as net_http_headers() returns them
+ * @headers : header block as net_http_headers_take() returns it
  *
  * True when the response frames its body with Content-Length or
  * "Transfer-Encoding: chunked", tested exactly as the receiver picks
@@ -227,15 +300,16 @@ struct string_list *net_http_headers_ex(struct http_t *state, bool accept_error)
  * on a truncated body (writing a downloaded file over a local one)
  * check this first.
  **/
-bool net_http_body_is_framed(const struct string_list *headers);
+bool net_http_body_is_framed(const char *headers);
 
 /**
  * net_http_data:
  *
  * Leaf function.
  *
- * @return the downloaded data. The returned buffer is owned by the
- * HTTP handler; it's freed by net_http_delete.
+ * @return the downloaded data. Ownership of the returned buffer passes
+ * to the caller, who frees it with free(); net_http_delete() no longer
+ * does. A NULL return leaves the buffer with the handler.
  * If the status is not 20x and accept_error is false, it returns NULL.
  **/
 uint8_t* net_http_data(struct http_t *state, size_t* len, bool accept_error);
@@ -261,6 +335,48 @@ void net_http_urlencode(char **dest, const char *source);
  * Re-encode a full URL
  **/
 void net_http_urlencode_full(char *s, const char *source, size_t len);
+
+/**
+ * net_http_url_join:
+ * @dst      : output buffer
+ * @dst_size : size of @dst including the NUL
+ * @base     : absolute http:// or https:// URL
+ * @ref      : reference to resolve against @base (RFC 3986 section 5)
+ *
+ * An empty @ref gives @base; an absolute http(s) URL replaces it; a
+ * reference starting with "//" keeps only the scheme, "/" keeps scheme
+ * and authority, "?" keeps the path and "#" keeps path and query;
+ * anything else replaces the last segment of the base path.  "." and
+ * ".." segments are then removed.  No allocation.
+ *
+ * Returns: length of the result, or -1 when @base is not an http(s)
+ * URL, @ref has another scheme, or @dst is too small (@dst is then an
+ * empty string).
+ **/
+int net_http_url_join(char *dst, size_t dst_size,
+      const char *base, const char *ref);
+
+/**
+ * net_http_urldecode:
+ *
+ * Decode %XX escapes from @src into @dst.  A '%' not followed by two
+ * hex digits is copied as is; '+' is left alone (it is a space only in
+ * form bodies).  Returns the decoded length, or -1 when @dst is too
+ * small (@dst holds the truncated, terminated prefix).
+ *
+ * Not for a URL that is about to be requested: decoding "%20" puts a
+ * space in the request line.  Use it on names meant for display or for
+ * the local filesystem.
+ **/
+int net_http_urldecode(char *dst, size_t dst_size, const char *src);
+
+/**
+ * net_http_urldecode_inplace:
+ *
+ * As net_http_urldecode(), in @s itself; decoded text is never longer
+ * than its source.  Returns the decoded length.
+ **/
+int net_http_urldecode_inplace(char *s);
 
 RETRO_END_DECLS
 

@@ -618,115 +618,600 @@ done:
  * same Montgomery-form field arithmetic the curves use. Scalars and
  * coordinates are little-endian on the wire; the scalar is clamped as
  * the RFC says and the top bit of a coordinate ignored. */
-#define X25519_K (256 / BN_WORD_BITS)
 
-static const uint8_t x25519_p_be[32] = {
-   0x7f,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-   0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xed
-};
+#if defined(__SIZEOF_INT128__) && !defined(X25519_NO_128)
+/* 64-bit machines: arithmetic mod 2^255 - 19 in five 51-bit limbs,
+ * products in 128 bits. 2^255 = 19 (mod p), so what a product carries
+ * past limb 4 folds back into limb 0 times 19. Limbs stay under 2^52
+ * between operations: sums of two reduced values, and f + 2p - g for a
+ * difference, fit what a multiply takes. */
+__extension__ typedef unsigned __int128 fe51_u128;
+typedef uint64_t fe51[5];
+#define FE51_MASK (((uint64_t)1 << 51) - 1)
 
-static void x25519_cswap(bn_word swap, bn_word *a, bn_word *b)
+static void fe51_frombytes(fe51 h, const uint8_t *s)
 {
-   bn_word mask = (bn_word)0 - swap;
+   uint64_t w[4];
    unsigned i;
-   for (i = 0; i < X25519_K; i++)
+   for (i = 0; i < 4; i++)
+      w[i] = (uint64_t)s[8 * i]            | ((uint64_t)s[8 * i + 1] << 8)
+           | ((uint64_t)s[8 * i + 2] << 16) | ((uint64_t)s[8 * i + 3] << 24)
+           | ((uint64_t)s[8 * i + 4] << 32) | ((uint64_t)s[8 * i + 5] << 40)
+           | ((uint64_t)s[8 * i + 6] << 48) | ((uint64_t)s[8 * i + 7] << 56);
+   h[0] =  w[0]                       & FE51_MASK;
+   h[1] = ((w[0] >> 51) | (w[1] << 13)) & FE51_MASK;
+   h[2] = ((w[1] >> 38) | (w[2] << 26)) & FE51_MASK;
+   h[3] = ((w[2] >> 25) | (w[3] << 39)) & FE51_MASK;
+   h[4] =  (w[3] >> 12)               & FE51_MASK;   /* the top bit ignored */
+}
+
+static void fe51_carry(fe51 h)
+{
+   uint64_t c;
+   c = h[0] >> 51; h[0] &= FE51_MASK; h[1] += c;
+   c = h[1] >> 51; h[1] &= FE51_MASK; h[2] += c;
+   c = h[2] >> 51; h[2] &= FE51_MASK; h[3] += c;
+   c = h[3] >> 51; h[3] &= FE51_MASK; h[4] += c;
+   c = h[4] >> 51; h[4] &= FE51_MASK; h[0] += c * 19;
+   c = h[0] >> 51; h[0] &= FE51_MASK; h[1] += c;
+}
+
+/* The canonical value, 0 <= h < p, little-endian. */
+static void fe51_tobytes(uint8_t *s, const fe51 f)
+{
+   fe51     h;
+   uint64_t q, w[4];
+   unsigned i;
+   for (i = 0; i < 5; i++)
+      h[i] = f[i];
+   fe51_carry(h);
+   fe51_carry(h);
+   /* h < 2^255 now; subtract p once if h >= p: q = 1 iff h + 19 >= 2^255 */
+   q = (h[0] + 19) >> 51;
+   q = (h[1] + q) >> 51;
+   q = (h[2] + q) >> 51;
+   q = (h[3] + q) >> 51;
+   q = (h[4] + q) >> 51;
+   h[0] += 19 * q;
+   h[1] += h[0] >> 51; h[0] &= FE51_MASK;
+   h[2] += h[1] >> 51; h[1] &= FE51_MASK;
+   h[3] += h[2] >> 51; h[2] &= FE51_MASK;
+   h[4] += h[3] >> 51; h[3] &= FE51_MASK;
+   h[4] &= FE51_MASK;                    /* drops the 2^255 the +19 made */
+   w[0] = h[0]         | (h[1] << 51);
+   w[1] = (h[1] >> 13) | (h[2] << 38);
+   w[2] = (h[2] >> 26) | (h[3] << 25);
+   w[3] = (h[3] >> 39) | (h[4] << 12);
+   for (i = 0; i < 32; i++)
+      s[i] = (uint8_t)(w[i >> 3] >> (8 * (i & 7)));
+}
+
+static void fe51_add(fe51 h, const fe51 f, const fe51 g)
+{
+   unsigned i;
+   for (i = 0; i < 5; i++)
+      h[i] = f[i] + g[i];
+}
+
+/* f + 2p - g: never negative for reduced limbs */
+static void fe51_sub(fe51 h, const fe51 f, const fe51 g)
+{
+   h[0] = f[0] + (uint64_t)0xfffffffffffdaULL - g[0];
+   h[1] = f[1] + (uint64_t)0xffffffffffffeULL - g[1];
+   h[2] = f[2] + (uint64_t)0xffffffffffffeULL - g[2];
+   h[3] = f[3] + (uint64_t)0xffffffffffffeULL - g[3];
+   h[4] = f[4] + (uint64_t)0xffffffffffffeULL - g[4];
+}
+
+static void fe51_mul(fe51 h, const fe51 f, const fe51 g)
+{
+   fe51_u128 r0, r1, r2, r3, r4;
+   uint64_t  g1_19 = g[1] * 19, g2_19 = g[2] * 19, g3_19 = g[3] * 19, g4_19 = g[4] * 19;
+   uint64_t  c;
+   r0 = (fe51_u128)f[0] * g[0] + (fe51_u128)f[1] * g4_19 + (fe51_u128)f[2] * g3_19
+      + (fe51_u128)f[3] * g2_19 + (fe51_u128)f[4] * g1_19;
+   r1 = (fe51_u128)f[0] * g[1] + (fe51_u128)f[1] * g[0] + (fe51_u128)f[2] * g4_19
+      + (fe51_u128)f[3] * g3_19 + (fe51_u128)f[4] * g2_19;
+   r2 = (fe51_u128)f[0] * g[2] + (fe51_u128)f[1] * g[1] + (fe51_u128)f[2] * g[0]
+      + (fe51_u128)f[3] * g4_19 + (fe51_u128)f[4] * g3_19;
+   r3 = (fe51_u128)f[0] * g[3] + (fe51_u128)f[1] * g[2] + (fe51_u128)f[2] * g[1]
+      + (fe51_u128)f[3] * g[0] + (fe51_u128)f[4] * g4_19;
+   r4 = (fe51_u128)f[0] * g[4] + (fe51_u128)f[1] * g[3] + (fe51_u128)f[2] * g[2]
+      + (fe51_u128)f[3] * g[1] + (fe51_u128)f[4] * g[0];
+   c = (uint64_t)(r0 >> 51); h[0] = (uint64_t)r0 & FE51_MASK; r1 += c;
+   c = (uint64_t)(r1 >> 51); h[1] = (uint64_t)r1 & FE51_MASK; r2 += c;
+   c = (uint64_t)(r2 >> 51); h[2] = (uint64_t)r2 & FE51_MASK; r3 += c;
+   c = (uint64_t)(r3 >> 51); h[3] = (uint64_t)r3 & FE51_MASK; r4 += c;
+   c = (uint64_t)(r4 >> 51); h[4] = (uint64_t)r4 & FE51_MASK;
+   h[0] += c * 19;
+   c = h[0] >> 51; h[0] &= FE51_MASK; h[1] += c;
+}
+
+static void fe51_sq(fe51 h, const fe51 f)
+{
+   fe51_mul(h, f, f);
+}
+
+static void fe51_sqn(fe51 h, const fe51 f, unsigned n)
+{
+   fe51_sq(h, f);
+   while (--n)
+      fe51_sq(h, h);
+}
+
+/* 121665 f (a24 = (486662 - 2) / 4) */
+static void fe51_mul_a24(fe51 h, const fe51 f)
+{
+   fe51_u128 r;
+   uint64_t  c = 0;
+   unsigned  i;
+   for (i = 0; i < 5; i++)
    {
-      bn_word t = mask & (a[i] ^ b[i]);
+      r    = (fe51_u128)f[i] * 121665 + c;
+      h[i] = (uint64_t)r & FE51_MASK;
+      c    = (uint64_t)(r >> 51);
+   }
+   h[0] += c * 19;
+   c = h[0] >> 51; h[0] &= FE51_MASK; h[1] += c;
+}
+
+/* z^(p - 2) = z^(2^255 - 21): the inverse, by an addition chain of
+ * 254 squarings and 11 multiplies */
+static void fe51_invert(fe51 out, const fe51 z)
+{
+   fe51 z2, z9, z11, z_5, z_10, z_20, z_50, z_100, t;
+   fe51_sq(z2, z);                        /* 2 */
+   fe51_sqn(t, z2, 2);                    /* 8 */
+   fe51_mul(z9, t, z);                    /* 9 */
+   fe51_mul(z11, z9, z2);                 /* 11 */
+   fe51_sq(t, z11);                       /* 22 */
+   fe51_mul(z_5, t, z9);                  /* 2^5 - 1 */
+   fe51_sqn(t, z_5, 5);
+   fe51_mul(z_10, t, z_5);                /* 2^10 - 1 */
+   fe51_sqn(t, z_10, 10);
+   fe51_mul(z_20, t, z_10);               /* 2^20 - 1 */
+   fe51_sqn(t, z_20, 20);
+   fe51_mul(t, t, z_20);                  /* 2^40 - 1 */
+   fe51_sqn(t, t, 10);
+   fe51_mul(z_50, t, z_10);               /* 2^50 - 1 */
+   fe51_sqn(t, z_50, 50);
+   fe51_mul(z_100, t, z_50);              /* 2^100 - 1 */
+   fe51_sqn(t, z_100, 100);
+   fe51_mul(t, t, z_100);                 /* 2^200 - 1 */
+   fe51_sqn(t, t, 50);
+   fe51_mul(t, t, z_50);                  /* 2^250 - 1 */
+   fe51_sqn(t, t, 5);                     /* 2^255 - 32 */
+   fe51_mul(out, t, z11);                 /* 2^255 - 21 */
+}
+
+static void fe51_cswap(uint64_t swap, fe51 a, fe51 b)
+{
+   uint64_t mask = (uint64_t)0 - swap;
+   unsigned i;
+   for (i = 0; i < 5; i++)
+   {
+      uint64_t t = mask & (a[i] ^ b[i]);
       a[i] ^= t;
       b[i] ^= t;
    }
 }
 
-int x25519(uint8_t *out, const uint8_t *scalar, const uint8_t *u_le)
+static int x25519_51(uint8_t *out, const uint8_t *scalar, const uint8_t *u_le)
 {
-   bn_word p[X25519_K], r2[X25519_K], one[X25519_K], a24[X25519_K];
-   bn_word x1[X25519_K], x2[X25519_K], z2[X25519_K], x3[X25519_K], z3[X25519_K];
-   bn_word A[X25519_K], AA[X25519_K], B[X25519_K], BB[X25519_K], E[X25519_K];
-   bn_word C[X25519_K], D[X25519_K], DA[X25519_K], CB[X25519_K], t[X25519_K];
-   bn_word tmp[BN_MONT_TMP_WORDS(X25519_K)];
-   bn_word n0, swap = 0;
-   uint8_t k[32], ube[32], pm2_be[32];
-   int i;
+   fe51     x1, x2, z2, x3, z3, A, AA, B, BB, E, C, D, DA, CB, t;
+   uint64_t swap = 0;
+   uint8_t  k[32];
+   uint8_t  acc = 0;
+   int      i;
 
    memcpy(k, scalar, 32);
    k[0]  &= 248;
    k[31] &= 127;
    k[31] |= 64;
-   for (i = 0; i < 32; i++)
-      ube[i] = u_le[31 - i];
-   ube[0] &= 0x7f;
-
-   bn_from_be(p, X25519_K, x25519_p_be, 32);
-   n0 = bn_mont_n0(p);
-   bn_mont_r2(r2, p, X25519_K);
-   /* Montgomery forms of 1, 121665 and u */
-   bn_zero(t, X25519_K); t[0] = 1;
-   bn_mont_mul(one, t, r2, p, n0, X25519_K, tmp);
-   bn_zero(t, X25519_K); t[0] = 121665;
-   bn_mont_mul(a24, t, r2, p, n0, X25519_K, tmp);
-   bn_from_be(t, X25519_K, ube, 32);
-   if (bn_cmp(t, p, X25519_K) >= 0)
-      bn_sub(t, t, p, X25519_K);
-   bn_mont_mul(x1, t, r2, p, n0, X25519_K, tmp);
-
-   bn_copy(x2, one, X25519_K); bn_zero(z2, X25519_K);
-   bn_copy(x3, x1, X25519_K);  bn_copy(z3, one, X25519_K);
+   fe51_frombytes(x1, u_le);
+   x2[0] = 1; x2[1] = x2[2] = x2[3] = x2[4] = 0;
+   z2[0] = z2[1] = z2[2] = z2[3] = z2[4] = 0;
+   for (i = 0; i < 5; i++)
+      x3[i] = x1[i];
+   z3[0] = 1; z3[1] = z3[2] = z3[3] = z3[4] = 0;
 
    for (i = 254; i >= 0; i--)
    {
-      bn_word bit = (bn_word)((k[i >> 3] >> (i & 7)) & 1);
+      uint64_t bit = (uint64_t)((k[i >> 3] >> (i & 7)) & 1);
       swap ^= bit;
-      x25519_cswap(swap, x2, x3);
-      x25519_cswap(swap, z2, z3);
+      fe51_cswap(swap, x2, x3);
+      fe51_cswap(swap, z2, z3);
       swap = bit;
 
-      bn_mod_add(A, x2, z2, p, X25519_K);
-      bn_mont_sqr(AA, A, p, n0, X25519_K, tmp);
-      bn_mod_sub(B, x2, z2, p, X25519_K);
-      bn_mont_sqr(BB, B, p, n0, X25519_K, tmp);
-      bn_mod_sub(E, AA, BB, p, X25519_K);
-      bn_mod_add(C, x3, z3, p, X25519_K);
-      bn_mod_sub(D, x3, z3, p, X25519_K);
-      bn_mont_mul(DA, D, A, p, n0, X25519_K, tmp);
-      bn_mont_mul(CB, C, B, p, n0, X25519_K, tmp);
-      bn_mod_add(t, DA, CB, p, X25519_K);
-      bn_mont_sqr(x3, t, p, n0, X25519_K, tmp);
-      bn_mod_sub(t, DA, CB, p, X25519_K);
-      bn_mont_sqr(t, t, p, n0, X25519_K, tmp);
-      bn_mont_mul(z3, x1, t, p, n0, X25519_K, tmp);
-      bn_mont_mul(x2, AA, BB, p, n0, X25519_K, tmp);
-      bn_mont_mul(t, a24, E, p, n0, X25519_K, tmp);
-      bn_mod_add(t, AA, t, p, X25519_K);
-      bn_mont_mul(z2, E, t, p, n0, X25519_K, tmp);
+      fe51_add(A, x2, z2);
+      fe51_sq(AA, A);
+      fe51_sub(B, x2, z2);
+      fe51_sq(BB, B);
+      fe51_sub(E, AA, BB);
+      fe51_add(C, x3, z3);
+      fe51_sub(D, x3, z3);
+      fe51_mul(DA, D, A);
+      fe51_mul(CB, C, B);
+      fe51_add(t, DA, CB);
+      fe51_sq(x3, t);
+      fe51_sub(t, DA, CB);
+      fe51_sq(t, t);
+      fe51_mul(z3, x1, t);
+      fe51_mul(x2, AA, BB);
+      fe51_mul_a24(t, E);
+      fe51_add(t, AA, t);
+      fe51_mul(z2, E, t);
    }
-   x25519_cswap(swap, x2, x3);
-   x25519_cswap(swap, z2, z3);
+   fe51_cswap(swap, x2, x3);
+   fe51_cswap(swap, z2, z3);
 
-   /* x2 / z2: z2^(p-2) by square-and-multiply, all in Montgomery form */
-   memcpy(pm2_be, x25519_p_be, 32);
-   pm2_be[31] -= 2;
-   bn_copy(A, one, X25519_K);
-   for (i = 254; i >= 0; i--)
-   {
-      bn_mont_sqr(A, A, p, n0, X25519_K, tmp);
-      if ((pm2_be[31 - (i >> 3)] >> (i & 7)) & 1)
-         bn_mont_mul(A, A, z2, p, n0, X25519_K, tmp);
-   }
-   bn_mont_mul(t, x2, A, p, n0, X25519_K, tmp);
-   /* out of Montgomery form: multiply by 1 */
-   bn_zero(A, X25519_K); A[0] = 1;
-   bn_mont_mul(t, t, A, p, n0, X25519_K, tmp);
-   bn_to_be(ube, 32, t, X25519_K);
-   for (i = 0; i < 32; i++)
-      out[i] = ube[31 - i];
+   fe51_invert(t, z2);
+   fe51_mul(t, x2, t);
+   fe51_tobytes(out, t);
    crypto_memzero(k, sizeof(k));
    /* all-zero output means a low-order point: refuse it */
+   for (i = 0; i < 32; i++)
+      acc |= out[i];
+   return acc ? 0 : -1;
+}
+#else
+/* Machines without a 128-bit integer (32-bit ones, MSVC): arithmetic
+ * mod 2^255 - 19 in ten limbs of 26 and 25 bits, at bit offsets 0, 26,
+ * 51, 77, 102, 128, 153, 179, 204 and 230. Limbs are 32-bit words and
+ * every product one 32x32->64 multiply. Limb i times limb j lands in
+ * limb i + j; when both are odd the offsets add to one more than that
+ * limb's, a factor 2, and past limb 9 the product wraps to limb
+ * i + j - 10 times 19 (2^255 = 19 mod p). Inputs to a multiply stay
+ * under 2^27 a limb, so 19 g and 2 f fit 32 bits and a column of ten
+ * products is under 2^63. All unsigned: no shift of a negative. */
+typedef uint32_t fe10[10];
+static const unsigned char fe10_off[10]  = { 0, 26, 51, 77, 102, 128, 153, 179, 204, 230 };
+static const unsigned char fe10_bits[10] = { 26, 25, 26, 25, 26, 25, 26, 25, 26, 25 };
+/* 2p in this radix: 2(2^26 - 19), then 2(2^25 - 1), 2(2^26 - 1), ... */
+static const uint32_t fe10_2p[10] = {
+   0x7ffffdaU, 0x3fffffeU, 0x7fffffeU, 0x3fffffeU, 0x7fffffeU,
+   0x3fffffeU, 0x7fffffeU, 0x3fffffeU, 0x7fffffeU, 0x3fffffeU
+};
+
+/* r (column sums under 2^63) carried into limbs h */
+static void fe10_carry64(fe10 h, uint64_t *r)
+{
+   uint64_t c;
+   unsigned i;
+   for (i = 0; i < 9; i++)
    {
-      uint8_t acc = 0;
-      for (i = 0; i < 32; i++)
-         acc |= out[i];
-      return acc ? 0 : -1;
+      c         = r[i] >> fe10_bits[i];
+      h[i]      = (uint32_t)r[i] & ((1U << fe10_bits[i]) - 1);
+      r[i + 1] += c;
    }
+   c     = r[9] >> 25;
+   h[9]  = (uint32_t)r[9] & ((1U << 25) - 1);
+   c     = h[0] + 19 * c;
+   h[0]  = (uint32_t)c & ((1U << 26) - 1);
+   h[1] += (uint32_t)(c >> 26);
+}
+
+static void fe10_carry(fe10 h)
+{
+   uint64_t r[10];
+   unsigned i;
+   for (i = 0; i < 10; i++)
+      r[i] = h[i];
+   fe10_carry64(h, r);
+}
+
+static void fe10_frombytes(fe10 h, const uint8_t *s)
+{
+   uint64_t w[4];
+   unsigned i;
+   for (i = 0; i < 4; i++)
+      w[i] = (uint64_t)s[8 * i]            | ((uint64_t)s[8 * i + 1] << 8)
+           | ((uint64_t)s[8 * i + 2] << 16) | ((uint64_t)s[8 * i + 3] << 24)
+           | ((uint64_t)s[8 * i + 4] << 32) | ((uint64_t)s[8 * i + 5] << 40)
+           | ((uint64_t)s[8 * i + 6] << 48) | ((uint64_t)s[8 * i + 7] << 56);
+   for (i = 0; i < 10; i++)
+   {
+      /* the limb's bits from its offset, across two words at most */
+      unsigned word = fe10_off[i] >> 6, sh = fe10_off[i] & 63;
+      uint64_t v    = w[word] >> sh;
+      if (sh + fe10_bits[i] > 64)
+         v |= w[word + 1] << (64 - sh);
+      h[i] = (uint32_t)v & ((1U << fe10_bits[i]) - 1);
+   }
+   /* limb 9 is 25 bits from bit 230: bit 255 is left out */
+}
+
+/* The canonical value, 0 <= h < p, little-endian. */
+static void fe10_tobytes(uint8_t *s, const fe10 f)
+{
+   fe10     h;
+   uint64_t w[4];
+   uint32_t q;
+   unsigned i;
+   for (i = 0; i < 10; i++)
+      h[i] = f[i];
+   fe10_carry(h);
+   fe10_carry(h);
+   /* h < 2^255; q = 1 iff h + 19 >= 2^255, i.e. h >= p */
+   q = (h[0] + 19) >> 26;
+   for (i = 1; i < 10; i++)
+      q = (h[i] + q) >> fe10_bits[i];
+   h[0] += 19 * q;
+   for (i = 0; i < 9; i++)
+   {
+      h[i + 1] += h[i] >> fe10_bits[i];
+      h[i]     &= (1U << fe10_bits[i]) - 1;
+   }
+   h[9] &= (1U << 25) - 1;            /* drops the 2^255 the +19 made */
+   w[0] = w[1] = w[2] = w[3] = 0;
+   for (i = 0; i < 10; i++)
+   {
+      unsigned word = fe10_off[i] >> 6, sh = fe10_off[i] & 63;
+      w[word] |= (uint64_t)h[i] << sh;
+      if (sh + fe10_bits[i] > 64)
+         w[word + 1] |= (uint64_t)h[i] >> (64 - sh);
+   }
+   for (i = 0; i < 32; i++)
+      s[i] = (uint8_t)(w[i >> 3] >> (8 * (i & 7)));
+}
+
+static void fe10_add(fe10 h, const fe10 f, const fe10 g)
+{
+   unsigned i;
+   for (i = 0; i < 10; i++)
+      h[i] = f[i] + g[i];
+}
+
+static void fe10_sub(fe10 h, const fe10 f, const fe10 g)
+{
+   unsigned i;
+   for (i = 0; i < 10; i++)
+      h[i] = f[i] + fe10_2p[i] - g[i];
+   fe10_carry(h);
+}
+
+static void fe10_mul(fe10 h, const fe10 f, const fe10 g)
+{
+   uint32_t f2[10], g19[10];
+   uint64_t r[10];
+   unsigned i;
+   for (i = 0; i < 10; i++)
+   {
+      f2[i]  = 2 * f[i];
+      g19[i] = 19 * g[i];
+   }
+   r[0] = (uint64_t)f[0] * g[0]
+        + (uint64_t)f2[1] * g19[9]
+        + (uint64_t)f[2] * g19[8]
+        + (uint64_t)f2[3] * g19[7]
+        + (uint64_t)f[4] * g19[6]
+        + (uint64_t)f2[5] * g19[5]
+        + (uint64_t)f[6] * g19[4]
+        + (uint64_t)f2[7] * g19[3]
+        + (uint64_t)f[8] * g19[2]
+        + (uint64_t)f2[9] * g19[1];
+   r[1] = (uint64_t)f[0] * g[1]
+        + (uint64_t)f[1] * g[0]
+        + (uint64_t)f[2] * g19[9]
+        + (uint64_t)f[3] * g19[8]
+        + (uint64_t)f[4] * g19[7]
+        + (uint64_t)f[5] * g19[6]
+        + (uint64_t)f[6] * g19[5]
+        + (uint64_t)f[7] * g19[4]
+        + (uint64_t)f[8] * g19[3]
+        + (uint64_t)f[9] * g19[2];
+   r[2] = (uint64_t)f[0] * g[2]
+        + (uint64_t)f2[1] * g[1]
+        + (uint64_t)f[2] * g[0]
+        + (uint64_t)f2[3] * g19[9]
+        + (uint64_t)f[4] * g19[8]
+        + (uint64_t)f2[5] * g19[7]
+        + (uint64_t)f[6] * g19[6]
+        + (uint64_t)f2[7] * g19[5]
+        + (uint64_t)f[8] * g19[4]
+        + (uint64_t)f2[9] * g19[3];
+   r[3] = (uint64_t)f[0] * g[3]
+        + (uint64_t)f[1] * g[2]
+        + (uint64_t)f[2] * g[1]
+        + (uint64_t)f[3] * g[0]
+        + (uint64_t)f[4] * g19[9]
+        + (uint64_t)f[5] * g19[8]
+        + (uint64_t)f[6] * g19[7]
+        + (uint64_t)f[7] * g19[6]
+        + (uint64_t)f[8] * g19[5]
+        + (uint64_t)f[9] * g19[4];
+   r[4] = (uint64_t)f[0] * g[4]
+        + (uint64_t)f2[1] * g[3]
+        + (uint64_t)f[2] * g[2]
+        + (uint64_t)f2[3] * g[1]
+        + (uint64_t)f[4] * g[0]
+        + (uint64_t)f2[5] * g19[9]
+        + (uint64_t)f[6] * g19[8]
+        + (uint64_t)f2[7] * g19[7]
+        + (uint64_t)f[8] * g19[6]
+        + (uint64_t)f2[9] * g19[5];
+   r[5] = (uint64_t)f[0] * g[5]
+        + (uint64_t)f[1] * g[4]
+        + (uint64_t)f[2] * g[3]
+        + (uint64_t)f[3] * g[2]
+        + (uint64_t)f[4] * g[1]
+        + (uint64_t)f[5] * g[0]
+        + (uint64_t)f[6] * g19[9]
+        + (uint64_t)f[7] * g19[8]
+        + (uint64_t)f[8] * g19[7]
+        + (uint64_t)f[9] * g19[6];
+   r[6] = (uint64_t)f[0] * g[6]
+        + (uint64_t)f2[1] * g[5]
+        + (uint64_t)f[2] * g[4]
+        + (uint64_t)f2[3] * g[3]
+        + (uint64_t)f[4] * g[2]
+        + (uint64_t)f2[5] * g[1]
+        + (uint64_t)f[6] * g[0]
+        + (uint64_t)f2[7] * g19[9]
+        + (uint64_t)f[8] * g19[8]
+        + (uint64_t)f2[9] * g19[7];
+   r[7] = (uint64_t)f[0] * g[7]
+        + (uint64_t)f[1] * g[6]
+        + (uint64_t)f[2] * g[5]
+        + (uint64_t)f[3] * g[4]
+        + (uint64_t)f[4] * g[3]
+        + (uint64_t)f[5] * g[2]
+        + (uint64_t)f[6] * g[1]
+        + (uint64_t)f[7] * g[0]
+        + (uint64_t)f[8] * g19[9]
+        + (uint64_t)f[9] * g19[8];
+   r[8] = (uint64_t)f[0] * g[8]
+        + (uint64_t)f2[1] * g[7]
+        + (uint64_t)f[2] * g[6]
+        + (uint64_t)f2[3] * g[5]
+        + (uint64_t)f[4] * g[4]
+        + (uint64_t)f2[5] * g[3]
+        + (uint64_t)f[6] * g[2]
+        + (uint64_t)f2[7] * g[1]
+        + (uint64_t)f[8] * g[0]
+        + (uint64_t)f2[9] * g19[9];
+   r[9] = (uint64_t)f[0] * g[9]
+        + (uint64_t)f[1] * g[8]
+        + (uint64_t)f[2] * g[7]
+        + (uint64_t)f[3] * g[6]
+        + (uint64_t)f[4] * g[5]
+        + (uint64_t)f[5] * g[4]
+        + (uint64_t)f[6] * g[3]
+        + (uint64_t)f[7] * g[2]
+        + (uint64_t)f[8] * g[1]
+        + (uint64_t)f[9] * g[0];
+   fe10_carry64(h, r);
+}
+
+static void fe10_sq(fe10 h, const fe10 f)
+{
+   fe10_mul(h, f, f);
+}
+
+static void fe10_sqn(fe10 h, const fe10 f, unsigned n)
+{
+   fe10_sq(h, f);
+   while (--n)
+      fe10_sq(h, h);
+}
+
+static void fe10_mul_a24(fe10 h, const fe10 f)
+{
+   uint64_t r[10];
+   unsigned i;
+   for (i = 0; i < 10; i++)
+      r[i] = (uint64_t)f[i] * 121665;
+   fe10_carry64(h, r);
+}
+
+/* z^(2^255 - 21), the same addition chain as the 51-bit form */
+static void fe10_invert(fe10 out, const fe10 z)
+{
+   fe10 z2, z9, z11, z_5, z_10, z_20, z_50, z_100, t;
+   fe10_sq(z2, z);
+   fe10_sqn(t, z2, 2);
+   fe10_mul(z9, t, z);
+   fe10_mul(z11, z9, z2);
+   fe10_sq(t, z11);
+   fe10_mul(z_5, t, z9);
+   fe10_sqn(t, z_5, 5);
+   fe10_mul(z_10, t, z_5);
+   fe10_sqn(t, z_10, 10);
+   fe10_mul(z_20, t, z_10);
+   fe10_sqn(t, z_20, 20);
+   fe10_mul(t, t, z_20);
+   fe10_sqn(t, t, 10);
+   fe10_mul(z_50, t, z_10);
+   fe10_sqn(t, z_50, 50);
+   fe10_mul(z_100, t, z_50);
+   fe10_sqn(t, z_100, 100);
+   fe10_mul(t, t, z_100);
+   fe10_sqn(t, t, 50);
+   fe10_mul(t, t, z_50);
+   fe10_sqn(t, t, 5);
+   fe10_mul(out, t, z11);
+}
+
+static void fe10_cswap(uint32_t swap, fe10 a, fe10 b)
+{
+   uint32_t mask = (uint32_t)0 - swap;
+   unsigned i;
+   for (i = 0; i < 10; i++)
+   {
+      uint32_t t = mask & (a[i] ^ b[i]);
+      a[i] ^= t;
+      b[i] ^= t;
+   }
+}
+
+static int x25519_10(uint8_t *out, const uint8_t *scalar, const uint8_t *u_le)
+{
+   fe10     x1, x2, z2, x3, z3, A, AA, B, BB, E, C, D, DA, CB, t;
+   uint32_t swap = 0;
+   uint8_t  k[32];
+   uint8_t  acc = 0;
+   int      i;
+
+   memcpy(k, scalar, 32);
+   k[0]  &= 248;
+   k[31] &= 127;
+   k[31] |= 64;
+   fe10_frombytes(x1, u_le);
+   for (i = 0; i < 10; i++)
+   {
+      x2[i] = z2[i] = z3[i] = 0;
+      x3[i] = x1[i];
+   }
+   x2[0] = 1;
+   z3[0] = 1;
+
+   for (i = 254; i >= 0; i--)
+   {
+      uint32_t bit = (uint32_t)((k[i >> 3] >> (i & 7)) & 1);
+      swap ^= bit;
+      fe10_cswap(swap, x2, x3);
+      fe10_cswap(swap, z2, z3);
+      swap = bit;
+
+      fe10_add(A, x2, z2);
+      fe10_sq(AA, A);
+      fe10_sub(B, x2, z2);
+      fe10_sq(BB, B);
+      fe10_sub(E, AA, BB);
+      fe10_add(C, x3, z3);
+      fe10_sub(D, x3, z3);
+      fe10_mul(DA, D, A);
+      fe10_mul(CB, C, B);
+      fe10_add(t, DA, CB);
+      fe10_sq(x3, t);
+      fe10_sub(t, DA, CB);
+      fe10_sq(t, t);
+      fe10_mul(z3, x1, t);
+      fe10_mul(x2, AA, BB);
+      fe10_mul_a24(t, E);
+      fe10_add(t, AA, t);
+      fe10_mul(z2, E, t);
+   }
+   fe10_cswap(swap, x2, x3);
+   fe10_cswap(swap, z2, z3);
+
+   fe10_invert(t, z2);
+   fe10_mul(t, x2, t);
+   fe10_tobytes(out, t);
+   crypto_memzero(k, sizeof(k));
+   for (i = 0; i < 32; i++)
+      acc |= out[i];
+   return acc ? 0 : -1;
+}
+#endif
+
+int x25519(uint8_t *out, const uint8_t *scalar, const uint8_t *u_le)
+{
+#if defined(__SIZEOF_INT128__) && !defined(X25519_NO_128)
+   return x25519_51(out, scalar, u_le);
+#else
+   return x25519_10(out, scalar, u_le);
+#endif
 }
 
 int x25519_base(uint8_t *out, const uint8_t *scalar)
@@ -825,36 +1310,31 @@ static struct ec_curve ec_p384 = { {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0},
    384 / BN_WORD_BITS, 384, 48, 0 };
 
 /* The curve constants are computed on first use. Two threads making
- * their first connections at once both get here; without a lock one
- * can publish the flag while the other is still rewriting the same
- * fields, and a third reads a half-written constant. The flag is an
- * acquire load on the fast path, the computation runs under a lock,
- * and the flag is stored with release once every field is in place. */
+ * their first connections at once both get here; the one that moves
+ * ready from 0 to EC_BUSY computes, the other yields until it reads
+ * EC_READY, stored with release once every field is in place. */
+#define EC_BUSY  1
+#define EC_READY 2
 #ifdef HAVE_THREADS
 #include <rthreads/rthreads.h>
-static retro_atomic_ptr_t ec_lock_ptr;
-static slock_t *ec_lock_get(void)
-{
-   slock_t *l = (slock_t*)retro_atomic_load_acquire_ptr(&ec_lock_ptr);
-   if (!l)
-   {
-      slock_t *fresh = slock_new();
-      if (retro_atomic_cas_ptr(&ec_lock_ptr, NULL, fresh))
-         l = fresh;
-      else
-      {
-         slock_free(fresh);
-         l = (slock_t*)retro_atomic_load_acquire_ptr(&ec_lock_ptr);
-      }
-   }
-   return l;
-}
-#define EC_LOCK()   slock_lock(ec_lock_get())
-#define EC_UNLOCK() slock_unlock(ec_lock_get())
-#else
-#define EC_LOCK()   do { } while (0)
-#define EC_UNLOCK() do { } while (0)
 #endif
+
+/* Nonzero when the caller is the one to compute the constants. */
+static int ec_claim(struct ec_curve *cv)
+{
+#ifdef HAVE_THREADS
+   for (;;)
+   {
+      if (retro_atomic_load_acquire_int(&cv->ready) == EC_READY)
+         return 0;
+      if (retro_atomic_cas_int(&cv->ready, 0, EC_BUSY))
+         return 1;
+      sthread_yield();
+   }
+#else
+   return retro_atomic_load_acquire_int(&cv->ready) != EC_READY;
+#endif
+}
 
 static void ec_init(struct ec_curve *cv)
 {
@@ -862,14 +1342,8 @@ static void ec_init(struct ec_curve *cv)
    bn_word two[EC_MAX_K];
    const unsigned k = cv->k;
 
-   if (retro_atomic_load_acquire_int(&cv->ready))
+   if (!ec_claim(cv))
       return;
-   EC_LOCK();
-   if (retro_atomic_load_acquire_int(&cv->ready))
-   {
-      EC_UNLOCK();
-      return;
-   }
 
    bn_from_be(cv->p, k, cv->p_be, cv->bytes);
    bn_from_be(cv->n, k, cv->n_be, cv->bytes);
@@ -895,8 +1369,7 @@ static void ec_init(struct ec_curve *cv)
    bn_mont_mul(cv->g.y, cv->g.y, cv->r2p, cv->p, cv->n0p, k, tmp);
    bn_copy(cv->g.z, cv->one, k);
 
-   retro_atomic_store_release_int(&cv->ready, 1);
-   EC_UNLOCK();
+   retro_atomic_store_release_int(&cv->ready, EC_READY);
 }
 
 /* Field helpers, all in the Montgomery domain. */
@@ -1079,8 +1552,9 @@ static void p256_pt_select(const struct ec_curve *cv, struct ec_pt *r, bn_word b
 
 /* r = k * a. Double-and-always-add with a select, so the sequence of
  * field operations does not depend on the scalar; what still does is
- * the infinity test inside p256_pt_add for the leading zero bits. */
-static void p256_pt_mul(const struct ec_curve *cv, struct ec_pt *r, const bn_word *k,
+ * the infinity test inside p256_pt_add for the leading zero bits. The
+ * fallback for p256_pt_mul() when its table cannot be had. */
+static void p256_pt_mul_bits(const struct ec_curve *cv, struct ec_pt *r, const bn_word *k,
       const struct ec_pt *a)
 {
    struct ec_pt acc, t;
@@ -1097,6 +1571,116 @@ static void p256_pt_mul(const struct ec_curve *cv, struct ec_pt *r, const bn_wor
       p256_pt_select(cv, &acc, bn_get_bit(k, i), &t, &acc);
    }
    *r = acc;
+}
+
+/* Four scalar bits from bit 4w up. */
+static unsigned ec_digit4(const bn_word *k, unsigned w)
+{
+   return (unsigned)(bn_get_bit(k, 4 * w)
+         | (bn_get_bit(k, 4 * w + 1) << 1)
+         | (bn_get_bit(k, 4 * w + 2) << 2)
+         | (bn_get_bit(k, 4 * w + 3) << 3));
+}
+
+/* 1..15 times a in t[1..15]; t[0] unused. */
+static void ec_table4(const struct ec_curve *cv, struct ec_pt *t, const struct ec_pt *a)
+{
+   unsigned j;
+   t[1] = *a;
+   p256_pt_double(cv, &t[2], a);
+   for (j = 3; j < 16; j++)
+      p256_pt_add(cv, &t[j], &t[j - 1], a);
+}
+
+/* r = k * a, four bits at a time: per window four doublings and one
+ * addition, where the bit-by-bit form does one addition per bit. The
+ * table entry is chosen by scanning all fifteen with a select, and a
+ * zero digit adds t[1] anyway and throws the sum away, so neither the
+ * memory touched nor the field operations follow the scalar, save the
+ * infinity test for its leading zero digits, as before. The table
+ * (fifteen points, 2 KiB for P-384) is on the heap: the stack budget. */
+static void p256_pt_mul(const struct ec_curve *cv, struct ec_pt *r, const bn_word *k,
+      const struct ec_pt *a)
+{
+   struct ec_pt *t = (struct ec_pt*)malloc(16 * sizeof(*t));
+   struct ec_pt  acc, sel, sum;
+   unsigned      w, j;
+
+   if (!t)
+   {
+      p256_pt_mul_bits(cv, r, k, a);
+      return;
+   }
+   ec_table4(cv, t, a);
+   bn_zero(acc.x, cv->k);
+   bn_zero(acc.y, cv->k);
+   bn_zero(acc.z, cv->k);
+   for (w = cv->bits / 4; w-- > 0; )
+   {
+      unsigned d = ec_digit4(k, w);
+      p256_pt_double(cv, &acc, &acc);
+      p256_pt_double(cv, &acc, &acc);
+      p256_pt_double(cv, &acc, &acc);
+      p256_pt_double(cv, &acc, &acc);
+      sel = t[1];
+      for (j = 2; j < 16; j++)
+      {
+         bn_word x  = (bn_word)(j ^ d);
+         bn_word eq = (bn_word)1 ^ ((x | ((bn_word)0 - x)) >> (BN_WORD_BITS - 1));
+         p256_pt_select(cv, &sel, eq, &t[j], &sel);
+      }
+      p256_pt_add(cv, &sum, &acc, &sel);
+      {
+         bn_word nz = ((bn_word)d | ((bn_word)0 - (bn_word)d)) >> (BN_WORD_BITS - 1);
+         p256_pt_select(cv, &acc, nz, &sum, &acc);
+      }
+   }
+   *r = acc;
+   crypto_memzero(t, 16 * sizeof(*t));
+   crypto_memzero(&sel, sizeof(sel));
+   crypto_memzero(&sum, sizeof(sum));
+   free(t);
+}
+
+/* r = u1 g + u2 q in one pass (Shamir's trick), four bits of each
+ * scalar per window: the doublings are shared. For signature checks,
+ * where every input is public, so the additions may skip zero digits. */
+static void p256_pt_mul2(const struct ec_curve *cv, struct ec_pt *r,
+      const bn_word *u1, const struct ec_pt *g, const bn_word *u2, const struct ec_pt *q)
+{
+   struct ec_pt *tg = (struct ec_pt*)malloc(32 * sizeof(*tg));
+   struct ec_pt *tq;
+   struct ec_pt  acc;
+   unsigned      w;
+
+   if (!tg)
+   {
+      struct ec_pt b;
+      p256_pt_mul_bits(cv, r, u1, g);
+      p256_pt_mul_bits(cv, &b, u2, q);
+      p256_pt_add(cv, r, r, &b);
+      return;
+   }
+   tq = tg + 16;
+   ec_table4(cv, tg, g);
+   ec_table4(cv, tq, q);
+   bn_zero(acc.x, cv->k);
+   bn_zero(acc.y, cv->k);
+   bn_zero(acc.z, cv->k);
+   for (w = cv->bits / 4; w-- > 0; )
+   {
+      unsigned d1 = ec_digit4(u1, w), d2 = ec_digit4(u2, w);
+      p256_pt_double(cv, &acc, &acc);
+      p256_pt_double(cv, &acc, &acc);
+      p256_pt_double(cv, &acc, &acc);
+      p256_pt_double(cv, &acc, &acc);
+      if (d1)
+         p256_pt_add(cv, &acc, &acc, &tg[d1]);
+      if (d2)
+         p256_pt_add(cv, &acc, &acc, &tq[d2]);
+   }
+   *r = acc;
+   free(tg);
 }
 
 /* Affine x, y (plain domain) from Jacobian. Returns -1 at infinity. */
@@ -1209,7 +1793,7 @@ static int ec_ecdsa_verify(const struct ec_curve *cv, const uint8_t *pub,
    bn_word rr[EC_MAX_K], ss[EC_MAX_K], e[EC_MAX_K], w[EC_MAX_K], u1[EC_MAX_K], u2[EC_MAX_K], x[EC_MAX_K];
    bn_word tmp[BN_MONT_TMP_WORDS(EC_MAX_K)];
    bn_word one[EC_MAX_K];
-   struct ec_pt q, a, b;
+   struct ec_pt q, a;
 
    if (p256_pt_load(cv, &q, pub) != 0)
       return -1;
@@ -1233,9 +1817,7 @@ static int ec_ecdsa_verify(const struct ec_curve *cv, const uint8_t *pub,
    bn_mod_mul(u1, e,  w, cv->n, cv->r2n, cv->n0n, cv->k, tmp);
    bn_mod_mul(u2, rr, w, cv->n, cv->r2n, cv->n0n, cv->k, tmp);
 
-   p256_pt_mul(cv, &a, u1, &cv->g);
-   p256_pt_mul(cv, &b, u2, &q);
-   p256_pt_add(cv, &a, &a, &b);
+   p256_pt_mul2(cv, &a, u1, &cv->g, u2, &q);
    if (p256_pt_affine(cv, x, NULL, &a) != 0)
       return -1;
    if (bn_cmp(x, cv->n, cv->k) >= 0)

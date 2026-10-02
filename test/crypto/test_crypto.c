@@ -831,9 +831,11 @@ START_TEST (test_x509)
 
    /* the shipped bundle: every anchor with an RSA or P-256 key parses */
    {
-      int n = x509_trust_load_pem(cacert_pem, sizeof(cacert_pem));
-      ck_assert_int_eq(n, 155);   /* every certificate in the bundle */
-      ck_assert_int_eq(x509_trust_load_pem(cacert_pem, sizeof(cacert_pem)), n);
+      int n = x509_trust_load_pem_parts(cacert_pem_parts, cacert_pem_sizes,
+            CACERT_PEM_PARTS);
+      ck_assert_int_eq(n, 155);   /* every certificate in the bundle, all parts */
+      ck_assert_int_eq(x509_trust_load_pem_parts(cacert_pem_parts, cacert_pem_sizes,
+            CACERT_PEM_PARTS), n);
       ck_assert_int_eq(x509_verify_chain(chain, lens, 3, "example.com", X509_TEST_NOW, info, sizeof(info)), -1);
    }
    x509_trust_free();
@@ -959,6 +961,154 @@ START_TEST (test_krb5_enctypes)
 }
 END_TEST
 
+/* The bulk paths - eight AES blocks at a time, four ChaCha20 blocks,
+ * Poly1305 in 44-bit limbs - against the block functions they must
+ * agree with, over lengths either side of each group size and counters
+ * across the 32-bit wrap. */
+static uint32_t bulk_rng = 0x9e3779b9u;
+static uint32_t bulk_rand(void)
+{
+   bulk_rng ^= bulk_rng << 13; bulk_rng ^= bulk_rng >> 17; bulk_rng ^= bulk_rng << 5;
+   return bulk_rng;
+}
+
+START_TEST(test_bulk_paths)
+{
+   static uint8_t in[2100], out[2100], ref[2100];
+   uint8_t key[32], nonce[12], blk[64], iv[16], tag1[16], tag2[16];
+   unsigned it, i;
+
+   for (i = 0; i < sizeof(in); i++)
+      in[i] = (uint8_t)bulk_rand();
+   for (it = 0; it < 300; it++)
+   {
+      size_t   len = bulk_rand() % 2049;
+      uint32_t ctr = (it & 1) ? bulk_rand() : 0xfffffff0u + (bulk_rand() % 16);
+      struct aes_ctx a;
+      for (i = 0; i < 32; i++)
+         key[i] = (uint8_t)bulk_rand();
+      for (i = 0; i < 12; i++)
+         nonce[i] = (uint8_t)bulk_rand();
+
+      /* ChaCha20: chacha20_xor against the keystream a block at a time */
+      chacha20_xor(key, nonce, ctr, in, out, len);
+      for (i = 0; i < len; i++)
+      {
+         if (!(i % 64))
+            chacha20_block(key, nonce, ctr + (uint32_t)(i / 64), blk);
+         ref[i] = in[i] ^ blk[i % 64];
+      }
+      ck_assert_int_eq(memcmp(out, ref, len), 0);
+
+      /* AES-CTR: aes_ctr_crypt against aes_encrypt_block per counter */
+      ck_assert_int_eq(aes_init(&a, key, (it & 2) ? 32 : 16), 0);
+      memcpy(iv, nonce, 12);
+      iv[12] = (uint8_t)(ctr >> 24); iv[13] = (uint8_t)(ctr >> 16);
+      iv[14] = (uint8_t)(ctr >> 8);  iv[15] = (uint8_t)ctr;
+      {
+         uint8_t c[16];
+         memcpy(c, iv, 16);
+         aes_ctr_crypt(&a, c, in, out, len);
+      }
+      for (i = 0; i < len; i++)
+      {
+         if (!(i % 16))
+         {
+            uint32_t n = ctr + (uint32_t)(i / 16);
+            iv[12] = (uint8_t)(n >> 24); iv[13] = (uint8_t)(n >> 16);
+            iv[14] = (uint8_t)(n >> 8);  iv[15] = (uint8_t)n;
+            aes_encrypt_block(&a, iv, blk);
+         }
+         ref[i] = in[i] ^ blk[i % 16];
+      }
+      ck_assert_int_eq(memcmp(out, ref, len), 0);
+
+      /* Poly1305: random chunks against the one-shot tag */
+      poly1305_auth(tag1, in, len, key);
+      {
+         struct poly1305_ctx pc;
+         size_t p = 0;
+         poly1305_init(&pc, key);
+         while (p < len)
+         {
+            size_t k = bulk_rand() % 200;
+            if (k > len - p)
+               k = len - p;
+            poly1305_update(&pc, in + p, k);
+            p += k;
+         }
+         poly1305_final(&pc, tag2);
+      }
+      ck_assert_int_eq(memcmp(tag1, tag2, 16), 0);
+   }
+}
+END_TEST
+
+/* IP literals: parsed exactly, and matched only against iPAddress SAN
+ * entries - never a dNSName or the commonName that happens to spell the
+ * address. */
+START_TEST (test_x509_ip_literals)
+{
+   static const uint8_t v6_loop[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 };
+   static const uint8_t v6_mapped[16] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff,192,0,2,1 };
+   /* GeneralNames contents: dNSName example.com, iPAddress 127.0.0.1,
+    * iPAddress ::1, and a dNSName that merely reads "10.0.0.1" */
+   static const uint8_t san[] = {
+      0x82, 11, 'e','x','a','m','p','l','e','.','c','o','m',
+      0x87, 4, 127, 0, 0, 1,
+      0x87, 16, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,
+      0x82, 8, '1','0','.','0','.','0','.','1'
+   };
+   static const uint8_t cn_ip[] = { '1','0','.','0','.','0','.','1' };
+   struct x509_cert c;
+   uint8_t ip[16];
+
+   ck_assert_int_eq(x509_parse_ip("127.0.0.1", ip), 4);
+   ck_assert(ip[0] == 127 && ip[1] == 0 && ip[2] == 0 && ip[3] == 1);
+   ck_assert_int_eq(x509_parse_ip("::1", ip), 16);
+   ck_assert(!memcmp(ip, v6_loop, 16));
+   ck_assert_int_eq(x509_parse_ip("[::1]", ip), 16);
+   ck_assert(!memcmp(ip, v6_loop, 16));
+   ck_assert_int_eq(x509_parse_ip("0:0:0:0:0:0:0:1", ip), 16);
+   ck_assert(!memcmp(ip, v6_loop, 16));
+   ck_assert_int_eq(x509_parse_ip("fe80::1%25eth0", ip), 16);
+   ck_assert(ip[0] == 0xfe && ip[1] == 0x80 && ip[15] == 1);
+   ck_assert_int_eq(x509_parse_ip("::ffff:192.0.2.1", ip), 16);
+   ck_assert(!memcmp(ip, v6_mapped, 16));
+   ck_assert_int_eq(x509_parse_ip("::", ip), 16);
+   /* not IP literals: host names, and malformed addresses */
+   ck_assert_int_eq(x509_parse_ip("example.com", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("1.2.3", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("1.2.3.4.5", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("256.0.0.1", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("01.2.3.4", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("1::2::3", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("1:2:3:4:5:6:7:8:9", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("1:2:3:4:5:6:7:8::", ip), 0);
+   ck_assert_int_eq(x509_parse_ip(":1", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("1:", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("12345::1", ip), 0);
+   ck_assert_int_eq(x509_parse_ip("[::1", ip), 0);
+
+   memset(&c, 0, sizeof(c));
+   c.san     = san;
+   c.san_len = sizeof(san);
+   ck_assert_int_eq(x509_match_hostname(&c, "example.com"), 0);
+   ck_assert_int_eq(x509_match_hostname(&c, "127.0.0.1"), 0);
+   ck_assert_int_eq(x509_match_hostname(&c, "::1"), 0);
+   ck_assert_int_eq(x509_match_hostname(&c, "0::0:1"), 0);
+   ck_assert_int_eq(x509_match_hostname(&c, "127.0.0.2"), -1);
+   ck_assert_int_eq(x509_match_hostname(&c, "::2"), -1);
+   /* an address the certificate lists only as a dNSName string */
+   ck_assert_int_eq(x509_match_hostname(&c, "10.0.0.1"), -1);
+   /* nor through the commonName, with no subjectAltName at all */
+   memset(&c, 0, sizeof(c));
+   c.cn     = cn_ip;
+   c.cn_len = sizeof(cn_ip);
+   ck_assert_int_eq(x509_match_hostname(&c, "10.0.0.1"), -1);
+}
+END_TEST
+
 Suite *create_suite(void)
 {
    Suite *s = suite_create(SUITE_NAME);
@@ -983,8 +1133,10 @@ Suite *create_suite(void)
    tcase_add_test(tc_core, test_p384);
    tcase_add_test(tc_core, test_smb_prereqs);
    tcase_add_test(tc_core, test_x509);
+   tcase_add_test(tc_core, test_x509_ip_literals);
    tcase_add_test(tc_core, test_aes_decrypt_hmac_sha1);
    tcase_add_test(tc_core, test_krb5_enctypes);
+   tcase_add_test(tc_core, test_bulk_paths);
    suite_add_tcase(s, tc_core);
    return s;
 }

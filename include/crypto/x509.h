@@ -124,11 +124,22 @@ int x509_verify_ecdsa_digest(const struct x509_cert *key,
  *
  * dNSName entries of the subjectAltName, with a wildcard allowed as
  * the whole leftmost label; the subject commonName only when there is
- * no subjectAltName at all.
+ * no subjectAltName at all.  An IP address (see x509_parse_ip()) matches
+ * only an iPAddress entry, never a dNSName or the commonName.
  *
  * Returns: 0 on a match, -1 otherwise.
  **/
 int x509_match_hostname(const struct x509_cert *c, const char *host);
+
+/**
+ * x509_parse_ip:
+ *
+ * @host as an IP address: dotted IPv4 (4 bytes, no leading zeros), or
+ * IPv6 with "::" compression and an optional trailing dotted IPv4,
+ * brackets and a "%zone" allowed (16 bytes).  Returns 4 or 16 with the
+ * address in @out, 0 when @host is not an IP literal - a host name.
+ **/
+int x509_parse_ip(const char *host, uint8_t out[16]);
 
 /**
  * x509_trust_load_pem:
@@ -141,6 +152,19 @@ int x509_match_hostname(const struct x509_cert *c, const char *host);
  * Returns: number of anchors loaded, -1 out of memory.
  **/
 int x509_trust_load_pem(const char *pem, size_t len);
+
+/**
+ * x509_trust_load_pem_parts:
+ *
+ * As x509_trust_load_pem() for a bundle kept in @count parts, each a
+ * run of whole certificates (net/cacert.h, split for compilers that
+ * refuse long string literals): all of them are loaded into the one
+ * trust store, the table standing for the source.
+ *
+ * Returns: the number of anchors loaded, or -1 on failure.
+ **/
+int x509_trust_load_pem_parts(const char *const *parts, const size_t *lens,
+      unsigned count);
 
 void x509_trust_free(void);
 
