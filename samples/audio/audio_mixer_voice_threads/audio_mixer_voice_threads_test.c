@@ -20,7 +20,16 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/* A voice's volume and gain, set by a control thread and read by a
+/* A voice a caller holds - building its decoder in play, tearing it
+ * down in stop - never holds the mix up: the mix passes it over and
+ * returns. And voices played and stopped by one thread while the audio
+ * thread mixes them: a decoder freed under the mix is a use after free.
+ *
+ * A stream voice's position read and its bound set by a feeder thread,
+ * with no lock, while the audio thread mixes and loops the voice: every
+ * position read must lie inside the stream.
+ *
+ * A voice's volume and gain, set by a control thread and read by a
  * second while the audio thread mixes the voice. Built under
  * ThreadSanitizer: a field two threads touch without ordering is a
  * reported race. Every read must give back one of the values set, and
@@ -33,10 +42,14 @@
 #include <stdint.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 
 #include <audio/audio_mixer.h>
 #include <audio/audio_resampler.h>
 #include <retro_atomic.h>
+
+/* For audio_mixer_voice_own(): a caller's hold on a voice. */
+#include "../../../audio/audio_mixer.c"
 
 #define MIX_RATE 48000
 #define BLOCK    256
@@ -113,6 +126,58 @@ static void *reader_thread(void *arg)
    return NULL;
 }
 
+static audio_mixer_voice_t *stream_voice;
+static size_t               stream_size;
+static unsigned             odd_tells;
+static unsigned             tells;
+
+static void *feeder_thread(void *arg)
+{
+   (void)arg;
+   while (retro_atomic_load_acquire_int(&mixing))
+   {
+      size_t at = audio_mixer_voice_buffer_tell(stream_voice);
+      if (at > stream_size)
+         odd_tells++;
+      audio_mixer_voice_set_avail(stream_voice, at + 4096);
+      tells++;
+   }
+   return NULL;
+}
+
+static audio_mixer_sound_t *churn_sound;
+static retro_atomic_int_t   churned;
+#define CHURN_ROUNDS 300
+
+static void *churn_thread(void *arg)
+{
+   (void)arg;
+   while (retro_atomic_load_acquire_int(&mixing))
+   {
+      audio_mixer_voice_t *v = audio_mixer_play(churn_sound, true, 0.0f,
+            "nearest", RESAMPLER_QUALITY_DONTCARE, NULL);
+      if (v)
+      {
+         audio_mixer_stop(v);
+         retro_atomic_fetch_add_int(&churned, 1);
+      }
+   }
+   return NULL;
+}
+
+static float held_peak(void)
+{
+   float    buf[BLOCK * 2];
+   float    peak = 0.0f;
+   unsigned i;
+   memset(buf, 0, sizeof(buf));
+   audio_mixer_mix(buf, BLOCK, 0.0f, false);
+   for (i = 0; i < BLOCK * 2; i++)
+      if (fabsf(buf[i]) > peak)
+         peak = fabsf(buf[i]);
+   return peak;
+}
+
 static void *audio_thread(void *arg)
 {
    float buf[BLOCK * 2];
@@ -136,10 +201,10 @@ static void *audio_thread(void *arg)
 
 int main(void)
 {
-   pthread_t      t, r;
-   size_t         wav_size;
-   unsigned char *wav;
-   audio_mixer_sound_t *snd;
+   pthread_t      t, r, f, c;
+   size_t         wav_size, wav3_size;
+   unsigned char *wav, *wav2, *wav3;
+   audio_mixer_sound_t *snd, *snd2;
    unsigned       i, bad = 0;
 
    audio_mixer_init(MIX_RATE);
@@ -153,9 +218,45 @@ int main(void)
       return 1;
    }
 
+   /* the same triangle as a silent stream voice, short enough to loop
+    * many times under the feeder */
+   if (     !(wav2 = make_wav(MIX_RATE / 100, MIX_RATE, &stream_size))
+         || !(snd2 = audio_mixer_load_wav_stream(wav2, stream_size))
+         || !(stream_voice = audio_mixer_play(snd2, true, 0.0f, "nearest",
+               RESAMPLER_QUALITY_DONTCARE, NULL)))
+   {
+      printf("FAIL  could not set up a repeating stream voice\n");
+      return 1;
+   }
+
+   if (     !(wav3 = make_wav(MIX_RATE / 100, MIX_RATE, &wav3_size))
+         || !(churn_sound = audio_mixer_load_wav_stream(wav3, wav3_size)))
+   {
+      printf("FAIL  could not set up the sound to play and stop\n");
+      return 1;
+   }
+
+   /* Held by a caller, on this very thread: a mix that waited for the
+    * voice would never return. It passes the voice over instead, and
+    * mixes it again once the caller lets go. */
+   audio_mixer_voice_own(voice);
+   if (held_peak() != 0.0f)
+   {
+      printf("FAIL  a voice a caller held was mixed\n");
+      return 1;
+   }
+   audio_mixer_voice_disown(voice);
+   if (held_peak() == 0.0f)
+   {
+      printf("FAIL  a voice was not mixed once its caller let go\n");
+      return 1;
+   }
+
    retro_atomic_store_release_int(&mixing, 1);
    pthread_create(&t, NULL, audio_thread, NULL);
    pthread_create(&r, NULL, reader_thread, NULL);
+   pthread_create(&f, NULL, feeder_thread, NULL);
+   pthread_create(&c, NULL, churn_thread, NULL);
    for (i = 0; i < ROUNDS; i++)
    {
       float   v = (i & 1) ? 1.0f : 0.0f;
@@ -168,21 +269,36 @@ int main(void)
          bad++;
       audio_mixer_voice_set_gain(voice, AUDIO_MIXER_GAIN_UNITY);
    }
+   while (retro_atomic_load_acquire_int(&churned) < CHURN_ROUNDS)
+      sched_yield();
    retro_atomic_store_release_int(&mixing, 0);
    pthread_join(t, NULL);
    pthread_join(r, NULL);
+   pthread_join(f, NULL);
+   pthread_join(c, NULL);
 
    audio_mixer_stop(voice);
    audio_mixer_destroy(snd);
+   audio_mixer_stop(stream_voice);
+   audio_mixer_destroy(snd2);
+   audio_mixer_destroy(churn_sound);
    audio_mixer_done();
    free(wav);
 
+   if (odd_tells)
+   {
+      printf("FAIL  %u of %u positions read lay outside the stream\n",
+            odd_tells, tells);
+      return 1;
+   }
    if (bad || odd_reads || odd_blocks)
    {
       printf("FAIL  %u reads gave back another volume, %u values never set were read, "
             "%u blocks mixed louder than any set\n", bad, odd_reads, odd_blocks);
       return 1;
    }
-   printf("ok    %u volume and gain changes made while the voice mixed\n", ROUNDS);
+   printf("ok    %u volume and gain changes made while the voice mixed, "
+         "%u voices played and stopped under the mix\n", ROUNDS,
+         (unsigned)retro_atomic_load_acquire_int(&churned));
    return 0;
 }
