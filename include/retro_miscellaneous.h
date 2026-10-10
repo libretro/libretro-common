@@ -523,8 +523,15 @@ typedef struct
 #  endif
 #elif defined(PS2)
 #  define PRI_SIZET "u"
+#elif defined(DJGPP)
+/* DJGPP's size_t is unsigned long, 32 bits as it is */
+#  define PRI_SIZET "lu"
 #elif defined(__EMSCRIPTEN__)
 #  define PRI_SIZET "zu"
+#elif defined(__APPLE__)
+/* Darwin's size_t is unsigned long on every architecture, 32-bit
+ * (armv7, i386, PowerPC) included, where SIZE_MAX alone says "u". */
+#  define PRI_SIZET "lu"
 #else
 #  if (SIZE_MAX == 0xFFFF)
 #    define PRI_SIZET "hu"

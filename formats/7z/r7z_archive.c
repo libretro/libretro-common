@@ -49,6 +49,7 @@
 #include <string.h>
 
 #include <encodings/crc32.h>
+#include <retro_atomic.h>
 
 #include <7z/r7z_archive.h>
 #include <7z/r7z_lzma.h>
@@ -312,8 +313,11 @@ typedef struct
 
 struct r7z_archive
 {
-   const uint8_t *data;
+   const uint8_t *data;       /* the whole archive, or NULL when it is read */
    size_t         len;
+   r7z_read_t     read_cb;    /* positioned reads of it, when data is NULL */
+   void          *read_ud;
+   uint8_t       *next_buf;   /* the header block, when it had to be read in */
 
    /* Decoded header, when the archive used an encoded one. */
    uint8_t       *header_buf;
@@ -355,6 +359,7 @@ struct r7z_archive
    uint32_t       pend_folder;
    uint32_t       pend_coder;      /* index within the folder's chain */
    uint8_t       *pend_in;         /* previous stage's output */
+   int            pend_in_borrowed;/* ...or the archive's own bytes: not freed */
    size_t         pend_in_len;
    uint8_t       *pend_out;        /* buffer being filled */
    size_t         pend_out_len;
@@ -362,6 +367,17 @@ struct r7z_archive
    uint16_t      *pend_probs;
    size_t         pend_fed;        /* input consumed by this stage */
    uint32_t       pend_base;       /* coder_unpack_sizes base for folder */
+
+   /* What a reader on another thread may look at while one thread calls
+    * r7z_archive_decode_step(): the buffer the folder is being decoded
+    * into in order, and how much of it is final. prog_state is 0 when
+    * there is nothing to look at, 1 while it is being decoded, 2 when
+    * the folder is decoded and held; the buffer and the folder are
+    * written before the state says they are there. */
+   const uint8_t      *prog_buf;
+   uint32_t            prog_folder;
+   retro_atomic_int_t  prog_state;
+   retro_atomic_size_t prog_pos;
 
    /* A BCJ2 folder part way through. Its four inputs must all be
     * complete before the converter can run, but they need not be
@@ -1541,6 +1557,20 @@ static int decode_coder(r7z_archive_t *a, const coder_t *c,
  * single-input coders (7z usually compresses main and call with LZMA).
  * This resolves each input independently and then runs the converter.
  */
+/* @n of the archive's bytes at @off, copied to @dst: from memory, or read
+ * in through the callback. The range is the caller's to have checked
+ * against the archive's length. */
+static int r7z_fetch(const r7z_archive_t *a, uint64_t off, uint8_t *dst,
+      size_t n)
+{
+   if (a->data)
+      memcpy(dst, a->data + (size_t)off, n);
+   else if (n && (!a->read_cb
+            || a->read_cb(a->read_ud, off, dst, n) != (int64_t)n))
+      return R7Z_ERROR_DATA;
+   return R7Z_OK;
+}
+
 static int folder_input_offsets(r7z_archive_t *a, uint32_t fi,
       uint32_t *pack_first_index, uint64_t *pack_file_offset)
 {
@@ -1598,7 +1628,12 @@ static int resolve_input(r7z_archive_t *a, uint32_t fi, uint32_t port,
          *out = (uint8_t *)malloc(n ? n : 1);
          if (!*out)
             return R7Z_ERROR_MEM;
-         memcpy(*out, a->data + 32 + off, n);
+         if ((res = r7z_fetch(a, 32 + off, *out, n)) != R7Z_OK)
+         {
+            free(*out);
+            *out = NULL;
+            return res;
+         }
          *out_len = n;
          return R7Z_OK;
       }
@@ -1765,6 +1800,7 @@ static int decode_folder(r7z_archive_t *a, uint32_t fi, uint8_t **out)
    folder_t *f;
    uint8_t  *cur      = NULL;
    size_t    cur_len  = 0;
+   int       cur_owned = 1;   /* cur is ours to free */
    uint32_t  ci;
    int       res;
 
@@ -1822,10 +1858,27 @@ static int decode_folder(r7z_archive_t *a, uint32_t fi, uint8_t **out)
          if ((uint64_t)cur_len + pack_off + 32 > (uint64_t)a->len)
             return R7Z_ERROR_DATA;
       }
-      cur = (uint8_t *)malloc(cur_len ? cur_len : 1);
-      if (!cur)
-         return R7Z_ERROR_MEM;
-      memcpy(cur, a->data + 32 + pack_off, cur_len);
+      /* The first coder reads the packed stream where it lies when the
+       * archive is in memory: it was copied whole - as many bytes again
+       * as the folder's compressed size - only to be read once and
+       * freed. An archive that is read has it read in here, and that
+       * is the only time those bytes are in memory. */
+      if (a->data)
+      {
+         cur       = (uint8_t *)(a->data + 32 + (size_t)pack_off);
+         cur_owned = 0;
+      }
+      else
+      {
+         cur = (uint8_t *)malloc(cur_len ? cur_len : 1);
+         if (!cur)
+            return R7Z_ERROR_MEM;
+         if ((res = r7z_fetch(a, 32 + pack_off, cur, cur_len)) != R7Z_OK)
+         {
+            free(cur);
+            return res;
+         }
+      }
 
       for (ci = 0; ci < f->num_coders; ci++)
       {
@@ -1835,12 +1888,14 @@ static int decode_folder(r7z_archive_t *a, uint32_t fi, uint8_t **out)
 
          if (base + ci >= a->num_coder_unpack_sizes)
          {
-            free(cur);
+            if (cur_owned)
+               free(cur);
             return R7Z_ERROR_DATA;
          }
          if (a->coder_unpack_sizes[base + ci] > (uint64_t)((size_t)-1))
          {
-            free(cur);
+            if (cur_owned)
+               free(cur);
             return R7Z_ERROR_DATA;
          }
          next_len = (size_t)a->coder_unpack_sizes[base + ci];
@@ -1848,12 +1903,15 @@ static int decode_folder(r7z_archive_t *a, uint32_t fi, uint8_t **out)
          next = (uint8_t *)malloc(next_len ? next_len : 1);
          if (!next)
          {
-            free(cur);
+            if (cur_owned)
+               free(cur);
             return R7Z_ERROR_MEM;
          }
 
          res = decode_coder(a, c, cur, cur_len, next, next_len);
-         free(cur);
+         if (cur_owned)
+            free(cur);
+         cur_owned = 1;
          if (res != R7Z_OK)
          {
             free(next);
@@ -1866,16 +1924,27 @@ static int decode_folder(r7z_archive_t *a, uint32_t fi, uint8_t **out)
 
    if (cur_len != (size_t)f->unpack_size)
    {
-      free(cur);
+      if (cur_owned)
+         free(cur);
       return R7Z_ERROR_DATA;
    }
 
    if (f->has_crc && encoding_crc32(0, cur, cur_len) != f->crc)
    {
-      free(cur);
+      if (cur_owned)
+         free(cur);
       return R7Z_ERROR_CRC;
    }
 
+   /* (a folder no coder touched hands out a copy, not the archive) */
+   if (!cur_owned)
+   {
+      uint8_t *copy = (uint8_t *)malloc(cur_len ? cur_len : 1);
+      if (!copy)
+         return R7Z_ERROR_MEM;
+      memcpy(copy, cur, cur_len);
+      cur = copy;
+   }
    *out = cur;
    return R7Z_OK;
 }
@@ -2025,8 +2094,10 @@ static int decode_encoded_header(r7z_archive_t *a, rd_t *r,
 
    memset(&tmp, 0, sizeof(tmp));
    memset(&ss, 0, sizeof(ss));
-   tmp.data = a->data;
-   tmp.len  = a->len;
+   tmp.data    = a->data;
+   tmp.len     = a->len;
+   tmp.read_cb = a->read_cb;
+   tmp.read_ud = a->read_ud;
 
    res = parse_streams_info(&tmp, r, &ss);
    substreams_free(&ss);
@@ -2055,35 +2126,43 @@ static int decode_encoded_header(r7z_archive_t *a, rd_t *r,
    return res;
 }
 
-int r7z_archive_open(r7z_archive_t **out, const uint8_t *data, size_t len)
+/* The archive in memory (@data), or read through @read_cb. */
+static int r7z_open(r7z_archive_t **out, const uint8_t *data, size_t len,
+      r7z_read_t read_cb, void *ud)
 {
    static const uint8_t sig[R7Z_SIGNATURE_SIZE] =
       { '7', 'z', 0xBC, 0xAF, 0x27, 0x1C };
    r7z_archive_t *a;
+   uint8_t        start[32];
+   const uint8_t *next;
    uint64_t       next_off, next_size;
    uint32_t       next_crc;
    rd_t           r;
    int            res;
 
-   if (!out || !data)
+   if (!out || (!data && !read_cb))
       return R7Z_ERROR_PARAM;
    *out = NULL;
 
    if (len < 32)
       return R7Z_ERROR_DATA;
-   if (memcmp(data, sig, R7Z_SIGNATURE_SIZE) != 0)
+   if (data)
+      memcpy(start, data, 32);
+   else if (read_cb(ud, 0, start, 32) != 32)
+      return R7Z_ERROR_DATA;
+   if (memcmp(start, sig, R7Z_SIGNATURE_SIZE) != 0)
       return R7Z_ERROR_DATA;
 
-   next_off  = (uint64_t)data[12] | ((uint64_t)data[13] << 8)
-             | ((uint64_t)data[14] << 16) | ((uint64_t)data[15] << 24)
-             | ((uint64_t)data[16] << 32) | ((uint64_t)data[17] << 40)
-             | ((uint64_t)data[18] << 48) | ((uint64_t)data[19] << 56);
-   next_size = (uint64_t)data[20] | ((uint64_t)data[21] << 8)
-             | ((uint64_t)data[22] << 16) | ((uint64_t)data[23] << 24)
-             | ((uint64_t)data[24] << 32) | ((uint64_t)data[25] << 40)
-             | ((uint64_t)data[26] << 48) | ((uint64_t)data[27] << 56);
-   next_crc  = (uint32_t)data[28] | ((uint32_t)data[29] << 8)
-             | ((uint32_t)data[30] << 16) | ((uint32_t)data[31] << 24);
+   next_off  = (uint64_t)start[12] | ((uint64_t)start[13] << 8)
+             | ((uint64_t)start[14] << 16) | ((uint64_t)start[15] << 24)
+             | ((uint64_t)start[16] << 32) | ((uint64_t)start[17] << 40)
+             | ((uint64_t)start[18] << 48) | ((uint64_t)start[19] << 56);
+   next_size = (uint64_t)start[20] | ((uint64_t)start[21] << 8)
+             | ((uint64_t)start[22] << 16) | ((uint64_t)start[23] << 24)
+             | ((uint64_t)start[24] << 32) | ((uint64_t)start[25] << 40)
+             | ((uint64_t)start[26] << 48) | ((uint64_t)start[27] << 56);
+   next_crc  = (uint32_t)start[28] | ((uint32_t)start[29] << 8)
+             | ((uint32_t)start[30] << 16) | ((uint32_t)start[31] << 24);
 
    /* The header sits after the 32-byte signature block. Both bounds
     * are checked against the real file length before either is used. */
@@ -2094,18 +2173,43 @@ int r7z_archive_open(r7z_archive_t **out, const uint8_t *data, size_t len)
    if (next_size == 0)
       return R7Z_ERROR_DATA;
 
-   if (encoding_crc32(0, data + 32 + next_off, (size_t)next_size) != next_crc)
-      return R7Z_ERROR_CRC;
-
    a = (r7z_archive_t *)calloc(1, sizeof(*a));
    if (!a)
       return R7Z_ERROR_MEM;
    a->data          = data;
    a->len           = len;
+   a->read_cb       = read_cb;
+   a->read_ud       = ud;
+   retro_atomic_int_init(&a->prog_state, 0);
+   retro_atomic_size_init(&a->prog_pos, 0);
    a->cached_folder = 0xFFFFFFFFu;
    a->pend_folder   = 0xFFFFFFFFu;
 
-   r.p   = data + 32 + next_off;
+   /* The header block: where it lies, or read in and kept - what is
+    * parsed out of it may point into it. */
+   if (data)
+      next = data + 32 + (size_t)next_off;
+   else
+   {
+      if (!(a->next_buf = (uint8_t *)malloc((size_t)next_size)))
+      {
+         r7z_archive_close(a);
+         return R7Z_ERROR_MEM;
+      }
+      if (r7z_fetch(a, 32 + next_off, a->next_buf, (size_t)next_size) != R7Z_OK)
+      {
+         r7z_archive_close(a);
+         return R7Z_ERROR_DATA;
+      }
+      next = a->next_buf;
+   }
+   if (encoding_crc32(0, next, (size_t)next_size) != next_crc)
+   {
+      r7z_archive_close(a);
+      return R7Z_ERROR_CRC;
+   }
+
+   r.p   = next;
    r.end = r.p + (size_t)next_size;
 
    /* An encoded header needs decoding before it can be parsed. */
@@ -2141,13 +2245,30 @@ int r7z_archive_open(r7z_archive_t **out, const uint8_t *data, size_t len)
    return R7Z_OK;
 }
 
+int r7z_archive_open(r7z_archive_t **out, const uint8_t *data, size_t len)
+{
+   if (!data)
+      return R7Z_ERROR_PARAM;
+   return r7z_open(out, data, len, NULL, NULL);
+}
+
+int r7z_archive_open_read(r7z_archive_t **out, uint64_t len,
+      r7z_read_t read_cb, void *ud)
+{
+   if (!read_cb || len > (uint64_t)((size_t)-1))
+      return R7Z_ERROR_PARAM;
+   return r7z_open(out, NULL, (size_t)len, read_cb, ud);
+}
+
 void r7z_archive_close(r7z_archive_t *a)
 {
    if (!a)
       return;
    decode_pending_reset(a);
+   retro_atomic_store_release_int(&a->prog_state, 0);
    free(a->cached_data);
    free(a->header_buf);
+   free(a->next_buf);
    free(a->pack_sizes);
    free(a->coders);
    free(a->props);
@@ -2199,11 +2320,16 @@ static void decode_pending_reset(r7z_archive_t *a)
 {
    if (!a)
       return;
-   free(a->pend_in);
+   /* (a folder decoded and held stays to be looked at: 2) */
+   if (retro_atomic_load_acquire_int(&a->prog_state) == 1)
+      retro_atomic_store_release_int(&a->prog_state, 0);
+   if (!a->pend_in_borrowed)
+      free(a->pend_in);
    free(a->pend_out);
    free(a->pend_dec);
    free(a->pend_probs);
-   a->pend_in     = NULL;
+   a->pend_in          = NULL;
+   a->pend_in_borrowed = 0;
    a->pend_out    = NULL;
    a->pend_dec    = NULL;
    a->pend_probs  = NULL;
@@ -2243,6 +2369,24 @@ static int coder_is_resumable(const coder_t *c)
    return (c->method == METHOD_LZMA2 || c->method == METHOD_LZMA);
 }
 
+/* The cached folder, decoded whole and checked, is there to be read. */
+static void r7z_progress_held(r7z_archive_t *a)
+{
+   a->prog_buf    = a->cached_data;
+   a->prog_folder = a->cached_folder;
+   retro_atomic_store_release_size(&a->prog_pos, a->cached_len);
+   retro_atomic_store_release_int(&a->prog_state, 2);
+}
+
+/* The stage that is being decoded writes its output in order, and is the
+ * folder's last: what it has written so far is the folder's bytes, there
+ * to be read (r7z_archive_decode_peek()). */
+static void r7z_progress_at(r7z_archive_t *a, size_t pos)
+{
+   if (retro_atomic_load_acquire_int(&a->prog_state) == 1)
+      retro_atomic_store_release_size(&a->prog_pos, pos);
+}
+
 /* Run one slice of a paused LZMA2 stage. Returns R7Z_OK with *done set
  * when the stage has produced its whole output. */
 static int decode_slice_lzma2(r7z_archive_t *a, const coder_t *c, int *done)
@@ -2265,6 +2409,7 @@ static int decode_slice_lzma2(r7z_archive_t *a, const coder_t *c, int *done)
       return R7Z_ERROR_DATA;
 
    a->pend_fed += got;
+   r7z_progress_at(a, dec->lzma.dic_pos);
 
    if (dec->lzma.dic_pos >= a->pend_out_len
          || status == RLZMA2_STATUS_FINISHED)
@@ -2304,6 +2449,7 @@ static int decode_slice_lzma(r7z_archive_t *a, int *done)
       return R7Z_ERROR_DATA;
 
    a->pend_fed += got;
+   r7z_progress_at(a, s->dic_pos);
 
    if (s->dic_pos >= a->pend_out_len
          || status == RLZMA_STATUS_FINISHED)
@@ -2342,6 +2488,16 @@ static int decode_stage_begin(r7z_archive_t *a, const folder_t *f)
 
    if (!coder_is_resumable(c))
       return R7Z_OK;
+
+   /* The folder's last coder, decoding in order into the buffer the
+    * folder will be held in: its progress can be watched. */
+   if (a->pend_coder + 1 == f->num_coders)
+   {
+      a->prog_buf    = a->pend_out;
+      a->prog_folder = a->pend_folder;
+      retro_atomic_store_release_size(&a->prog_pos, 0);
+      retro_atomic_store_release_int(&a->prog_state, 1);
+   }
 
    /* Stand up a decoder that survives between slices. */
    if (c->method == METHOD_LZMA2)
@@ -2410,7 +2566,9 @@ static int decode_stage_finish(r7z_archive_t *a, const folder_t *f)
    a->pend_dec   = NULL;
    a->pend_probs = NULL;
 
-   free(a->pend_in);
+   if (!a->pend_in_borrowed)
+      free(a->pend_in);
+   a->pend_in_borrowed = 0;
    a->pend_in     = a->pend_out;
    a->pend_in_len = a->pend_out_len;
    a->pend_out    = NULL;
@@ -2594,13 +2752,19 @@ static int decode_folder_bcj2_slice(r7z_archive_t *a, uint32_t fi,
                         decode_pending_reset(a);
                         return R7Z_ERROR_DATA;
                      }
-                     free(a->pend_in);
+                     if (!a->pend_in_borrowed)
+                        free(a->pend_in);
+                     a->pend_in_borrowed = 0;
                      if (!(a->pend_in = (uint8_t *)malloc(n ? n : 1)))
                      {
                         decode_pending_reset(a);
                         return R7Z_ERROR_MEM;
                      }
-                     memcpy(a->pend_in, a->data + 32 + off, n);
+                     if (r7z_fetch(a, 32 + off, a->pend_in, n) != R7Z_OK)
+                     {
+                        decode_pending_reset(a);
+                        return R7Z_ERROR_DATA;
+                     }
                      a->pend_in_len = n;
                      break;
                   }
@@ -2710,6 +2874,7 @@ static int decode_folder_bcj2_slice(r7z_archive_t *a, uint32_t fi,
       return R7Z_ERROR_CRC;
    }
 
+   retro_atomic_store_release_int(&a->prog_state, 0);
    free(a->cached_data);
    a->cached_data   = a->pend_b2dst;
    a->cached_len    = a->pend_b2dstlen;
@@ -2796,12 +2961,26 @@ static int decode_folder_slice(r7z_archive_t *a, uint32_t fi, int *done)
             decode_pending_reset(a);
             return R7Z_ERROR_DATA;
          }
-         if (!(a->pend_in = (uint8_t *)malloc(n ? n : 1)))
+         /* Where it lies, when the archive is in memory: see
+          * decode_folder(). */
+         if (a->data)
          {
-            decode_pending_reset(a);
-            return R7Z_ERROR_MEM;
+            a->pend_in          = (uint8_t *)(a->data + 32 + (size_t)off);
+            a->pend_in_borrowed = 1;
          }
-         memcpy(a->pend_in, a->data + 32 + off, n);
+         else
+         {
+            if (!(a->pend_in = (uint8_t *)malloc(n ? n : 1)))
+            {
+               decode_pending_reset(a);
+               return R7Z_ERROR_MEM;
+            }
+            if (r7z_fetch(a, 32 + off, a->pend_in, n) != R7Z_OK)
+            {
+               decode_pending_reset(a);
+               return R7Z_ERROR_DATA;
+            }
+         }
          a->pend_in_len = n;
       }
 
@@ -2865,10 +3044,25 @@ static int decode_folder_slice(r7z_archive_t *a, uint32_t fi, int *done)
       return R7Z_ERROR_CRC;
    }
 
+   /* (a folder no coder touched is kept as a copy, not as the archive) */
+   if (a->pend_in_borrowed)
+   {
+      uint8_t *copy = (uint8_t *)malloc(a->pend_in_len ? a->pend_in_len : 1);
+      if (!copy)
+      {
+         decode_pending_reset(a);
+         return R7Z_ERROR_MEM;
+      }
+      memcpy(copy, a->pend_in, a->pend_in_len);
+      a->pend_in          = copy;
+      a->pend_in_borrowed = 0;
+   }
+   retro_atomic_store_release_int(&a->prog_state, 0);
    free(a->cached_data);
    a->cached_data   = a->pend_in;
    a->cached_len    = a->pend_in_len;
    a->cached_folder = fi;
+   r7z_progress_held(a);
 
    a->pend_in     = NULL;
    a->pend_in_len = 0;
@@ -2961,6 +3155,7 @@ int r7z_archive_extract_slice(r7z_archive_t *a, uint32_t index,
       if ((res = decode_folder(a, e->folder, &folder_data)) != R7Z_OK)
          return res;
 
+      retro_atomic_store_release_int(&a->prog_state, 0);
       free(a->cached_data);
       a->cached_data   = folder_data;
       a->cached_len    = (size_t)a->folders[e->folder].unpack_size;
@@ -3021,6 +3216,7 @@ int r7z_archive_extract(r7z_archive_t *a, uint32_t index,
       if (res != R7Z_OK)
          return res;
 
+      retro_atomic_store_release_int(&a->prog_state, 0);
       free(a->cached_data);
       a->cached_data   = folder_data;
       a->cached_len    = (size_t)a->folders[e->folder].unpack_size;
@@ -3057,5 +3253,191 @@ int r7z_archive_extract(r7z_archive_t *a, uint32_t index,
 
    *out     = buf;
    *out_len = (size_t)e->size;
+   return R7Z_OK;
+}
+
+int r7z_archive_extract_detach(r7z_archive_t *a, uint32_t index,
+      uint8_t **out, size_t *out_len)
+{
+   const r7z_entry_t *e;
+   uint8_t           *buf;
+   int                res;
+
+   if (!a || !out || !out_len)
+      return R7Z_ERROR_PARAM;
+   if (index >= a->num_entries)
+      return R7Z_ERROR_PARAM;
+
+   e = &a->entries[index];
+
+   if (e->is_dir || e->size == 0 || e->folder >= a->num_folders
+         || e->offset_in_folder != 0
+         || e->size != a->folders[e->folder].unpack_size)
+      return r7z_archive_extract(a, index, out, out_len);
+
+   *out     = NULL;
+   *out_len = 0;
+
+   if (a->cached_folder == e->folder && a->cached_data)
+      buf = a->cached_data;
+   else
+   {
+      retro_atomic_store_release_int(&a->prog_state, 0);
+      free(a->cached_data);
+      a->cached_data   = NULL;
+      a->cached_folder = 0xFFFFFFFFu;
+      if ((res = decode_folder(a, e->folder, &buf)) != R7Z_OK)
+         return res;
+   }
+
+   /* The folder's output is the member: hand the buffer over rather
+    * than keep it cached and copy it. */
+   retro_atomic_store_release_int(&a->prog_state, 0);
+   a->cached_data   = NULL;
+   a->cached_len    = 0;
+   a->cached_folder = 0xFFFFFFFFu;
+
+   if (e->has_crc && encoding_crc32(0, buf, (size_t)e->size) != e->crc)
+   {
+      free(buf);
+      return R7Z_ERROR_CRC;
+   }
+
+   *out     = buf;
+   *out_len = (size_t)e->size;
+   return R7Z_OK;
+}
+
+int r7z_archive_entry_borrow(r7z_archive_t *a, uint32_t index,
+      const uint8_t **out, size_t *out_len)
+{
+   const r7z_entry_t *e;
+   uint8_t           *folder_data;
+   int                res;
+
+   if (!a || !out || !out_len)
+      return R7Z_ERROR_PARAM;
+   if (index >= a->num_entries)
+      return R7Z_ERROR_PARAM;
+
+   e        = &a->entries[index];
+   *out     = NULL;
+   *out_len = 0;
+
+   if (e->is_dir)
+      return R7Z_ERROR_PARAM;
+   if (e->size == 0)
+      return R7Z_OK;
+   if (e->folder >= a->num_folders)
+      return R7Z_ERROR_DATA;
+
+   if (a->cached_folder == e->folder && a->cached_data)
+      folder_data = a->cached_data;
+   else
+   {
+      if ((res = decode_folder(a, e->folder, &folder_data)) != R7Z_OK)
+         return res;
+      retro_atomic_store_release_int(&a->prog_state, 0);
+      free(a->cached_data);
+      a->cached_data   = folder_data;
+      a->cached_len    = (size_t)a->folders[e->folder].unpack_size;
+      a->cached_folder = e->folder;
+   }
+
+   if (e->offset_in_folder > a->cached_len
+         || e->size > a->cached_len - (size_t)e->offset_in_folder)
+      return R7Z_ERROR_DATA;
+
+   folder_data += (size_t)e->offset_in_folder;
+   if (e->has_crc && encoding_crc32(0, folder_data, (size_t)e->size) != e->crc)
+      return R7Z_ERROR_CRC;
+
+   *out     = folder_data;
+   *out_len = (size_t)e->size;
+   return R7Z_OK;
+}
+
+uint64_t r7z_archive_folder_size(const r7z_archive_t *a, uint32_t folder)
+{
+   if (!a || folder >= a->num_folders)
+      return 0;
+   return a->folders[folder].unpack_size;
+}
+
+int r7z_archive_decode_step(r7z_archive_t *a, uint32_t index)
+{
+   const r7z_entry_t *e;
+   int                done = 0;
+   int                res;
+
+   if (!a || index >= a->num_entries)
+      return R7Z_ERROR_PARAM;
+   e = &a->entries[index];
+   if (e->is_dir || e->size == 0)
+      return R7Z_ERROR_PARAM;
+   if (e->folder >= a->num_folders)
+      return R7Z_ERROR_DATA;
+
+   if (a->cached_folder == e->folder && a->cached_data)
+   {
+      if (retro_atomic_load_acquire_int(&a->prog_state) != 2)
+         r7z_progress_held(a);
+      return R7Z_OK;
+   }
+
+   res = decode_folder_slice(a, e->folder, &done);
+   if (res == R7Z_ERROR_UNSUPPORTED)
+   {
+      /* A shape the slicer will not take: whole, in this one call. */
+      uint8_t *folder_data;
+
+      if ((res = decode_folder(a, e->folder, &folder_data)) != R7Z_OK)
+         return res;
+      retro_atomic_store_release_int(&a->prog_state, 0);
+      free(a->cached_data);
+      a->cached_data   = folder_data;
+      a->cached_len    = (size_t)a->folders[e->folder].unpack_size;
+      a->cached_folder = e->folder;
+      r7z_progress_held(a);
+      return R7Z_OK;
+   }
+   if (res != R7Z_OK)
+      return res;
+   if (!done)
+      return R7Z_PENDING;
+   /* (a folder that went through the BCJ2 slicer says so only now) */
+   if (retro_atomic_load_acquire_int(&a->prog_state) != 2)
+      r7z_progress_held(a);
+   return R7Z_OK;
+}
+
+int r7z_archive_decode_peek(const r7z_archive_t *a, uint32_t index,
+      const uint8_t **data, size_t *avail)
+{
+   const r7z_entry_t *e;
+   size_t             pos;
+   int                state;
+
+   if (!a || !data || !avail || index >= a->num_entries)
+      return R7Z_ERROR_PARAM;
+   *data  = NULL;
+   *avail = 0;
+   e      = &a->entries[index];
+   if (e->is_dir)
+      return R7Z_ERROR_PARAM;
+
+   /* the state, and then what it says is there */
+   state = retro_atomic_load_acquire_int((retro_atomic_int_t*)&a->prog_state);
+   if (!state || a->prog_folder != e->folder)
+      return R7Z_OK;
+   pos = retro_atomic_load_acquire_size((retro_atomic_size_t*)&a->prog_pos);
+   if (e->offset_in_folder > (uint64_t)((size_t)-1))
+      return R7Z_ERROR_DATA;
+   *data = a->prog_buf + (size_t)e->offset_in_folder;
+   if (pos > (size_t)e->offset_in_folder)
+   {
+      size_t have = pos - (size_t)e->offset_in_folder;
+      *avail = (uint64_t)have < e->size ? have : (size_t)e->size;
+   }
    return R7Z_OK;
 }

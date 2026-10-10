@@ -117,6 +117,28 @@ typedef struct r7z_archive r7z_archive_t;
 int r7z_archive_open(r7z_archive_t **out,
       const uint8_t *data, size_t len);
 
+/* Positioned read of @len bytes at @off into @dst; returns the bytes
+ * read, 0 at the end, negative on error. */
+typedef int64_t (*r7z_read_t)(void *ud, uint64_t off, void *dst,
+      size_t len);
+
+/**
+ * r7z_archive_open_read:
+ * @out        : receives the opened archive
+ * @len        : length of the archive file
+ * @read_cb    : positioned reads of it
+ * @ud         : handed to @read_cb
+ *
+ * The same, for an archive that is not in memory and is not to be put
+ * there whole: the header is read at open, and a folder's packed bytes
+ * are read in when it is decoded and let go of when it has been. A
+ * member is extracted as it is from an archive in memory.
+ *
+ * Returns: R7Z_OK, or a negative R7Z_ERROR_* code.
+ */
+int r7z_archive_open_read(r7z_archive_t **out, uint64_t len,
+      r7z_read_t read_cb, void *ud);
+
 /**
  * r7z_archive_close:
  * @a          : archive, may be NULL
@@ -191,6 +213,84 @@ int r7z_archive_extract_slice(r7z_archive_t *a, uint32_t index,
  */
 int r7z_archive_extract(r7z_archive_t *a, uint32_t index,
       uint8_t **out, size_t *out_len);
+
+/**
+ * r7z_archive_extract_detach:
+ *
+ * The same as r7z_archive_extract(), except that an entry which is its
+ * folder's entire output - every member of a non-solid archive - is
+ * handed over as the decoded folder buffer itself, with nothing copied
+ * and nothing left in the folder cache. Any other entry extracts
+ * exactly as r7z_archive_extract() does.
+ */
+int r7z_archive_extract_detach(r7z_archive_t *a, uint32_t index,
+      uint8_t **out, size_t *out_len);
+
+/**
+ * r7z_archive_entry_borrow:
+ *
+ * The entry's bytes inside the decoded folder cache, decoding the folder
+ * first if it is not the one held. Nothing is copied: the pointer is
+ * owned by the archive and stays valid until a different folder is
+ * decoded, the folder is detached, or the archive is closed. The CRC is
+ * checked on every call, so a caller keeping the pointer calls once.
+ * A solid archive is one folder, so every member of it can be borrowed
+ * at the same time.
+ */
+int r7z_archive_entry_borrow(r7z_archive_t *a, uint32_t index,
+      const uint8_t **out, size_t *out_len);
+
+/**
+ * r7z_archive_folder_size:
+ *
+ * The decoded length of folder @folder (an entry's is in its
+ * r7z_entry_t), or 0 if there is none. What decoding it will take.
+ */
+uint64_t r7z_archive_folder_size(const r7z_archive_t *a, uint32_t folder);
+
+/**
+ * r7z_archive_decode_step:
+ * @a          : opened archive
+ * @index      : an entry of the folder to decode
+ *
+ * One slice of decoding the folder that holds @index: for a thread that
+ * decodes a large folder while another reads what has been decoded so
+ * far, with r7z_archive_decode_peek(). Call it until it returns
+ * something other than R7Z_PENDING. On R7Z_OK the folder is decoded,
+ * checked against its CRC and held, as r7z_archive_entry_borrow()
+ * leaves it.
+ *
+ * One thread, and nothing else done with @a meanwhile but
+ * r7z_archive_decode_peek() from other threads: an archive decodes one
+ * folder at a time. A caller that wants another folder at the same time
+ * opens the archive a second time for it.
+ *
+ * Returns: R7Z_PENDING, R7Z_OK, or a negative R7Z_ERROR_* code.
+ */
+int r7z_archive_decode_step(r7z_archive_t *a, uint32_t index);
+
+/**
+ * r7z_archive_decode_peek:
+ * @a          : the archive r7z_archive_decode_step() is called on
+ * @index      : an entry of the folder being decoded
+ * @data       : receives where the entry's bytes are, or NULL
+ * @avail      : receives how many of them are there to be read
+ *
+ * How much of entry @index has been decoded. A folder whose last coder
+ * decodes in order - LZMA or LZMA2, which is to say nearly all of them -
+ * fills the buffer it will be held in from the front, and what is in it
+ * is final: @data points into it, at the same place from the first call
+ * to the last and for as long as the folder is held, and @avail grows
+ * to the entry's size. A folder that ends in a filter gives nothing
+ * until it is done, and then everything. The bytes are not checked
+ * against a CRC until the folder is.
+ *
+ * Any thread.
+ *
+ * Returns: R7Z_OK, or a negative R7Z_ERROR_* code.
+ */
+int r7z_archive_decode_peek(const r7z_archive_t *a, uint32_t index,
+      const uint8_t **data, size_t *avail);
 
 RETRO_END_DECLS
 

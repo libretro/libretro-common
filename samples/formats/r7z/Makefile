@@ -1,4 +1,7 @@
-TARGET := r7z_lzma_props_test
+include ../../sample_objdir.mk
+
+TARGET       := r7z_lzma_props_test
+TARGET_TEST2 := r7z_archive_detach_test
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -6,7 +9,20 @@ SOURCES := \
 	r7z_lzma_props_test.c \
 	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma.c
 
-OBJS := $(SOURCES:.c=.o)
+ARCHIVE_SOURCES := \
+	r7z_archive_detach_test.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_crc32.c \
+	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c \
+	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_archive.c \
+	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_bcj2.c \
+	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_filters.c \
+	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma.c \
+	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma2.c \
+	$(LIBRETRO_COMM_DIR)/formats/7z/r7z_lzma_stream.c
+
+OBJS         := $(call sample_objs,$(SOURCES:.c=.o))
+ARCHIVE_OBJS := $(call sample_objs,$(ARCHIVE_SOURCES:.c=.o))
 
 CFLAGS += -Wall -pedantic -std=gnu99 -g -I$(LIBRETRO_COMM_DIR)/include
 
@@ -15,18 +31,27 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-all: $(TARGET)
+all: $(TARGET) $(TARGET_TEST2)
 
 %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(SAMPLE_OBJDIR)/%.o: $$(call sample_src,$$*).c
+	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
-check: $(TARGET)
+$(TARGET_TEST2): $(ARCHIVE_OBJS)
+	$(CC) $(ARCHIVE_OBJS) $(LDFLAGS) -o $@
+
+check: $(TARGET) $(TARGET_TEST2)
 	./$(TARGET)
+	./$(TARGET_TEST2)
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -rf $(SAMPLE_OBJDIR)
+	rm -f $(TARGET) $(TARGET_TEST2) $(OBJS) $(ARCHIVE_OBJS)
 
 .PHONY: all check clean

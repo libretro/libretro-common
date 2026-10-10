@@ -1871,6 +1871,16 @@ void filestream_set_mapped_ptr_cb(filestream_mapped_ptr_cb_t cb)
    filestream_mapped_ptr_cb = cb;
 }
 
+void filestream_prefetch(RFILE *stream, uint64_t offset, uint64_t len)
+{
+   if (!stream || !stream->hfile)
+      return;
+   if (filestream_read_cb)
+      return;   /* no such request in the libretro VFS interface */
+   retro_vfs_file_prefetch_impl(
+         (libretro_vfs_implementation_file*)stream->hfile, offset, len);
+}
+
 const uint8_t *filestream_get_mapped_ptr(RFILE *stream, int64_t *len)
 {
    if (len)
@@ -2243,18 +2253,23 @@ RFILE *filestream_open_atomic(const char *path)
    return file;
 }
 
+bool filestream_atomic_temp_name(char *s, size_t len, const char *path)
+{
+   size_t path_len;
+   if (!s || !path || !*path)
+      return false;
+   path_len = strlen(path);
+   if (path_len + sizeof(".tmp") > len)
+      return false;
+   memcpy(s, path, path_len);
+   memcpy(s + path_len, ".tmp", sizeof(".tmp"));
+   return true;
+}
+
 int filestream_commit_atomic(RFILE *file, const char *path, bool ok)
 {
-   char *temp_path;
-
    if (!file)
       return -1;
-   if (!path || !*path || !(temp_path = filestream_atomic_temp_path(path)))
-   {
-      if (filestream_close(file) != 0)
-         free(file);
-      return -1;
-   }
 
    /* A buffered write reports a full disk at close, not at write,
     * so both have to agree before the rename goes ahead. */
@@ -2263,6 +2278,16 @@ int filestream_commit_atomic(RFILE *file, const char *path, bool ok)
       free(file);
       ok = false;
    }
+
+   return filestream_finish_atomic(path, ok);
+}
+
+int filestream_finish_atomic(const char *path, bool ok)
+{
+   char *temp_path;
+
+   if (!path || !*path || !(temp_path = filestream_atomic_temp_path(path)))
+      return -1;
 
    if (!ok)
    {

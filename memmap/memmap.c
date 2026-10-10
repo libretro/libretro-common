@@ -59,6 +59,18 @@
 #define FILE_MAP_EXECUTE 0x0020
 #endif
 
+/* A UWP build's headers leave MapViewOfFileEx out, and C takes a call
+ * to a function it has not seen declared to return int: on a 64-bit
+ * build the address it hands back loses its upper half. The function
+ * is there to link against; this is the declaration the desktop
+ * headers give it. */
+#if defined(WINAPI_FAMILY) && defined(WINAPI_FAMILY_APP) \
+   && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
+WINBASEAPI LPVOID WINAPI MapViewOfFileEx(HANDLE hFileMappingObject,
+      DWORD dwDesiredAccess, DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
+      SIZE_T dwNumberOfBytesToMap, LPVOID lpBaseAddress);
+#endif
+
 /* Map POSIX prot bits to a PAGE_* protection constant.  Windows has
  * no write-only or exec-only protections; those requests take the
  * nearest expressible superset, as every mman shim does. */
@@ -627,20 +639,33 @@ void memshm_unmap(void *addr, size_t len) { (void)addr; (void)len; }
  * TARGET_OS_OSX is the test, not the architecture. */
 #if defined(__APPLE__) && defined(__aarch64__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX
 #include <pthread.h>
+#include <dlfcn.h>
 /* pthread_jit_write_protect_np is per thread, and so is this depth:
  * one thread's nesting must not flip another's pages. */
 static __thread int memjit_depth;
 
+/* Every macOS that runs on arm64 has pthread_jit_write_protect_np, but
+ * the SDK declares it for macOS 11 against a lower deployment target,
+ * so it is resolved by name once, at load: the call through the
+ * pointer is the same indirect call the library stub makes. */
+static void (*memjit_protect)(int);
+
+static void __attribute__((constructor)) memjit_resolve(void)
+{
+   *(void **)(&memjit_protect) = dlsym(RTLD_DEFAULT,
+         "pthread_jit_write_protect_np");
+}
+
 void memjit_write_begin(void)
 {
-   if (memjit_depth++ == 0)
-      pthread_jit_write_protect_np(0);
+   if (memjit_depth++ == 0 && memjit_protect)
+      memjit_protect(0);
 }
 
 void memjit_write_end(void)
 {
-   if (--memjit_depth == 0)
-      pthread_jit_write_protect_np(1);
+   if (--memjit_depth == 0 && memjit_protect)
+      memjit_protect(1);
 }
 #else
 void memjit_write_begin(void) { }
