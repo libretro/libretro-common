@@ -62,6 +62,9 @@ static thread_local uint64_t co_active_buffer[CONTEXT_SIZE / 8] __attribute__((_
 static thread_local cothread_t co_active_handle;
 
 __asm__ (
+      ".text\n"
+      ".set push\n"
+      ".set noreorder\n"
       ".align 4\n"
       ".globl co_switch_mips\n"
       ".globl _co_switch_mips\n"
@@ -222,6 +225,9 @@ __asm__ (
       " lv.q	c720, " VFP_OFF(30) "($a0)\n"
       " lv.q	c730, " VFP_OFF(31) "($a0)\n"
 #endif
+      /* PIC entrypoints derive their GOT pointer from t9. On resumption
+       * t9 is caller-saved, so setting it to the continuation is harmless. */
+      " move $t9, $ra\n"
       " jr $ra\n"
       "  nop\n"
       ".align 4\n"
@@ -232,6 +238,7 @@ __asm__ (
       STORE_REG " $gp, 0($a0)\n"
       " jr $ra\n"
       "  nop\n"
+      ".set pop\n"
     );
 
 /* ASM */
