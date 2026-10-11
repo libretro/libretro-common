@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 
 #ifndef __APPLE__
 #include <malloc.h>
@@ -247,10 +248,15 @@ void store_gp(gpr_t *s);
 
 cothread_t co_create(unsigned int size, void (*entrypoint)(void))
 {
-   size = (size + CONTEXT_SIZE + 1023) & ~1023;
    cothread_t handle = 0;
+   gpr_t *ptr;
+
+   /* Do not let context overhead or alignment wrap the allocation size. */
+   if (size > UINT_MAX - CONTEXT_SIZE - 1023)
+      return 0;
+   size = (size + CONTEXT_SIZE + 1023) & ~1023;
 #if defined(__APPLE__) || HAVE_POSIX_MEMALIGN >= 1
-   if (posix_memalign(&handle, 1024, size) < 0)
+   if (posix_memalign(&handle, 1024, size) != 0)
       return 0;
 #else
    handle = memalign(1024, size);
@@ -259,7 +265,7 @@ cothread_t co_create(unsigned int size, void (*entrypoint)(void))
    if (!handle)
       return handle;
 
-   gpr_t *ptr = (gpr_t*)handle;
+   ptr = (gpr_t*)handle;
    memset(ptr, 0, CONTEXT_SIZE);
    /* Non-volatiles.  */
    /* ptr[0],..., ptr[7] -> s0,..., s7 */
