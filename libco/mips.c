@@ -20,12 +20,13 @@
 extern "C" {
 #endif
 
-#if __mips >= 3
-/* If we have 64-bit registers.  */
+/* Use the compiler's register model, not the ISA revision: MIPS32 is
+ * numbered 32, and even MIPS III/64 uses 32-bit GPR operations with o32.
+ * n32 still has 32-bit pointers but uses 64-bit GPRs. */
+#if defined(__mips64)
 #define STORE_REG "sd"
 #define LOAD_REG "ld"
 #define _GPR_OFF(x) (x * 8)
-#define _VFPOFF0 (12 * 8 + 12 * 4)
 typedef uint64_t gpr_t;
 #else
 /* 32-bit only variant.  */
@@ -37,13 +38,18 @@ typedef uint32_t gpr_t;
 #define _STR(x) #x
 #define STR(x) _STR(x)
 #define GPR_OFF(x) STR(_GPR_OFF(x))
-/* Argument to GPR_OFF must be divisible by 4 and be >= number of saved GPR registers.  */
-#define _FPR_OFF(x) ((x * 4) + _GPR_OFF(12))
+/* Reserve twelve eight-byte FP slots even with soft float. The even slots
+ * hold doubles (paired registers with FR=0); n64 also saves odd registers.
+ * The following VFPU area stays sixteen-byte aligned in both GPR layouts. */
+#define _FPR_OFF(x) ((x * 8) + _GPR_OFF(12))
 #define FPR_OFF(x) STR(_FPR_OFF(x))
-/* Argument to FPR_OFF must be divisible by 4 and be >= number of saved FPR registers.  */
 #define _VFP_OFF(x) ((x * 16) + _FPR_OFF(12))
 #define VFP_OFF(x) STR(_VFP_OFF(x))
+#if defined(__mips_hard_float)
 #define HAVE_FP 1
+#else
+#define HAVE_FP 0
+#endif
 #ifdef __psp__
 #define HAVE_VFP 1
 #else
@@ -74,6 +80,8 @@ __asm__ (
       STORE_REG " $fp, " GPR_OFF(10) "($a1)\n"
       STORE_REG " $ra, " GPR_OFF(11) "($a1)\n"
 #if HAVE_FP
+#if __mips == 1
+      /* MIPS I has only word FP transfers; save both halves of each pair. */
       " swc1 $f20, " FPR_OFF(0) "($a1)\n"
       " swc1 $f21, " FPR_OFF(1) "($a1)\n"
       " swc1 $f22, " FPR_OFF(2) "($a1)\n"
@@ -85,6 +93,22 @@ __asm__ (
       " swc1 $f28, " FPR_OFF(8) "($a1)\n"
       " swc1 $f29, " FPR_OFF(9) "($a1)\n"
       " swc1 $f30, " FPR_OFF(10) "($a1)\n"
+      " swc1 $f31, " FPR_OFF(11) "($a1)\n"
+#else
+      " sdc1 $f20, " FPR_OFF(0) "($a1)\n"
+      " sdc1 $f22, " FPR_OFF(2) "($a1)\n"
+      " sdc1 $f24, " FPR_OFF(4) "($a1)\n"
+      " sdc1 $f26, " FPR_OFF(6) "($a1)\n"
+      " sdc1 $f28, " FPR_OFF(8) "($a1)\n"
+      " sdc1 $f30, " FPR_OFF(10) "($a1)\n"
+#if defined(_ABI64) && _MIPS_SIM == _ABI64
+      /* n64 preserves all eight f24..f31 registers, not just the evens. */
+      " sdc1 $f25, " FPR_OFF(5) "($a1)\n"
+      " sdc1 $f27, " FPR_OFF(7) "($a1)\n"
+      " sdc1 $f29, " FPR_OFF(9) "($a1)\n"
+      " sdc1 $f31, " FPR_OFF(11) "($a1)\n"
+#endif
+#endif
 #endif
 #if HAVE_VFP
       " sv.q	c000, " VFP_OFF(0) "($a1), wt\n"
@@ -132,7 +156,10 @@ __asm__ (
       LOAD_REG " $sp, " GPR_OFF(9) "($a0)\n"
       LOAD_REG " $fp, " GPR_OFF(10) "($a0)\n"
       LOAD_REG " $ra, " GPR_OFF(11) "($a0)\n"
+      " nop\n" /* MIPS I load delay before using ra, including soft float. */
 #if HAVE_FP
+#if __mips == 1
+      /* MIPS I has only word FP transfers; save both halves of each pair. */
       " lwc1 $f20, " FPR_OFF(0) "($a0)\n"
       " lwc1 $f21, " FPR_OFF(1) "($a0)\n"
       " lwc1 $f22, " FPR_OFF(2) "($a0)\n"
@@ -144,6 +171,22 @@ __asm__ (
       " lwc1 $f28, " FPR_OFF(8) "($a0)\n"
       " lwc1 $f29, " FPR_OFF(9) "($a0)\n"
       " lwc1 $f30, " FPR_OFF(10) "($a0)\n"
+      " lwc1 $f31, " FPR_OFF(11) "($a0)\n"
+#else
+      " ldc1 $f20, " FPR_OFF(0) "($a0)\n"
+      " ldc1 $f22, " FPR_OFF(2) "($a0)\n"
+      " ldc1 $f24, " FPR_OFF(4) "($a0)\n"
+      " ldc1 $f26, " FPR_OFF(6) "($a0)\n"
+      " ldc1 $f28, " FPR_OFF(8) "($a0)\n"
+      " ldc1 $f30, " FPR_OFF(10) "($a0)\n"
+#if defined(_ABI64) && _MIPS_SIM == _ABI64
+      /* n64 preserves all eight f24..f31 registers, not just the evens. */
+      " ldc1 $f25, " FPR_OFF(5) "($a0)\n"
+      " ldc1 $f27, " FPR_OFF(7) "($a0)\n"
+      " ldc1 $f29, " FPR_OFF(9) "($a0)\n"
+      " ldc1 $f31, " FPR_OFF(11) "($a0)\n"
+#endif
+#endif
 #endif
 #if HAVE_VFP
       " lv.q	c000, " VFP_OFF(0) "($a0)\n"
@@ -188,7 +231,7 @@ __asm__ (
       "_store_gp:\n"
       STORE_REG " $gp, 0($a0)\n"
       " jr $ra\n"
-      "  nop\n"      
+      "  nop\n"
     );
 
 /* ASM */
@@ -214,9 +257,9 @@ cothread_t co_create(unsigned int size, void (*entrypoint)(void))
    /* Non-volatiles.  */
    /* ptr[0],..., ptr[7] -> s0,..., s7 */
    store_gp(&ptr[8]); /* gp */
-   ptr[9] = (uintptr_t)ptr + size - 16; /* sp  */
+   ptr[9] = (gpr_t)(intptr_t)((uintptr_t)ptr + size - 16); /* sp  */
    /* ptr[10] is fp */
-   ptr[11] = (uintptr_t)entrypoint; /* ra */
+   ptr[11] = (gpr_t)(intptr_t)entrypoint; /* ra */
    return handle;
 }
 
