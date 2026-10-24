@@ -91,6 +91,15 @@ typedef struct
    size_t uncomp_size;       /* bytes consumed by the uncompressed header */
 } rvp9_hdr;
 
+/* Parse one coded frame without allocating or reconstructing pixels.
+ * previous supplies sequence color/depth; NULL starts a new sequence.
+ * ref_dims contains eight logical-slot width/height pairs (zero if absent).
+ * Returns 0 for a coded frame, 1 for show_existing_frame, negative on error.
+ * Coded frames must include the compressed header and at least one tile byte.
+ * Output is scratch on failure; previous and out must be distinct. */
+int rvp9_parse_frame_header(const uint8_t *data, size_t len,
+      const rvp9_hdr *previous, const int *ref_dims, rvp9_hdr *out);
+
 typedef struct
 {
    const uint8_t *buf, *end;
@@ -266,7 +275,8 @@ typedef struct
     * 8 KiB thread stacks.  mc_scratch is the motion-compensation
     * edge-emulation buffer (worst case is the 10-bit path: a
     * 160x160 block of uint16 pixels, 50 KiB); iht_scratch holds the
-    * inverse-transform row-pass output for the largest transform. */
+    * inverse-transform row-pass output for the largest transform;
+    * coefficient decoding reuses it before each inverse transform. */
    uint16_t  mc_scratch[80 * 2 * 80 * 2];
    rvp9_tran iht_scratch[32 * 32];
    /* rvp9_convolve8's horizontal-pass intermediate; separate from

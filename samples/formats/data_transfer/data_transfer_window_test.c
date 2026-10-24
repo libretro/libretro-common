@@ -66,6 +66,25 @@
 #include <string.h>
 #include <stdint.h>
 #include <formats/data_transfer.h>
+#include <memmap.h>
+#ifdef DT_COUNT_IO
+#include <streams/file_stream.h>
+static unsigned io_seeks, io_reads;
+static uint64_t io_bytes;
+int64_t __real_filestream_seek(RFILE *stream, int64_t offset, int origin);
+int64_t __real_filestream_read(RFILE *stream, void *data, int64_t length);
+int64_t __wrap_filestream_seek(RFILE *stream, int64_t offset, int origin)
+{
+   io_seeks++;
+   return __real_filestream_seek(stream, offset, origin);
+}
+int64_t __wrap_filestream_read(RFILE *stream, void *data, int64_t length)
+{
+   io_reads++;
+   if (length > 0) io_bytes += (uint64_t)length;
+   return __real_filestream_read(stream, data, length);
+}
+#endif
 #if defined(__linux__)
 #include <unistd.h>
 #endif
@@ -96,7 +115,7 @@ static size_t rss_kb(void)
  * it must stay near the window rather than near the file. */
 static int residency_check(void)
 {
-   const char *path = "/tmp/dtwin_resident.bin";
+   const char *path = "dtwin_resident.bin";
    size_t n = 64u << 20, i, tell, before, peak = 0;
    uint8_t *buf = (uint8_t*)malloc(n);
    data_transfer_t *dt; const uint8_t *base; size_t blen = 0;
@@ -154,7 +173,7 @@ static int residency_check(void)
  *     leaves the very next consumer read on unresident pages. */
 static int feed_budget_check(void)
 {
-   const char *path = "/tmp/dtwin_budget.bin";
+   const char *path = "dtwin_budget.bin";
    size_t n = 8u << 20, i, tell;
    size_t budget = 32u * 1024;
    uint8_t *ref = (uint8_t*)malloc(n);
@@ -262,7 +281,7 @@ static int feed_budget_check(void)
  * Run it in a child so either answer is observable. */
 static int ahead_of_frontier_check(void)
 {
-   const char *path = "/tmp/dtwin_ahead.bin";
+   const char *path = "dtwin_ahead.bin";
    size_t n = 16u << 20, i;
    uint8_t *buf = (uint8_t*)malloc(n);
    FILE *f;
@@ -354,7 +373,7 @@ static int ahead_of_frontier_check(void)
  * them by accident. */
 static int surface_mixing_check(void)
 {
-   const char *path = "/tmp/dtwin_mix.bin";
+   const char *path = "dtwin_mix.bin";
    size_t n = 4u << 20, i, blen = 0, avail_before;
    uint8_t *ref = (uint8_t*)malloc(n);
    data_transfer_t *dt;
@@ -452,7 +471,7 @@ static int surface_mixing_check(void)
  * pins the contract rather than catching a fault. */
 static int range_bounds_check(void)
 {
-   const char *path = "/tmp/dtwin_bounds.bin";
+   const char *path = "dtwin_bounds.bin";
    size_t n = 4u << 20, i, blen = 0;
    uint8_t *ref = (uint8_t*)malloc(n);
    uint8_t tmp[64];
@@ -547,7 +566,7 @@ static int range_bounds_check(void)
  * end reads fewer bytes than asked for. */
 static int extend_settles_check(void)
 {
-   const char *path = "/tmp/dtwin_settle.bin";
+   const char *path = "dtwin_settle.bin";
    size_t n = 4u << 20, i, blen = 0;
    uint8_t *ref = (uint8_t*)malloc(n);
    data_transfer_t *dt;
@@ -738,7 +757,7 @@ static int null_handle_check(void)
  * DT_STRICT. */
 static int settle_releases_check(void)
 {
-   const char *path = "/tmp/dtwin_release.bin";
+   const char *path = "dtwin_release.bin";
    size_t n = 8u << 20, i;
    uint8_t *ref = (uint8_t*)malloc(n);
    FILE *f;
@@ -823,9 +842,124 @@ static int settle_releases_check(void)
 }
 #endif
 
+static int sparse_skip_check(void)
+{
+   const char *path = "dtwin_sparse.bin";
+   data_transfer_t *dt = NULL;
+   const uint8_t *base;
+   uint8_t *ref;
+   size_t page = mempagesize(), n, i, len, pos;
+   FILE *file;
+   int rv = 1;
+   data_transfer_window_skip(NULL, 0);
+   if (!page) return 0;
+   n = KEEP + 8 * page;
+   ref = (uint8_t*)malloc(n);
+   if (!ref) return 1;
+   for (i = 0; i < n; i++) ref[i] = (uint8_t)(i * 17 + i / page);
+   file = fopen(path, "wb");
+   if (!file) goto done;
+   if (fwrite(ref, 1, n, file) != n) { fclose(file); goto done; }
+   fclose(file);
+   dt = data_transfer_open_window(path, KEEP);
+   if (!dt) goto done;
+   base = data_transfer_window_base(dt, &len);
+   if (!base || len != n) goto done;
+#ifdef DT_COUNT_IO
+   io_bytes = 0;
+#endif
+   for (i = 1; i <= 3; i++)
+   {
+      pos = KEEP + 2 * i * page + 3;
+      data_transfer_window_skip(dt, pos);
+      data_transfer_window_skip(dt, 0);
+      if (!data_transfer_window_extend(dt, pos + 10)
+            || memcmp(base + pos, ref + pos, 10)
+            || memcmp(base, ref, KEEP)) goto done;
+   }
+#ifdef DT_COUNT_IO
+   if (data_transfer_window_is_reserved(dt) && io_bytes != 30) goto done;
+#endif
+   rv = 0;
+done:
+   data_transfer_free(dt);
+   free(ref);
+   remove(path);
+   printf("[%s]   sparse window reads only the requested bytes\n", rv ? "FAIL" : "ok");
+   return rv;
+}
+
+static int pin_check(void)
+{
+   const char *path = "dtwin_pin.bin";
+   data_transfer_t *dt = NULL;
+   const uint8_t *base;
+   uint8_t *ref = NULL;
+   size_t n = 8u << 20, i, blen, page = mempagesize(), lo, hi, before;
+   FILE *file;
+   int rv = 1;
+   if (!page || page > KEEP) return 0;
+   ref = (uint8_t*)malloc(n);
+   if (!ref) return 1;
+   for (i = 0; i < n; i++) ref[i] = (uint8_t)(i * 13 + i / 4096);
+   file = fopen(path, "wb");
+   if (!file) goto done;
+   if (fwrite(ref, 1, n, file) != n) { fclose(file); goto done; }
+   fclose(file);
+   dt = data_transfer_open_window(path, KEEP);
+   if (!dt) goto done;
+   base = data_transfer_window_base(dt, &blen);
+   if (!base || blen != n || !data_transfer_window_extend(dt, KEEP + LOOKAHD)) goto done;
+   lo = KEEP + 2 * page; hi = lo + 2 * page;
+   if (!data_transfer_window_pin(dt, lo, hi)) goto done;
+   if (data_transfer_window_pin(dt, n, n + 1)) goto done;
+   data_transfer_window_rewind(dt);
+   data_transfer_window_rebase(dt, 4u << 20);
+   if (!data_transfer_window_extend(dt, (4u << 20) + LOOKAHD / 2)) goto done;
+   if (memcmp(base + lo, ref + lo, hi - lo) || memcmp(base, ref, KEEP)) goto done;
+   before = data_transfer_window_resident(dt);
+   if (data_transfer_window_is_reserved(dt) && before > KEEP + LOOKAHD + 2 * page) goto done;
+   /* Shrinking an out-of-window pin releases only its retired pages. */
+   if (!data_transfer_window_pin(dt, lo + page, hi)
+         || memcmp(base + lo + page, ref + lo + page, page)) goto done;
+   if (data_transfer_window_is_reserved(dt)
+         && data_transfer_window_resident(dt) + page != before) goto done;
+   if (!data_transfer_window_pin(dt, 0, 0)) goto done;
+   if (data_transfer_window_is_reserved(dt)
+         && data_transfer_window_resident(dt) + 2 * page != before) goto done;
+   if (memcmp(base + (4u << 20), ref + (4u << 20), LOOKAHD / 2)) goto done;
+#if defined(__linux__) && defined(DT_STRICT)
+   if (data_transfer_window_is_reserved(dt))
+   {
+      int status;
+      pid_t child = fork();
+      if (child < 0) goto done;
+      if (!child) { volatile uint8_t value = base[lo + page]; (void)value; _exit(42); }
+      waitpid(child, &status, 0);
+      if (WIFEXITED(status) && WEXITSTATUS(status) == 42) goto done;
+   }
+#endif
+   /* A pin inside the moving window does not get released on clear. */
+   if (!data_transfer_window_pin(dt, (4u << 20) + page, (4u << 20) + 2 * page)
+         || !data_transfer_window_pin(dt, 0, 0)
+         || memcmp(base + (4u << 20), ref + (4u << 20), LOOKAHD / 2)) goto done;
+   data_transfer_window_rewind(dt);
+   if (!data_transfer_window_extend(dt, KEEP + LOOKAHD)
+         || !data_transfer_window_pin(dt, lo, hi)
+         || !data_transfer_window_grow_keep(dt, hi + page)
+         || !data_transfer_window_pin(dt, 0, 0)
+         || memcmp(base, ref, hi + page)) goto done;
+   ok("coded pin survives rebase; retired pages released, window/head overlaps retained");
+   rv = 0;
+done:
+   if (rv) fail("coded window pin lifecycle/accounting");
+   data_transfer_free(dt); free(ref); remove(path);
+   return rv;
+}
+
 int main(void)
 {
-   const char *path = "/tmp/dtwin.bin";
+   const char *path = "dtwin.bin";
    size_t n = 4u << 20, i, tell;
    uint8_t *ref = malloc(n);
    data_transfer_t *dt;
@@ -848,6 +982,31 @@ int main(void)
    /* the head is resident from the start */
    if (memcmp(base, ref, KEEP)) fail("head contents after open");
    else ok("head resident and correct immediately after open");
+
+#ifdef DT_COUNT_IO
+   if (data_transfer_window_is_reserved(dt))
+   {
+      uint8_t probe[16];
+      io_seeks = io_reads = 0;
+      if (!data_transfer_window_extend(dt, KEEP + 4096)
+            || !data_transfer_window_extend(dt, KEEP + 8192)
+            || memcmp(base + KEEP, ref + KEEP, 8192))
+         fail("consecutive window reads retain exact bytes");
+      if (io_seeks || io_reads != 2)
+         fail("consecutive window reads need no seeks");
+      else ok("consecutive window reads need no seeks");
+      if (!data_transfer_window_peek(dt, KEEP * 3 + 7, probe, 8)
+            || !data_transfer_window_peek(dt, KEEP * 3 + 15, probe + 8, 8)
+            || memcmp(probe, ref + KEEP * 3 + 7, sizeof(probe))
+            || !data_transfer_window_extend(dt, KEEP + 12288)
+            || memcmp(base + KEEP, ref + KEEP, 12288))
+         fail("metadata probes and window refill retain exact bytes");
+      if (io_seeks != 2 || io_reads != 5)
+         fail("metadata probes only seek when changing ranges");
+      else ok("metadata probes only seek when changing ranges");
+      printf("window I/O: %u reads, %u seeks\n", io_reads, io_seeks);
+   }
+#endif
 
    /* play forward, feeding as a decoder would */
    for (tell = 0; tell < n; tell += 32768)
@@ -904,6 +1063,8 @@ int main(void)
    printf("[skip] residency bound: not measurable on this platform\n");
 #endif
 
+   bad |= sparse_skip_check();
+   bad |= pin_check();
    bad |= feed_budget_check();
    bad |= ahead_of_frontier_check();
    bad |= surface_mixing_check();

@@ -15,8 +15,11 @@ SOURCES := \
 	$(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c
 
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
+STDSTRING_OBJ := $(call sample_objs,$(LIBRETRO_COMM_DIR)/string/stdstring.o)
 
-CFLAGS += -Wall -pedantic -std=gnu99 -g -O0 -I$(LIBRETRO_COMM_DIR)/include
+$(STDSTRING_OBJ): CFLAGS += -Dutf8skip=word_wrap_test_utf8skip
+
+CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)

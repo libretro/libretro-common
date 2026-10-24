@@ -5,7 +5,7 @@
  * The decoding glue lives next door: rwebm_audio.c (audio track to PCM)
  * and rwebm_video.c (video track to images).
  *
- * Scope: WebM restricts Matroska to VP8/VP9 video and Vorbis/Opus audio,
+ * Scope: VP8/VP9/AV1 video, Vorbis/Opus audio and selected Matroska codecs,
  * SimpleBlock/BlockGroup lacing, and a Segment/Cluster/Block layout.  The
  * parser reads the elements it needs (EBML head just far enough to accept
  * the stream, Segment > Info for the timestamp scale and duration,
@@ -22,9 +22,8 @@
  *
  * What it does not implement: SeekHead (Cues are found by the header
  * walk reaching them, not by following a pointer to them), chapters,
- * tags, attachments, subtitle tracks, and encrypted streams.  Codecs other than
- * VP8/VP9/Vorbis/Opus are reported as unknown and their packets can be
- * skipped by the caller.
+ * tags, attachments, subtitle tracks, and encrypted streams. Unrecognised
+ * codecs retain their raw CodecID so callers can skip their packets.
  *
  * SPDX-License-Identifier: MIT  (RetroArch libretro-common)
  */
@@ -36,6 +35,7 @@
 /* ===== EBML primitives ===== */
 
 /* Matroska element IDs (the ones we act on). */
+#define ID_VOID            0xECu
 #define ID_EBML            0x1A45DFA3u
 #define ID_SEGMENT         0x18538067u
 #define ID_INFO            0x1549A966u
@@ -54,6 +54,8 @@
 #define ID_PIXELHEIGHT     0xBAu
 #define ID_COLOUR          0x55B0u
 #define ID_MATRIXCOEFF     0x55B1u
+#define ID_CHROMASITINGHORZ 0x55B7u
+#define ID_CHROMASITINGVERT 0x55B8u
 #define ID_COLOURRANGE     0x55B9u
 #define ID_TRANSFERCHAR    0x55BAu
 #define ID_PRIMARIES       0x55BBu
@@ -205,6 +207,53 @@ static double be_double_clamp(double v, double lo, double hi)
    return v;
 }
 
+static void rwebm_parse_mastering(const uint8_t *body, size_t size,
+      video_mastering_display_t *out)
+{
+   video_mastering_display_t m;
+   ebml_reader r;
+   memset(&m, 0, sizeof(m));
+   r.p = body;
+   r.end = body + size;
+   while (r.p < r.end)
+   {
+      int ok;
+      uint32_t id = ebml_read_id(&r);
+      uint64_t n = ebml_read_vint(&r, 1, &ok);
+      const uint8_t *p = r.p;
+      if (!id || !ok || n > (uint64_t)(r.end - p))
+         return;
+      if (id >= 0x55d1u && id <= 0x55dau)
+      {
+         unsigned index = id - 0x55d1u;
+         double value;
+         if ((n != 4 && n != 8) || (m.present & (1u << index)))
+            return;
+         value = be_float(p, (size_t)n);
+         if (!(value >= 0.0 && value <= (index < 8 ? 1.0 : 429496.7295)))
+            return;
+         if (index < 8)
+            m.chromaticity[index] = (uint16_t)(value * 50000.0 + 0.5);
+         else
+         {
+            double scaled = value * 10000.0;
+            uint32_t level = scaled >= 4294967295.0
+               ? UINT32_MAX : (uint32_t)(scaled + 0.5);
+            if (index == 8)
+               m.luminance_max = level;
+            else
+               m.luminance_min = level;
+         }
+         m.present |= 1u << index;
+      }
+      r.p = p + (size_t)n;
+   }
+   if ((m.present & 0x300u) == 0x300u && m.luminance_min > m.luminance_max)
+      return;
+   *out = m;
+}
+
+
 /* ===== Demuxer state ===== */
 
 struct rwebm_cue
@@ -240,6 +289,9 @@ struct rwebm
    const uint8_t *avail_end;
    /* Packet-read cursor. */
    const uint8_t *cur;              /* walk position inside the segment    */
+   size_t         need_hi;          /* blocked element end, or zero         */
+   rwebm_inert_range_cb_t inert_cb;
+   void *inert_user;
    int64_t        cluster_ts;       /* current cluster timestamp (ticks)   */
    /* Lacing: a SimpleBlock may carry several frames; we emit them one at a
     * time, so remember where we are within a block. */
@@ -350,6 +402,7 @@ static enum rwebm_codec codec_from_id(const char *id)
 {
    if (!strcmp(id, "V_VP8"))    return RWEBM_CODEC_VP8;
    if (!strcmp(id, "V_VP9"))    return RWEBM_CODEC_VP9;
+   if (!strcmp(id, "V_AV1"))    return RWEBM_CODEC_AV1;
    if (!strcmp(id, "A_VORBIS")) return RWEBM_CODEC_VORBIS;
    if (!strcmp(id, "A_OPUS"))   return RWEBM_CODEC_OPUS;
    if (!strcmp(id, "V_MPEG4/ISO/AVC")) return RWEBM_CODEC_H264;
@@ -404,13 +457,25 @@ static void parse_track_av(const uint8_t *p, const uint8_t *end,
                uint32_t  cid   = ebml_read_id(&cr);
                uint64_t  csz   = ebml_read_vint(&cr, 1, &cok);
                const uint8_t *cb = cr.p;
-               if (!cid || !cok || cb + csz > cr.end)
+               if (!cid || !cok || csz > (uint64_t)(cr.end - cb))
                   break;
                switch (cid)
                {
                   case ID_MATRIXCOEFF:
                      trk->matrix_coefficients     = (unsigned)be_uint(cb, (size_t)csz);
                      break;
+                  case ID_CHROMASITINGHORZ:
+                  case ID_CHROMASITINGVERT:
+                  {
+                     uint64_t value = csz <= 8
+                           ? be_uint(cb, (size_t)csz) : 3;
+                     unsigned siting = value <= 2 ? (unsigned)value : 3;
+                     if (cid == ID_CHROMASITINGHORZ)
+                        trk->chroma_siting_horz = siting;
+                     else
+                        trk->chroma_siting_vert = siting;
+                     break;
+                  }
                   case ID_COLOURRANGE:
                      trk->colour_range            = (unsigned)be_uint(cb, (size_t)csz);
                      break;
@@ -419,6 +484,9 @@ static void parse_track_av(const uint8_t *p, const uint8_t *end,
                      break;
                   case ID_PRIMARIES:
                      trk->primaries               = (unsigned)be_uint(cb, (size_t)csz);
+                     break;
+                  case 0x55d0u:
+                     rwebm_parse_mastering(cb, (size_t)csz, &trk->mastering);
                      break;
                   case ID_MAXCLL:
                      trk->max_cll                 = (unsigned)be_uint(cb, (size_t)csz);
@@ -535,6 +603,16 @@ size_t rwebm_tell(const rwebm_t *m)
    return (size_t)(m->cur - m->data);
 }
 
+size_t rwebm_consumed(const rwebm_t *m)
+{
+   const uint8_t *next;
+   if (!m || !m->cur) return 0;
+   next = m->cur;
+   if (m->lace_index < m->lace_count && m->lace_frame_ptr[m->lace_index] < next)
+      next = m->lace_frame_ptr[m->lace_index];
+   return (size_t)(next - m->data);
+}
+
 const rwebm_track *rwebm_get_track(const rwebm_t *webm, int index)
 {
    if (!webm || index < 0 || index >= webm->num_tracks)
@@ -549,12 +627,38 @@ void rwebm_close(rwebm_t *webm)
    free(webm);
 }
 
+rwebm_t *rwebm_cursor_clone(const rwebm_t *source)
+{
+   rwebm_t *copy;
+   if (!source || !(copy = (rwebm_t*)malloc(sizeof(*copy)))) return NULL;
+   memcpy(copy, source, sizeof(*copy));
+   copy->cues = NULL;
+   copy->num_cues = 0;
+   return copy;
+}
+
+void rwebm_cursor_copy(rwebm_t *destination, const rwebm_t *source)
+{
+   struct rwebm_cue *cues;
+   int count;
+   if (!destination || !source || destination == source) return;
+   cues = destination->cues;
+   count = destination->num_cues;
+   if (destination->data != source->data)
+   {
+      free(cues); cues = NULL; count = 0;
+   }
+   memcpy(destination, source, sizeof(*destination));
+   destination->cues = cues;
+   destination->num_cues = count;
+}
+
 int rwebm_num_cues(const rwebm_t *webm)
 {
    return webm ? webm->num_cues : 0;
 }
 
-int64_t rwebm_seek_time_ns(rwebm_t *webm, int64_t ns)
+static int webm_cue_index(const rwebm_t *webm, int64_t ns)
 {
    int64_t ticks;
    int     lo, hi, best;
@@ -582,11 +686,24 @@ int64_t rwebm_seek_time_ns(rwebm_t *webm, int64_t ns)
       else
          hi = mid - 1;
    }
+   return best;
+}
+
+int64_t rwebm_cue_time_ns(const rwebm_t *webm, int64_t ns)
+{
+   int best = webm_cue_index(webm, ns);
+   return best < 0 ? -1 : webm->cues[best].time_ticks * webm->timestamp_scale;
+}
+
+static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
+{
+   int best = webm_cue_index(webm, ns);
+   if (best < 0) return -1;
    {
       const uint8_t *at = webm->seg_body + webm->cues[best].cluster_pos;
       /* Under a partial read the target may be past the wall; say so
        * rather than pointing the walk at bytes that are not there. */
-      if (at >= webm->avail_end)
+      if (resident && at >= webm->avail_end)
          return -1;
       webm->cur        = at;
    }
@@ -596,7 +713,18 @@ int64_t rwebm_seek_time_ns(rwebm_t *webm, int64_t ns)
    webm->lace_count      = 0;
    webm->lace_index      = 0;
    webm->pending_discard = 0;
+   webm->need_hi         = 0;
    return webm->cues[best].time_ticks * webm->timestamp_scale;
+}
+
+int64_t rwebm_seek_time_ns(rwebm_t *webm, int64_t ns)
+{
+   return webm_select_time_ns(webm, ns, 1);
+}
+
+int64_t rwebm_select_time_ns(rwebm_t *webm, int64_t ns)
+{
+   return webm_select_time_ns(webm, ns, 0);
 }
 
 void rwebm_rewind(rwebm_t *webm)
@@ -607,6 +735,24 @@ void rwebm_rewind(rwebm_t *webm)
    webm->cluster_ts = 0;
    webm->lace_count = 0;
    webm->lace_index = 0;
+   webm->need_hi    = 0;
+}
+
+void rwebm_read_span(const rwebm_t *webm, size_t *lo, size_t *hi)
+{
+   if (lo) *lo = 0;
+   if (hi) *hi = 0;
+   if (!webm || !lo || !hi || !webm->need_hi) return;
+   *lo = (size_t)(webm->cur - webm->data);
+   *hi = webm->need_hi;
+}
+
+void rwebm_set_inert_callback(rwebm_t *webm,
+      rwebm_inert_range_cb_t callback, void *user)
+{
+   if (!webm) return;
+   webm->inert_cb = callback;
+   webm->inert_user = user;
 }
 
 /* DiscardPadding for the Block just parsed: the element may sit before
@@ -639,6 +785,8 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
    ebml_reader r;
    if (!webm || !pkt)
       return -1;
+   webm->need_hi = 0;
+   pkt->timestamp_continuation = 0;
 
    /* Drain a laced block first. */
    if (webm->lace_index < webm->lace_count)
@@ -648,6 +796,7 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
       pkt->size      = webm->lace_frame[i];
       pkt->track     = webm->lace_track;
       pkt->timestamp = webm->lace_ts;
+      pkt->timestamp_continuation = 1;
       pkt->keyframe  = webm->lace_keyframe;
       pkt->discard_padding = (webm->lace_index == webm->lace_count)
          ? webm->lace_discard : 0;
@@ -682,14 +831,28 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
           * established context-free resume (the cursor lands after
           * each block, mid-cluster, every call) makes re-entry at the
           * wall safe. */
-         const uint8_t *cend = body + sz;
-         if (cend > webm->segment_end)
-            cend = webm->segment_end;   /* malformed/overlong: clamp  */
+         const uint8_t *cend = sz > (uint64_t)(webm->segment_end - body)
+            ? webm->segment_end : body + (size_t)sz;
          r.p   = body;
          r.end = cend < r.end ? cend : r.end;
          continue;
       }
-      if (body + sz > r.end)
+      if (id == ID_VOID)
+      {
+         /* Padding carries no packet state. Its header establishes the
+          * next byte frontier even if its payload is not resident. Do
+          * not make a bounded feeder load a large padding body merely
+          * to discover that it contains no data. */
+         if (sz > (uint64_t)(webm->segment_end - body)) return -1;
+         if (webm->inert_cb && !webm->inert_cb(webm->inert_user,
+                  (size_t)(body - webm->data),
+                  (size_t)(body - webm->data) + (size_t)sz)) return -1;
+         r.p = body + (size_t)sz;
+         webm->cur = r.p;
+         continue;
+      }
+      if (sz > (uint64_t)(webm->segment_end - body)) return -1;
+      if (sz > (uint64_t)(r.end - body))
       {
          /* Truncated at the wall: if the file continues past it, the
           * element is merely not buffered yet - consume nothing (the
@@ -703,7 +866,10 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
           * group could yield a different DiscardPadding than the
           * fully-resident decode. */
          if (webm->avail_end < webm->segment_end)
+         {
+            webm->need_hi = (size_t)(body - webm->data) + (size_t)sz;
             return RWEBM_READ_AGAIN;
+         }
          webm->cur = r.end;
          return 0;
       }

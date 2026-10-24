@@ -24,6 +24,7 @@
 
 #include <formats/rmp4.h>
 #include <formats/rh265.h>
+#include <formats/rh265_hw.h>
 #ifdef HAVE_THREADS
 #include <rthreads/tpool.h>
 #endif
@@ -86,6 +87,7 @@ static int run(const char *fmt, ...)
  * and would be shared between pictures decoding concurrently. Every
  * case is decoded at both. */
 static int g_contexts = 1;
+static unsigned g_expected_slices;
 /* Pool threads for the decode under test; 0 is the calling thread. With
  * a pool the pictures decode concurrently, a picture reading from one
  * still decoding waits for the rows it needs, and the output must be
@@ -105,6 +107,9 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
    int trk = -1, i, frames = 0;
    long bad = 0;
    size_t off = 0;
+   static rh265_hw_state_t hw_state;
+   int hw_outputs = 0;
+   rh265_hw_state_init(&hw_state, 32);
    if (!b)
       return -1;
    if (!(m = rmp4_open_memory(b, n)))
@@ -139,6 +144,39 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
          break;
       if (pkt.track != trk)
          continue;
+      {
+         static rh265_nal_t slices[128];
+         rh265_access_unit_t au;
+         static rh265_video_params_t parameters;
+         rh265_hw_picture_t pending;
+         int prepared, shown;
+         const rmp4_track *track = rmp4_get_track(m, trk);
+         unsigned length_size = (track->codec_private[21] & 3) + 1;
+         if (rh265_video_get_access_unit(h, pkt.data, pkt.size, length_size,
+                  slices, 128, &au) || !au.num_slices
+               || (g_expected_slices && au.num_slices != g_expected_slices))
+         {
+            bad = -1;
+            goto done;
+         }
+         if (rh265_video_get_params(h, (unsigned)au.first.pps_id, &parameters))
+         { bad = -1; goto done; }
+         prepared = rh265_hw_prepare(&hw_state, &parameters, &au, &pending);
+         if (prepared == 1)
+         {
+            shown = rh265_hw_output_pick(&hw_state, (unsigned)parameters.max_num_reorder_pics, true);
+            if (shown < 0 || hw_state.poc[shown] != hw_outputs++) { bad = -1; goto done; }
+            rh265_hw_output_release(&hw_state, (unsigned)shown);
+            prepared = rh265_hw_prepare(&hw_state, &parameters, &au, &pending);
+         }
+         if (prepared || !rh265_hw_commit(&hw_state, &pending)) { bad = -1; goto done; }
+         while ((shown = rh265_hw_output_pick(&hw_state,
+                     (unsigned)parameters.max_num_reorder_pics, false)) >= 0)
+         {
+            if (hw_state.poc[shown] != hw_outputs++) { bad = -1; goto done; }
+            rh265_hw_output_release(&hw_state, (unsigned)shown);
+         }
+      }
       got = rh265_video_decode(h, pkt.data, pkt.size);
       if (getenv("RH265_TRACE"))
          fprintf(stderr, "TRACE threads=%d sample=%zu got=%d\n", g_threads, pkt.size, got);
@@ -251,6 +289,15 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
       }
       frames++;
    }
+   {
+      int shown;
+      while ((shown = rh265_hw_output_pick(&hw_state, 0, true)) >= 0)
+      {
+         if (hw_state.poc[shown] != hw_outputs++) { bad = -1; goto done; }
+         rh265_hw_output_release(&hw_state, (unsigned)shown);
+      }
+      if (hw_outputs != frames) { bad = -1; goto done; }
+   }
    if (off != alen)
       bad = bad < 0 ? bad : bad + 1;   /* short: not every reference frame came out */
 done:
@@ -272,6 +319,7 @@ static void oracle_case(const char *name, const char *src, int frames,
    size_t rlen;
    int nf = 0;
    long bad;
+   g_expected_slices = strstr(x265, "slices=2") ? 2 : 0;
    snprintf(mp4, sizeof(mp4), "%s/%s.mp4", dir, name);
    snprintf(yuv, sizeof(yuv), "%s/%s.yuv", dir, name);
    snprintf(label, sizeof(label), "%s (%s %s) byte-exact vs ffmpeg",
@@ -341,7 +389,7 @@ int main(void)
          rf = made;
       }
       ref = slurp(rf, &rlen);
-      int nf = 0;
+      int nf = 0, failed = 0;
       long bad;
       const char *te = getenv("RH265_FILE_THREADS");
       if (!ref)
@@ -350,22 +398,25 @@ int main(void)
       g_pool = tpool_create_with_stack_size(3, 512 * 1024);
       #endif
       bad = compare(getenv("RH265_FILE"), ref, rlen, ref, 0, &nf);
+      failed |= bad != 0;
       printf("one thread: %d frames, %ld differing samples, %d reads short of their rows\n",
             nf, bad, rh265_video_ref_wait_misses());
       g_contexts = 4;
       bad = compare(getenv("RH265_FILE"), ref, rlen, ref, 0, &nf);
       g_contexts = 1;
+      failed |= bad != 0;
       printf("4 contexts, one thread: %d frames, %ld differing samples\n", nf, bad);
       if (te && g_pool)
       {
          g_threads = atoi(te);
          bad = compare(getenv("RH265_FILE"), ref, rlen, ref, 0, &nf);
+         failed |= bad != 0;
          printf("%d threads: %d frames, %ld differing samples\n", g_threads, nf, bad);
       }
       free(ref);
       if (rf == made)
          remove(made);
-      return bad != 0;
+      return failed;
    }
    if (system("ffmpeg -version >/dev/null 2>&1") != 0)
    {
@@ -409,6 +460,12 @@ int main(void)
          "-x265-params crf=22:sao=1:deblock=1:bframes=2:wpp=1:frame-threads=1");
    oracle_case("lossy_10_b",    "mandelbrot=s=176x144:r=10", 8, "yuv420p10le",
          "-x265-params crf=22:sao=1:deblock=1:bframes=2:wpp=0:frame-threads=1");
+   oracle_case("weighted_b", "testsrc2=s=176x144:r=10,fade=t=in:st=0:d=1.5", 16,
+         "yuv420p",
+         "-x265-params crf=24:bframes=2:weightb=1:weightp=1:wpp=0:frame-threads=1:pools=none");
+   oracle_case("weighted_10_b", "testsrc2=s=176x144:r=10,fade=t=in:st=0:d=1.5",
+         16, "yuv420p10le",
+         "-x265-params crf=24:bframes=2:weightb=1:weightp=1:wpp=0:frame-threads=1:pools=none");
    /* Taller: five CTB rows and a partial sixth, P and B referencing
     * across them, the row hook and the reads that wait on it doing
     * real work; and a small-CTB stream, every row a quantisation
@@ -417,6 +474,10 @@ int main(void)
          "-x265-params crf=24:sao=1:deblock=1:bframes=3:b-pyramid=1:wpp=0:frame-threads=1");
    oracle_case("lossy_ctu16",   "mandelbrot=s=176x144:r=10", 6, "yuv420p",
          "-x265-params crf=24:ctu=16:sao=1:deblock=1:bframes=2:wpp=0:frame-threads=1");
+   oracle_case("multi_slice_b", "mandelbrot=s=256x256:r=10", 12, "yuv420p",
+         "-x265-params crf=24:slices=2:bframes=3:b-pyramid=1:wpp=1:frame-threads=1");
+   oracle_case("multi_slice_10", "mandelbrot=s=256x256:r=10", 12, "yuv420p10le",
+         "-x265-params crf=24:slices=2:bframes=3:b-pyramid=1:wpp=1:frame-threads=1");
    #ifdef HAVE_THREADS
    if (g_pool)
       tpool_destroy((tpool_t*)g_pool);

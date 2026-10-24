@@ -300,6 +300,92 @@ static void test_saturation(void)
    tpool_destroy(tp);
 }
 
+#ifdef RETRO_ATOMIC_LOCK_FREE
+static retro_atomic_int_t try_ran;
+static void try_job(void *arg)
+{
+   (void)arg;
+   retro_atomic_fetch_add_int(&try_ran, 1);
+}
+#define TRY_JOBS 2000
+static retro_atomic_int_t try_counts[PRODUCERS * TRY_JOBS];
+static unsigned char try_accepted[PRODUCERS * TRY_JOBS];
+static tpool_t *try_pool;
+static void try_count_job(void *arg)
+{
+   retro_atomic_fetch_add_int((retro_atomic_int_t*)arg, 1);
+}
+static void try_producer(void *arg)
+{
+   unsigned i, base = (unsigned)(size_t)arg * TRY_JOBS;
+   for (i = 0; i < TRY_JOBS; i++)
+      try_accepted[base + i] = tpool_try_add_work(try_pool, try_count_job, &try_counts[base + i]);
+}
+static void test_try_contention(void)
+{
+   sthread_t *threads[PRODUCERS];
+   unsigned i, wrong = 0, accepted = 0;
+   try_pool = tpool_create(4);
+   if (!try_pool) { check("contended try pool created", 0); return; }
+   for (i = 0; i < PRODUCERS * TRY_JOBS; i++)
+      retro_atomic_store_release_int(&try_counts[i], 0);
+   memset(try_accepted, 0, sizeof(try_accepted));
+   for (i = 0; i < PRODUCERS; i++)
+   {
+      threads[i] = sthread_create(try_producer, (void*)(size_t)i);
+      if (!threads[i]) wrong++;
+   }
+   for (i = 0; i < PRODUCERS; i++)
+      if (threads[i]) sthread_join(threads[i]);
+   tpool_wait(try_pool);
+   for (i = 0; i < PRODUCERS * TRY_JOBS; i++)
+   {
+      accepted += try_accepted[i];
+      if (retro_atomic_load_acquire_int(&try_counts[i]) != try_accepted[i]) wrong++;
+   }
+   check("contended try posts execute exactly the accepted jobs", !wrong && accepted);
+   check("contended try posts never use overflow or leave counts",
+         !retro_atomic_load_acquire_int(&try_pool->over)
+         && !retro_atomic_load_acquire_int(&try_pool->count.n.outstanding));
+   tpool_destroy(try_pool);
+}
+static void test_try_post(void)
+{
+   tpool_t *tp = tpool_create(1);
+   unsigned i, accepted = 0;
+   retro_time_t start;
+   if (!tp) { check("try pool created", 0); return; }
+   retro_atomic_store_release_int(&try_ran, 0);
+   retro_atomic_store_release_int(&sat_gate, 0);
+   retro_atomic_store_release_int(&sat_parked, 0);
+   tpool_add_work(tp, sat_stall, NULL);
+   start = cpu_features_get_time_usec();
+   while (!retro_atomic_load_acquire_int(&sat_parked)
+         && cpu_features_get_time_usec() - start < DEADLINE_US) sthread_yield();
+   check("try worker is stalled", retro_atomic_load_acquire_int(&sat_parked) == 1);
+   for (i = 0; i < TPOOL_QUEUE_SIZE; i++)
+      if (tpool_try_add_work(tp, try_job, NULL)) accepted++;
+   check("try fills the ring without allocating overflow", accepted == TPOOL_QUEUE_SIZE
+         && !retro_atomic_load_acquire_int(&tp->over));
+   check("try refuses a full ring without changing accounting",
+         !tpool_try_add_work(tp, try_job, NULL)
+         && retro_atomic_load_acquire_int(&tp->count.n.outstanding) == TPOOL_QUEUE_SIZE + 1);
+   check("try rejects missing pool or callback", !tpool_try_add_work(NULL, try_job, NULL)
+         && !tpool_try_add_work(tp, NULL, NULL));
+   tpool_add_work(tp, try_job, NULL);
+   check("try does not bypass pending overflow", !tpool_try_add_work(tp, try_job, NULL));
+   retro_atomic_store_release_int(&sat_gate, 1);
+   tpool_wait(tp);
+   check("every accepted try job runs once", retro_atomic_load_acquire_int(&try_ran)
+         == TPOOL_QUEUE_SIZE + 1);
+   check("try accepts again after draining", tpool_try_add_work(tp, try_job, NULL));
+   tpool_wait(tp);
+   check("drained try count balances", retro_atomic_load_acquire_int(&try_ran)
+         == TPOOL_QUEUE_SIZE + 2 && !retro_atomic_load_acquire_int(&tp->count.n.outstanding));
+   tpool_destroy(tp);
+}
+#endif
+
 int main(void)
 {
    test_no_lost_wakeup();
@@ -307,6 +393,10 @@ int main(void)
    test_in_order();
    test_destroy_pending();
    test_saturation();
+#ifdef RETRO_ATOMIC_LOCK_FREE
+   test_try_post();
+   test_try_contention();
+#endif
    if (fails)
    {
       printf("tpool_handoff_test: FAIL (%d)\n", fails);

@@ -13,6 +13,7 @@
  *   - Run under TSan for race detection.  Run without sanitizer for
  *     throughput sanity. */
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -655,8 +656,116 @@ static int run_mirror_stress(size_t min_capacity)
    return 0;
 }
 
+/* The cursor groups cannot share a cache line wherever the struct is
+ * placed: the next group, and whatever the embedder declares after the
+ * struct, start a full line past the previous group's last byte. */
+static int run_layout_checks(void)
+{
+   size_t line  = RETRO_SPSC_CACHE_LINE;
+   size_t head  = offsetof(retro_spsc_t, head);
+   size_t ctail = offsetof(retro_spsc_t, cached_tail);
+   size_t tail  = offsetof(retro_spsc_t, tail);
+   size_t chead = offsetof(retro_spsc_t, cached_head);
+   size_t head_end = (ctail > head ? ctail + sizeof(size_t)
+         : head + sizeof(retro_atomic_size_t));
+   size_t tail_end = (chead > tail ? chead + sizeof(size_t)
+         : tail + sizeof(retro_atomic_size_t));
+
+   if (tail < head_end + line)
+   {
+      printf("layout: tail group at %u, head group ends at %u: within a line\n",
+            (unsigned)tail, (unsigned)head_end);
+      return 1;
+   }
+   if (sizeof(retro_spsc_t) < tail_end + line)
+   {
+      printf("layout: struct ends at %u, tail group ends at %u: within a line\n",
+            (unsigned)sizeof(retro_spsc_t), (unsigned)tail_end);
+      return 1;
+   }
+   printf("layout: head group [%u,%u) tail group [%u,%u) size %u OK\n",
+         (unsigned)head, (unsigned)head_end, (unsigned)tail,
+         (unsigned)tail_end, (unsigned)sizeof(retro_spsc_t));
+   return 0;
+}
+
+/* retro_spsc_grow() on a ring whose unread bytes straddle the wrap:
+ * the bytes, the cursors and the kind of buffer carry over, and the
+ * grown ring keeps working past its new wrap point. */
+static int run_grow_case(int mirrored)
+{
+   retro_spsc_t q;
+   uint8_t      in[1500], out[1500];
+   size_t       head, tail, i, n;
+   int          was_mirror;
+   const char  *kind = mirrored ? "mirrored" : "plain";
+
+   if (!(mirrored ? retro_spsc_init_mirrored(&q, 1024)
+                  : retro_spsc_init(&q, 1024)))
+   {
+      fprintf(stderr, "FAIL: grow %s: init\n", kind);
+      return 1;
+   }
+   was_mirror = q.mirror != 0;
+   for (i = 0; i < sizeof(in); i++)
+      in[i] = (uint8_t)(i * 7 + 3);
+   /* 700 written and read leaves the cursors at 700; 600 more wrap. */
+   if (     retro_spsc_write(&q, in, 700) != 700
+         || retro_spsc_read(&q, out, 700) != 700
+         || retro_spsc_write(&q, in, 600) != 600)
+   {
+      fprintf(stderr, "FAIL: grow %s: fill\n", kind);
+      return 1;
+   }
+   head = retro_atomic_load_relaxed_size(&q.head);
+   tail = retro_atomic_load_relaxed_size(&q.tail);
+   if (     !retro_spsc_grow(&q, 512)
+         || q.capacity != 1024
+         || !retro_spsc_grow(&q, 3000))
+   {
+      fprintf(stderr, "FAIL: grow %s: grow\n", kind);
+      return 1;
+   }
+   if (     q.capacity != 4096
+         || (q.mirror != 0) != was_mirror
+         || retro_atomic_load_relaxed_size(&q.head) != head
+         || retro_atomic_load_relaxed_size(&q.tail) != tail
+         || retro_spsc_read_avail(&q) != 600
+         || retro_spsc_write_avail(&q) != 4096 - 600)
+   {
+      fprintf(stderr, "FAIL: grow %s: capacity %u, cursors %u/%u\n", kind,
+            (unsigned)q.capacity,
+            (unsigned)retro_atomic_load_relaxed_size(&q.tail),
+            (unsigned)retro_atomic_load_relaxed_size(&q.head));
+      return 1;
+   }
+   if (retro_spsc_read(&q, out, 600) != 600 || memcmp(out, in, 600))
+   {
+      fprintf(stderr, "FAIL: grow %s: unread bytes changed\n", kind);
+      return 1;
+   }
+   /* Round the new buffer twice more, across its own wrap. */
+   for (n = 0; n < 6; n++)
+   {
+      if (     retro_spsc_write(&q, in, sizeof(in)) != sizeof(in)
+            || retro_spsc_read(&q, out, sizeof(out)) != sizeof(out)
+            || memcmp(out, in, sizeof(in)))
+      {
+         fprintf(stderr, "FAIL: grow %s: round %u\n", kind, (unsigned)n);
+         return 1;
+      }
+   }
+   retro_spsc_free(&q);
+   printf("[pass] grow %s: unread bytes and cursors carried to 4096\n", kind);
+   return 0;
+}
+
 int main(void)
 {
+   if (run_layout_checks() != 0)
+      return 1;
+   if (run_grow_case(0) != 0 || run_grow_case(1) != 0)
+      return 1;
    if (     run_mirror_case(1024) != 0 || run_mirror_case(65536) != 0
          || run_mirror_stress(1024) != 0 || run_mirror_stress(4096) != 0)
       return 1;

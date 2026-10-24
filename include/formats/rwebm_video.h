@@ -32,6 +32,7 @@
 
 #include <boolean.h>
 #include <retro_common_api.h>
+#include <formats/video_hw_frame.h>
 
 RETRO_BEGIN_DECLS
 
@@ -81,6 +82,50 @@ int rwebm_video_blit_i420_fp16(uint16_t *dst, unsigned dst_stride,
       unsigned w, unsigned h, const uint16_t *y, int ys,
       const uint16_t *u, const uint16_t *v, int uvs,
       unsigned matrix, unsigned transfer, unsigned range);
+
+/* Source-primary-aware counterparts. primaries 1 is already BT.709;
+ * 9 is BT.2020, also the HDR default for absent/unspecified primaries.
+ * The legacy entry points above retain their BT.2020 HDR assumption.
+ * Primaries affect HDR gamut conversion and the linear HLG OOTF only;
+ * matrix remains the independent YCbCr matrix code point. */
+/* Caller-owned PQ table. Initialize before publishing it to row-band
+ * workers; keep immutable until those workers finish. The legacy blits
+ * remain stateless and need no shared cache or allocation. */
+typedef struct rwebm_video_hdr_tone
+{
+   uint16_t pq[1024];
+   unsigned peak;
+   int ready;
+} rwebm_video_hdr_tone_t;
+
+void rwebm_video_hdr_tone_init(rwebm_video_hdr_tone_t *tone, unsigned max_cll);
+void rwebm_video_blit_i420_hbd_tone(uint32_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range,
+      unsigned max_cll, unsigned primaries, int abgr,
+      const rwebm_video_hdr_tone_t *tone);
+void rwebm_video_blit_i420_10bit_tone(uint32_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range,
+      unsigned max_cll, unsigned primaries,
+      const rwebm_video_hdr_tone_t *tone);
+
+void rwebm_video_blit_i420_hbd_color(uint32_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range,
+      unsigned max_cll, unsigned primaries, int abgr);
+void rwebm_video_blit_i420_10bit_color(uint32_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range,
+      unsigned max_cll, unsigned primaries);
+int rwebm_video_blit_i420_fp16_color(uint16_t *dst, unsigned dst_stride,
+      unsigned w, unsigned h, const uint16_t *y, int ys,
+      const uint16_t *u, const uint16_t *v, int uvs,
+      unsigned matrix, unsigned transfer, unsigned range, unsigned primaries);
 
 bool rwebm_video_set_buf_ptr(rwebm_video_t *webm, void *data, size_t len);
 
@@ -144,6 +189,11 @@ rwebm_video_stream_t *rwebm_video_stream_open(const uint8_t *buf,
 rwebm_video_stream_t *rwebm_video_stream_open_avail(const uint8_t *buf,
       size_t len, size_t avail, int *need_more);
 
+/* Hardware-only AV1 candidate, without a CPU canvas. Call set_hw before
+ * decoding. The buffer, including pending packets, remains borrowed. */
+rwebm_video_stream_t *rwebm_video_stream_open_hw_avail(const uint8_t *buf,
+      size_t len, size_t avail, int *need_more);
+
 void rwebm_video_stream_close(rwebm_video_stream_t *stream);
 
 /* num_frames is the number of coded video packets, saturating at the
@@ -162,6 +212,22 @@ void rwebm_video_stream_get_info(const rwebm_video_stream_t *stream,
 const uint32_t *rwebm_video_stream_next(rwebm_video_stream_t *stream,
       int *duration_ms);
 
+/* Decode and discard the next displayed frame without color conversion or
+ * GPU surface export. References and timestamps advance normally. Returns 1
+ * for a displayed frame, 2 for retry, 0 at end/error. While waiting, retry the
+ * same operation (next or skip), or rewind/close to cancel it. */
+int rwebm_video_stream_skip(rwebm_video_stream_t *stream, int *duration_ms);
+
+/* Enable registered hardware before playback (VP9 rewinds on success), or
+ * query the active mode with enable == 0. AV1 candidates have no software
+ * decoder; other failures retain software state.
+ * GPU next returns a non-pixel token; take the lease with hw_frame.
+ * A NULL next while waiting is a retry, not EOS. Owner-thread calls. */
+int rwebm_video_stream_set_hw(rwebm_video_stream_t *stream, int enable);
+int rwebm_video_stream_hw_frame(rwebm_video_stream_t *stream,
+      video_hw_frame_t *out);
+int rwebm_video_stream_waiting(const rwebm_video_stream_t *stream);
+
 /* Select the channel order of subsequent frames: non-zero emits ARGB
  * words (memory order B,G,R,A on little-endian), zero restores the
  * default R,G,B,A memory order.  Applies to the 8-bit output paths;
@@ -176,11 +242,18 @@ void rwebm_video_stream_set_argb(rwebm_video_stream_t *stream, int argb);
 /* Blit decoded frames into @out - width * height words, the caller's,
  * which then comes back from rwebm_video_stream_next - instead of the
  * stream's own frame, so a caller uploading from its own buffer needs
- * no copy out of the stream. NULL restores the stream's frame. Takes
- * effect from the next decoded frame; @out must stay valid until the
- * next call that decodes has returned. */
+ * no copy out of the stream. NULL restores the stream's frame, allocated
+ * on its first displayed software frame. Takes effect from the next
+ * decoded frame; @out must stay valid until the next call that decodes
+ * has returned. */
 void rwebm_video_stream_set_output(rwebm_video_stream_t *stream,
       uint32_t *out);
+
+/* As set_output, with rows @stride pixels apart (0: width), including
+ * FP16 pixels. NULL restores the canvas. False leaves output unchanged
+ * if the stride is too short or its frame extent overflows size_t. */
+int rwebm_video_stream_set_output_stride(rwebm_video_stream_t *stream,
+      uint32_t *out, unsigned stride);
 
 /* Linear scRGB half floats for an HDR source: a 10-bit PQ or HLG frame
  * decoded into the caller's frame (rwebm_video_stream_set_output),
@@ -211,11 +284,22 @@ void rwebm_video_stream_set_avail(rwebm_video_stream_t *stream,
 
 /* Bounded-memory streaming support: media_floor is the fixed byte
  * offset where the cluster data begins (nothing below it is ever
- * read); consumed is the monotonic high-water byte offset the demuxer
- * has read up to.  Together they bound the window a feeder must keep
+ * read); consumed is the earliest byte still needed by pending packets
+ * or laces.  Together they bound the window a feeder must keep
  * resident: [media_floor, consumed + lookahead). */
 size_t rwebm_video_stream_media_floor(rwebm_video_stream_t *stream);
 size_t rwebm_video_stream_consumed(rwebm_video_stream_t *stream);
+/* Read demand may lead the release frontier while a coded packet is held
+ * for timestamp lookahead. A window owner pins the returned encoded span
+ * before moving to the demand frontier; prefix owners retain consumed(). */
+size_t rwebm_video_stream_feed_frontier(rwebm_video_stream_t *stream);
+void rwebm_video_stream_pin_span(rwebm_video_stream_t *stream,
+      size_t *lo, size_t *hi);
+/* Exclusively owned feeder query: pending complete element, not a release
+ * frontier. Keep the normal per-poll I/O budget while admitting its span. */
+void rwebm_video_stream_read_span(rwebm_video_stream_t *stream,
+      size_t *lo, size_t *hi);
+
 /* Container duration in nanoseconds, 0 when the file does not say. */
 int64_t rwebm_video_stream_duration_ns(rwebm_video_stream_t *stream);
 
@@ -232,6 +316,30 @@ void rwebm_video_stream_complete_scan(rwebm_video_stream_t *stream,
       const uint8_t *buf, size_t len);
 
 void rwebm_video_stream_rewind(rwebm_video_stream_t *stream);
+
+/* Owner-thread seek. Begin selects a cue (or rewinds without
+ * one); each step reads <=256 headers or decodes one packet. Step is
+ * -1 failure, 0 retry/feed consumed(), 1 target ready for next(). The
+ * first video packet at or after ns is retained without decoding.
+ * New begin/rewind cancels. AV1 hardware preroll yields on backpressure
+ * or after at most 32 stream steps / 4 ms. VP9 hardware preroll decodes
+ * one packet per step and retains submission state across backpressure. */
+/* Query only while the stream is exclusively owned, before publishing a
+ * playback session. AV1 requires an admitted hardware decoder. */
+int64_t rwebm_video_stream_start_ns(const rwebm_video_stream_t *stream);
+/* Last displayed packet timestamp, on the exclusive decode owner;
+ * -1 before a picture or after rewind. Hidden packets do not advance it. */
+int64_t rwebm_video_stream_frame_time_ns(const rwebm_video_stream_t *stream);
+/* Movie coordinates preserve requested positions in leading/tail video
+ * intervals; the raw bounded seek APIs remain unchanged. */
+int rwebm_video_stream_seek_movie_begin_ns(rwebm_video_stream_t *stream, int64_t ns);
+int rwebm_video_stream_seek_movie_step(rwebm_video_stream_t *stream,
+      int64_t *position_us);
+int rwebm_video_stream_seekable(const rwebm_video_stream_t *stream);
+int rwebm_video_stream_seek_begin_ns(rwebm_video_stream_t *stream, int64_t ns);
+int rwebm_video_stream_seek_step(rwebm_video_stream_t *stream,
+      int64_t *position_us);
+
 
 RETRO_END_DECLS
 

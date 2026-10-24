@@ -39,12 +39,11 @@ RETRO_BEGIN_DECLS
  * in the bytes it takes, which speaker each one belongs to - and the
  * two disc formats say all of that in a header of their own.
  *
- * DVD-Video carries LPCM in a private stream, each PES packet opening
- * with five bytes (ISO/IEC 13818-1's private stream 1, the LPCM
- * variant): a frame number, the first access unit's offset, and two
- * bytes saying the sample size, rate and channel count. Blu-ray's
- * HDMV LPCM opens each access unit with four: the payload's length,
- * then a channel assignment, a sampling frequency and a sample size.
+ * DVD-Video carries LPCM in a private stream. After the substream ID,
+ * six bytes carry a frame count, access-unit pointer, audio flags/frame
+ * number, sample configuration and dynamic range. Blu-ray's HDMV LPCM
+ * opens each access unit with four bytes: payload length, channel assignment,
+ * sampling frequency and sample size.
  * Both are big-endian, which is the opposite of WAV and of every
  * device the frontend writes to.
  *
@@ -54,7 +53,7 @@ RETRO_BEGIN_DECLS
 enum rlpcm_kind
 {
    RLPCM_KIND_RAW = 0,   /* no header; the caller supplies the shape */
-   RLPCM_KIND_DVD,       /* DVD-Video private stream 1, five-byte header */
+   RLPCM_KIND_DVD,       /* DVD-Video private stream 1, six-byte header */
    RLPCM_KIND_BLURAY     /* HDMV LPCM, four-byte header */
 };
 
@@ -78,19 +77,27 @@ typedef struct rlpcm_format
     * own ascending-bit order. */
    uint32_t layout;
    bool     big_endian;     /* the disc formats are; a raw caller says */
-   /* Bytes of header before the samples, and bytes of payload after
+   /* Bytes before the first samples (including DVD continuation prefix), and bytes of payload after
     * it where the header says (Blu-ray does; DVD's packet length is
     * the container's business, so 0 means "to the end of the buffer"). */
    unsigned header_bytes;
    size_t   payload_bytes;
 } rlpcm_format_t;
 
-/* Bytes one frame of every channel takes on the wire. 20-bit samples
+/* Unpacked frame size; DVD high-depth callers use dvd_block_shape.
+ * 20-bit samples
  * are packed two to five bytes, so a frame of an odd channel count at
  * 20 bits is not a whole number of bytes and the pair is the unit;
  * rlpcm_frame_bits() is exact where that matters. */
 unsigned rlpcm_frame_bits(const rlpcm_format_t *fmt);
 size_t   rlpcm_frame_bytes(const rlpcm_format_t *fmt);
+
+/* DVD high-depth packing uses groups of four samples (mono: two pairs).
+ * Returns the smallest complete channel-aligned block. Decode/encode round
+ * DVD requests down to multiples of its frame count; bytes are not simply
+ * frame_bytes times frames for a partial packed block. Failure clears outputs. */
+bool rlpcm_dvd_block_shape(const rlpcm_format_t *fmt,
+      size_t *bytes, unsigned *frames);
 
 /* Reads the header at src. RLPCM_NEED_MORE when len is shorter than
  * the header, RLPCM_NO_SYNC when the bytes cannot be one of that

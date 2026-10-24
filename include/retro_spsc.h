@@ -64,6 +64,12 @@
  *     tail's line and the consumer's publish starts invalidating it -
  *     which defeats the point for exactly the callers this primitive
  *     exists for.
+ *   - The struct carries no alignment of its own: an embedder on the
+ *     heap gets whatever malloc gives, so the cursors can start at any
+ *     offset within a line.  The pads are therefore sized so that each
+ *     cursor and its private copy sit a full line past the end of the
+ *     previous group, which keeps them on different lines wherever the
+ *     struct lands.
  *
  * Lifetime:
  *   - retro_spsc_init allocates an internal buffer; retro_spsc_free
@@ -134,12 +140,12 @@ RETRO_BEGIN_DECLS
       ? (RETRO_SPSC_CACHE_LINE - (sizeof(uint8_t*) + 3 * sizeof(size_t))) \
       : 1)
 /* Each cursor shares its line with that side's private copy of the
- * other cursor (see cached_tail / cached_head below), so the pad is
- * a line less both. */
-#define RETRO_SPSC_PAD1_BYTES \
-   ((RETRO_SPSC_CACHE_LINE > sizeof(retro_atomic_size_t) + sizeof(size_t)) \
-      ? (RETRO_SPSC_CACHE_LINE - sizeof(retro_atomic_size_t) - sizeof(size_t)) \
-      : 1)
+ * other cursor (see cached_tail / cached_head below).  A full line of
+ * pad after the pair puts the next group a line past the pair's last
+ * byte, so the two cannot share a line at any placement of the struct;
+ * a line less the pair would leave them sharing one whenever the
+ * struct starts late enough in a line. */
+#define RETRO_SPSC_PAD1_BYTES RETRO_SPSC_CACHE_LINE
 
 typedef struct retro_spsc
 {
@@ -237,6 +243,25 @@ void retro_spsc_free(retro_spsc_t *q);
  * stream begins.
  */
 void retro_spsc_clear(retro_spsc_t *q);
+
+/**
+ * retro_spsc_grow:
+ * @q             : The queue.
+ * @min_capacity  : Requested capacity in bytes, rounded up as for
+ *                  retro_spsc_init.
+ *
+ * Moves the queue to a larger buffer of the same kind, mirrored or
+ * not.  The unread data and both cursors carry over unchanged, so a
+ * position the caller recorded in the ring still names the same byte.
+ * A queue already holding @min_capacity is left as it is.
+ *
+ * SAFETY: as retro_spsc_clear, both the producer and the consumer must
+ * be quiesced, and any span either holds is invalid afterwards.
+ *
+ * Returns: true on success; false on allocation failure, with the
+ * queue untouched.
+ */
+bool retro_spsc_grow(retro_spsc_t *q, size_t min_capacity);
 
 /**
  * retro_spsc_write_avail:

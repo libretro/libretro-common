@@ -59,8 +59,16 @@
 #include <string.h>
 
 #include <string/stdstring.h>
+#include <encodings/utf.h>
 
 static int failures = 0;
+static size_t glyph_scans;
+
+const char *word_wrap_test_utf8skip(const char *str, size_t chars)
+{
+   glyph_scans++;
+   return utf8skip(str, chars);
+}
 
 /* A long ASCII source with no embedded newlines or wide glyphs.
  * "ASCII through wideglyph" is the worst-case for this function:
@@ -252,8 +260,187 @@ static void test_short_input_tiny_dest(void)
    free(dst);
 }
 
+static void test_regular_wrap_copy(void)
+{
+   static const struct {
+      const char *src;
+      const char *expected;
+      int width;
+      unsigned max_lines;
+   } cases[] = {
+      { "alpha beta gamma delta", "alpha\nbeta\ngamma\ndelta", 8, 0 },
+      { "caf\xc3\xa9 d\xc3\xa9j\xc3\xa0 vu encore",
+        "caf\xc3\xa9\nd\xc3\xa9j\xc3\xa0 vu\nencore", 8, 0 },
+      { "a b\ncccc dddd eeee", "a b\ncccc\ndddd\neeee", 6, 0 },
+      { "  leading  spaces and trailing  ",
+        " \nleading  spaces and trailing  ", 8, 2 },
+      { "one\ntwo\nthree\n", "one\ntwo\nthree\n", 4, 0 },
+      { "abcdefghij", "abcdefghij", 4, 0 },
+      { "", "", 4, 0 }
+   };
+   size_t i;
+   for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+   {
+      size_t len = strlen(cases[i].src);
+      size_t returned;
+      char *dst = (char*)malloc(len + 1);
+      if (!dst)
+      {
+         failures++;
+         continue;
+      }
+      memset(dst, 0xcc, len + 1);
+      returned = word_wrap(dst, len + 1, cases[i].src, len,
+            cases[i].width, 100, cases[i].max_lines);
+      if (returned != strlen(cases[i].expected)
+            || strcmp(dst, cases[i].expected) != 0)
+      {
+         printf("[ERROR] regular wrap case %zu changed output or length\n", i);
+         failures++;
+      }
+      free(dst);
+   }
+   {
+      char small[4] = {'X', 'X', 'X', 'X'};
+      if (word_wrap(small, sizeof(small), "too long", 8, 4, 100, 0) != 0
+            || memcmp(small, "XXXX", sizeof(small)) != 0)
+      {
+         printf("[ERROR] regular wrap changed an undersized destination\n");
+         failures++;
+      }
+   }
+}
+
+static void test_forward_glyph_scan(void)
+{
+   static const char *inputs[] = {
+      "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+      "a abcdefghijklmnopqrstuvwxyz a abcdefghijklmnopqrstuvwxyz",
+      "caf\xc3\xa9 d\xc3\xa9j\xc3\xa0 vu encore caf\xc3\xa9 d\xc3\xa9j\xc3\xa0 vu encore"
+   };
+   size_t i;
+   unsigned width;
+   for (i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++)
+      for (width = 4; width <= 32; width *= 2)
+      {
+         size_t len = strlen(inputs[i]);
+         size_t returned;
+         char *dst = (char*)malloc(len + 1);
+         if (!dst)
+         {
+            failures++;
+            continue;
+         }
+         glyph_scans = 0;
+         returned = word_wrap(dst, len + 1, inputs[i], len, width, 100, 0);
+         if (returned != len || glyph_scans > utf8len(inputs[i]))
+         {
+            printf("[ERROR] regular wrap rescanned glyphs at width %u\n", width);
+            failures++;
+         }
+         free(dst);
+      }
+}
+
+static void test_wide_word_tail_scan(void)
+{
+   const char *src = "a \xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9 a "
+      "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9 a "
+      "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9";
+   char dst[128];
+   size_t returned;
+   glyph_scans = 0;
+   returned = word_wrap_wideglyph(dst, sizeof(dst), src, strlen(src), 4, 200, 0);
+   if (returned != strlen(src) || strcmp(dst,
+            "a\n\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9 a\n"
+            "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9 a\n"
+            "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9") != 0
+         || glyph_scans != 15)
+   {
+      printf("[ERROR] wide wrap tail: scans=%zu length=%zu output=%s\n", glyph_scans, returned, dst);
+      failures++;
+   }
+}
+
+static void test_ascii_glyph_scan(void)
+{
+   const char *src = "alpha beta gamma delta epsilon zeta eta theta";
+   char dst[128];
+   unsigned wide;
+   for (wide = 0; wide < 2; wide++)
+   {
+      size_t returned;
+      glyph_scans = 0;
+      if (wide)
+         returned = word_wrap_wideglyph(dst, sizeof(dst), src, strlen(src), 8, 200, 0);
+      else
+         returned = word_wrap(dst, sizeof(dst), src, strlen(src), 8, 100, 0);
+      if (returned != strlen(src) || strcmp(dst,
+               "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta") != 0
+            || glyph_scans != 0)
+      {
+         printf("[ERROR] ASCII wrap used UTF-8 decoding (wide=%u)\n", wide);
+         failures++;
+      }
+   }
+}
+
+static void test_wide_glyph_scan(void)
+{
+   const char *src = "\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad"
+      "\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad"
+      "\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad";
+   char dst[128];
+   unsigned width;
+   for (width = 4; width <= 16; width *= 2)
+   {
+      size_t returned;
+      glyph_scans = 0;
+      returned = word_wrap_wideglyph(dst, sizeof(dst), src, strlen(src), width, 200, 0);
+      if (returned != strlen(dst) || !strchr(dst, '\n')
+            || !glyph_scans || glyph_scans > utf8len(src))
+      {
+         printf("[ERROR] wide wrap rescanned glyphs at width %u\n", width);
+         failures++;
+      }
+   }
+}
+static void test_bounded_utf8_copy(void)
+{
+   const char *src = "abc\xe4\xb8\xad\xf0\x9f\x98\x80\xc3\xa9xyz";
+   static const size_t lengths[] = {0, 0, 1, 2, 3, 3, 3, 6, 6,
+      6, 6, 10, 10, 12, 13, 14, 15, 15};
+   size_t cap;
+   for (cap = 0; cap < sizeof(lengths) / sizeof(lengths[0]); cap++)
+   {
+      unsigned char dst[32];
+      size_t i, returned;
+      memset(dst, 0xcc, sizeof(dst));
+      returned = utf8cpy((char*)dst, cap, src, 1000);
+      if (returned != lengths[cap] || memcmp(dst, src, returned)
+            || (cap && dst[returned] != 0))
+      {
+         printf("[ERROR] UTF-8 copy split a glyph at capacity %zu\n", cap);
+         failures++;
+      }
+      for (i = cap; i < sizeof(dst); i++)
+         if (dst[i] != 0xcc)
+         {
+            printf("[ERROR] UTF-8 copy exceeded capacity %zu\n", cap);
+            failures++;
+            break;
+         }
+   }
+}
+
 int main(void)
 {
+   test_bounded_utf8_copy();
+   test_wide_word_tail_scan();
+   test_ascii_glyph_scan();
+   test_wide_glyph_scan();
+   test_forward_glyph_scan();
+   test_regular_wrap_copy();
    test_truncating_normal_case();
    test_truncating_tiny_dest();
    test_fits();
@@ -266,6 +453,6 @@ int main(void)
             failures);
       return 1;
    }
-   printf("\nAll word_wrap_wideglyph regression tests passed.\n");
+   printf("\nAll word wrapping regression tests passed.\n");
    return 0;
 }

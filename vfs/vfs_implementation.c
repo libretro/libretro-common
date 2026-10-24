@@ -859,7 +859,7 @@ libretro_vfs_implementation_file *retro_vfs_file_open_impl(
          case VFS_SCHEME_CDROM:
             retro_vfs_file_open_cdrom(stream, path, mode, hints);
 #if defined(_WIN32) && !defined(_XBOX)
-            if (!stream->fh)
+            if (!stream->fh || stream->fh == INVALID_HANDLE_VALUE)
                goto error;
 #elif defined(__APPLE__)
             if (!stream->iokit_mmc)
@@ -1200,13 +1200,14 @@ error:
 
 int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
 {
+   int result = 0;
    if (!stream)
       return -1;
 
 #ifdef HAVE_CDROM
    if (stream->scheme == VFS_SCHEME_CDROM)
    {
-      retro_vfs_file_close_cdrom(stream);
+      result = retro_vfs_file_close_cdrom(stream);
       goto end;
    }
 #endif
@@ -1229,7 +1230,8 @@ int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
    if ((stream->hints & RFILE_HINT_UNBUFFERED) == 0)
    {
       if (stream->fp)
-         fclose(stream->fp);
+         if (fclose(stream->fp) != 0)
+            result = -1;
    }
    else
    {
@@ -1253,9 +1255,11 @@ int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
    if (stream->fd >= 0)
    {
 #if defined(VITA)
-      sceIoClose((SceUID)stream->fd);
+      if (sceIoClose((SceUID)stream->fd) < 0)
+         result = -1;
 #else
-      close(stream->fd);
+      if (close(stream->fd) != 0)
+         result = -1;
 #endif
    }
 #ifdef HAVE_CDROM
@@ -1282,7 +1286,7 @@ netend:
 
    free(stream);
 
-   return 0;
+   return result;
 }
 
 int retro_vfs_file_error_impl(libretro_vfs_implementation_file *stream)
@@ -1620,7 +1624,7 @@ int64_t retro_vfs_file_truncate_impl(libretro_vfs_implementation_file *stream, i
 	   return 0;
    }
 #endif
-#elif !defined(VITA) && !defined(PSP) && !defined(PS2) && !defined(ORBIS) && (!defined(SWITCH) || defined(HAVE_LIBNX))
+#elif !defined(VITA) && !defined(PSP) && !defined(PS2) && !defined(ORBIS)
    if (stream && stream->fp && ftruncate(fileno(stream->fp), (off_t)len) == 0)
    {
       stream->size = len;
@@ -2224,7 +2228,7 @@ int retro_vfs_file_rename_impl(const char *old_path, const char *new_path)
       free(aside);
       return ret;
    }
-#elif defined(_3DS) || defined(PS2) || defined(WIIU) || defined(GEKKO) || defined(__PSL1GHT__) || defined(__PS3__) || (defined(SWITCH) && defined(HAVE_LIBNX))
+#elif defined(_3DS) || defined(PS2) || defined(WIIU) || defined(GEKKO) || defined(__PSL1GHT__) || defined(__PS3__) || defined(SWITCH)
    /* The filesystems here refuse to rename onto an existing entry -
     * FS on 3DS and Switch, FatFs behind bdmfs_fatfs on PS2, libfat
     * on Wii and GameCube, LV2's sys_fs_rename on PS3 - and libnx,

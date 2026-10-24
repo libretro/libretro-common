@@ -8,10 +8,11 @@
  * contract as the rwebm demuxer, so the rwebm_video/rwebm_audio-style
  * glue can drive either container identically.
  *
- * The codec set mirrors what libretro-common can decode: VP8 ('vp08'),
- * VP9 ('vp09'), H.264 ('avc1'/'avc3') and H.265/HEVC ('hvc1'/'hev1')
- * video; Opus ('Opus'), Vorbis and AAC ('mp4a' by object type) audio.
- * Other codecs (AV1, ...) are reported with their sample-entry fourcc
+ * Recognised video codecs: VP8 ('vp08'), VP9 ('vp09'),
+ * H.264 ('avc1'/'avc3'), H.265/HEVC ('hvc1'/'hev1')
+ * and AV1 ('av01') video; Opus ('Opus'), Vorbis and AAC ('mp4a' by
+ * object type) audio. Track recognition does not imply decoder support.
+ * Other codecs are reported with their sample-entry fourcc
  * in codec_id and the codec field left RMP4_CODEC_UNKNOWN so callers
  * can skip them.
  *
@@ -22,10 +23,9 @@
  * The whole input buffer is supplied up front (memory-only, like the
  * rest of libretro-common's format layer) and is borrowed, not copied:
  * it must outlive the demuxer, and returned packet pointers alias into
- * it.  The one exception is Opus codec_private: MP4 stores the decoder
- * setup as a dOps box, which is repacked into the OpusHead layout the
- * Opus decoders expect; that buffer lives inside the demuxer and is
- * valid until rmp4_close.
+ * it. Decoder configuration records are owned by the demuxer and remain
+ * valid until rmp4_close, including when a streaming caller releases
+ * consumed input pages. Opus setup is repacked from dOps to OpusHead.
  */
 #ifndef __LIBRETRO_SDK_FORMAT_RMP4_H__
 #define __LIBRETRO_SDK_FORMAT_RMP4_H__
@@ -34,6 +34,7 @@
 #include <stddef.h>
 
 #include <retro_common_api.h>
+#include <formats/video_color.h>
 
 RETRO_BEGIN_DECLS
 
@@ -54,7 +55,8 @@ enum rmp4_codec
    RMP4_CODEC_VORBIS,
    RMP4_CODEC_OPUS,
    RMP4_CODEC_AAC,
-   RMP4_CODEC_H265
+   RMP4_CODEC_H265,
+   RMP4_CODEC_AV1
 };
 
 typedef struct
@@ -66,24 +68,33 @@ typedef struct
    unsigned               width, height;
    /* From the sample entry's colr box (nclx/nclc); 0 when untagged, in
     * which case converters pick defaults by resolution. */
+   video_mastering_display_t mastering;
+   unsigned               max_cll, max_fall;
+   unsigned               color_primaries;
    unsigned               matrix_coefficients;
    unsigned               transfer_characteristics;
    unsigned               full_range;
+   unsigned               color_description_present, range_present;
    /* Audio */
    unsigned               sample_rate;
    unsigned               channels;
    /* Media-timescale units the track's edit list trims from the
     * start (the usual encoder-delay edit; sample count for audio).
-    * Zero when absent. Only the common single-entry shape is read. */
+    * Zero when absent. A leading empty edit may precede this trim;
+    * arbitrary multi-entry or non-unity-rate edits remain unsupported. */
    uint64_t               media_skip;
-   /* Decoder setup data (Opus: an OpusHead repacked from the dOps box,
-    * owned by the demuxer; Vorbis: the xiph-laced 3 headers from the
-    * esds DecoderSpecificInfo, aliasing the input; VP8/VP9: usually
-    * empty). */
+   /* Decoder setup data, owned by the demuxer until rmp4_close.
+    * Opus: repacked OpusHead; Vorbis: xiph-laced headers from esds;
+    * H.264/HEVC/AV1: avcC/hvcC/av1C. VP8/VP9: complete vpcC payload. */
    const uint8_t         *codec_private;
    size_t                 codec_private_size;
    /* Sample-entry fourcc, NUL-terminated (e.g. "vp09", "avc1"). */
    char                   codec_id[24];
+   /* Leading empty edit in movie time, converted to nanoseconds. */
+   int64_t                presentation_delay_ns;
+   /* Duration of the supported nonempty unity-rate edit, excluding the
+    * leading delay. -1 when no such edit declares a play length. */
+   int64_t                presentation_duration_ns;
 } rmp4_track;
 
 typedef struct
@@ -161,6 +172,21 @@ void rmp4_set_avail(rmp4_t *mp4, size_t avail);
  * track; the array lives until rmp4_close. */
 const int64_t *rmp4_track_pts(const rmp4_t *mp4, int track,
       uint32_t *count);
+
+/* Metadata-only key flag for a track sample: 0/1, -1 if invalid.
+ * Does not read sample bytes or change any packet cursor. */
+int rmp4_track_sample_key(const rmp4_t *mp4, int track, uint32_t sample);
+
+/* Metadata-only half-open file span. Does not read sample bytes or
+ * change cursors. Invalid input leaves the outputs unchanged. */
+int rmp4_track_sample_span(const rmp4_t *mp4, int track, uint32_t sample,
+      size_t *begin, size_t *end);
+
+/* Read only this track from sample onward until rewind. Other tracks
+ * are parked at their ends. No sample bytes are read; the next read
+ * still obeys the current availability bound. Invalid input leaves
+ * all cursors unchanged. Returns 1 on success, 0 on failure. */
+int rmp4_select_track_sample(rmp4_t *mp4, int track, uint32_t sample);
 
 /* Restart packet reading from the first sample. */
 void rmp4_rewind(rmp4_t *mp4);

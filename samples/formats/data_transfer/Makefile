@@ -25,7 +25,7 @@ OBJS        := data_transfer_source_test.o data_transfer_prefix_test.o \
 	data_transfer_window_test.o data_transfer_pool_scrub_test.o \
 	$(COMMON_OBJS)
 
-CFLAGS += -Wall -pedantic -std=gnu99 -g -O0 -I$(LIBRETRO_COMM_DIR)/include
+CFLAGS += -Wall -pedantic -std=gnu99 -g1 -O0 -I$(LIBRETRO_COMM_DIR)/include
 
 ifneq ($(SANITIZER),)
    CFLAGS  := -fsanitize=$(SANITIZER) -fno-omit-frame-pointer $(CFLAGS)
@@ -46,6 +46,13 @@ $(TARGET): data_transfer_source_test.o $(COMMON_OBJS)
 
 $(TARGET_TEST2): data_transfer_prefix_test.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+ifeq ($(COUNT_IO),1)
+data_transfer_prefix_test.o: CFLAGS += -DDT_COUNT_IO
+$(TARGET_TEST2): LDFLAGS += -Wl,--wrap=filestream_read
+data_transfer_window_test.o: CFLAGS += -DDT_COUNT_IO
+$(TARGET_TEST3): LDFLAGS += -Wl,--wrap=filestream_seek -Wl,--wrap=filestream_read
+endif
 
 $(TARGET_TEST3): data_transfer_window_test.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)

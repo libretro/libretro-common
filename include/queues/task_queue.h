@@ -171,7 +171,24 @@ enum retro_task_flags
     * unfinished is called again on a later check, as on the
     * unthreaded runner.  Not changed after the push.
     */
-   RETRO_TASK_FLG_MAIN_THREAD      = (1 << 5)
+   RETRO_TASK_FLG_MAIN_THREAD      = (1 << 5),
+   /**
+    * Set by the pusher before \c task_queue_push: \c handler may run
+    * at the same time as any other task's, on one of the threaded
+    * runner's extra workers, which take only tasks marked so.  A task
+    * without it runs on the one worker every task has always run on,
+    * one at a time with every other such task, as before.  For work
+    * that shares nothing with other tasks but what it publishes on its
+    * own - a shader stage's compile, a decode into its own buffer.  One
+    * task is never in two handlers at once either way, but its calls
+    * may each be on a different worker.  Ignored with
+    * \c RETRO_TASK_FLG_DETACHABLE or \c RETRO_TASK_FLG_MAIN_THREAD, and
+    * by the unthreaded runner.  The GCD runner (Apple) already hands
+    * every task to the system's concurrent queue, one run of it at a
+    * time, a run on any thread; there the flag changes nothing.  Not
+    * changed after the push.
+    */
+   RETRO_TASK_FLG_PARALLEL         = (1 << 6)
 };
 
 /**
@@ -193,6 +210,12 @@ struct retro_task
     * @see cpu_features_get_time_usec
     */
    retro_time_t when;
+
+   /**
+    * The horizon the handler asked for with task_queue_park() on this
+    * pass, applied when the pass ends.  Owned by the task queue.
+    */
+   retro_time_t park;
 
    /**
     * The main body of work for a task.
@@ -313,6 +336,10 @@ struct retro_task
     */
    retro_task_t *next;
 
+   /** The GCD backend's record of how this task runs.  Owned by the
+    * task queue. */
+   void *sched;
+
    /**
     * Indicates the current progress of the task.
     *
@@ -344,6 +371,21 @@ struct retro_task
     * task_set_flags / task_get_flags.
     */
    retro_atomic_int_t flags;
+
+   /**
+    * Parked: \c when is a horizon from task_queue_park(), not a start
+    * time the caller set, so waits on the queue still count the task
+    * as running.  Woken: task_queue_wake() named the task since its
+    * handler was last picked up.  Owned by the task queue, read and
+    * written under its running lock.
+    */
+   bool parked;
+   bool woken;
+   /**
+    * A worker is in its handler; no other worker takes it.  Owned by the
+    * task queue, read and written under its running lock.
+    */
+   bool busy;
 };
 
 /**
@@ -474,6 +516,34 @@ void task_queue_retriever_info_free(task_retriever_info_t *list);
  * @see task_set_cancelled
  */
 void task_queue_cancel_task(void *task);
+
+/**
+ * task_queue_park:
+ * @task         : The task whose handler is running; called from it.
+ * @horizon_usec : The longest the task may wait before its handler
+ *                 runs again.
+ *
+ * For a handler returning unfinished because it waits on something -
+ * another task's callback, a thread, a device - rather than because
+ * its work is cut into slices.  The handler is not run again until
+ * task_queue_wake() names the task, the task is cancelled, or
+ * @horizon_usec passes.  The horizon is a watchdog; whatever ends the
+ * wait should wake the task.  The unthreaded queue, which runs a
+ * handler once per check, ignores it.
+ */
+void task_queue_park(retro_task_t *task, retro_time_t horizon_usec);
+
+/**
+ * task_queue_wake:
+ * @ident : The task::ident of the task to wake.
+ *
+ * Runs a parked task's handler again as soon as the queue can.  Safe
+ * from any thread, and does nothing for a task that is not parked or
+ * is no longer running.  A wake that arrives while the handler is
+ * running cancels the park that pass asks for, so a waker publishes
+ * whatever the handler checks first and wakes after.
+ */
+void task_queue_wake(uint32_t ident);
 
 typedef struct task_progress_snapshot
 {
@@ -677,6 +747,17 @@ bool task_queue_is_threaded(void);
  * caller's thread or on GCD.
  */
 void task_queue_set_prefer_fast_cores(bool prefer);
+
+/**
+ * How many extra workers the threaded runner starts for
+ * RETRO_TASK_FLG_PARALLEL tasks, beside the one worker every task runs
+ * on; at most 8.  They start the first time such a task is pushed after
+ * a task_queue_init(), and stop at task_queue_deinit().  None by
+ * default: a parallel task then runs on the one worker like any other.
+ * The frontend sizes it to the machine; the queue reads no core count.
+ * No effect on the GCD runner, whose concurrency is the system's.
+ */
+void task_queue_set_parallel_workers(unsigned count);
 
 /**
  * Calls the function given in \c find_data for each task
