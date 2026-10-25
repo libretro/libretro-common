@@ -267,7 +267,8 @@ typedef struct ngx_vk_resource
    unsigned char read_write;
 } ngx_vk_resource_t;
 
-/* NVSDK_NGX_Parameter's accessors, as the core library exports them */
+/* NVSDK_NGX_Parameter's accessors: the object's own virtual methods,
+ * called through its vtable (the library exports no C accessors) */
 typedef struct ngx_param_api
 {
    void (NGX_CONV *set_ull)(ngx_parameter_t *p, const char *name, uint64_t v);
@@ -363,6 +364,11 @@ typedef struct ngx_lib
  * driver, an older one without NGX, another platform) or one that
  * lacks the parameter accessors. A found library is kept loaded. */
 const ngx_lib_t *ngx_lib_get(void);
+
+/* What the probe found, for a log: where the library was looked for
+ * and loaded from, and which entry points it lacked. Valid after
+ * ngx_lib_get(); before, "not probed". */
+const char *ngx_lib_status(void);
 
 /* Whether @dir holds a DLSS Super Resolution feature library
  * (nvngx_dlss.dll on Windows, libnvidia-ngx-dlss.so.* on Linux), the

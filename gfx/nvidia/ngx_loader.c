@@ -106,6 +106,17 @@ bool ngx_dlss_feature_in(const char *dir)
 
 static ngx_lib_t ngx_lib;
 static bool ngx_probed;
+static char ngx_status[512] = "not probed";
+static char ngx_where[DIR_MAX_LENGTH];
+
+static void ngx_status_set(const char *s)
+{
+   strlcpy(ngx_status, s, sizeof(ngx_status));
+}
+static void ngx_status_add(const char *s)
+{
+   strlcat(ngx_status, s, sizeof(ngx_status));
+}
 
 typedef void (*ngx_proc_t)(void);
 
@@ -155,9 +166,13 @@ static ngx_module_t ngx_open_in(wchar_t *dir, size_t dir_chars)
          continue;
       wcscpy(dir + len, names[i]);
       m        = LoadLibraryW(dir);
-      dir[len] = 0;
       if (m)
+      {
+         WideCharToMultiByte(CP_UTF8, 0, dir, -1, ngx_where, sizeof(ngx_where), NULL, NULL);
+         dir[len] = 0;
          return m;
+      }
+      dir[len] = 0;
    }
    return NULL;
 }
@@ -192,6 +207,15 @@ static ngx_module_t ngx_open(void)
       m = LoadLibraryW(L"_nvngx.dll");
    if (!m)
       m = LoadLibraryW(L"nvngx.dll");
+   if (m && !ngx_where[0])
+   {
+      wchar_t path[MAX_PATH];
+      if (GetModuleFileNameW(m, path, MAX_PATH))
+         WideCharToMultiByte(CP_UTF8, 0, path, -1, ngx_where, sizeof(ngx_where), NULL, NULL);
+   }
+   if (!m)
+      ngx_status_set("no NGX core library: _nvngx.dll/nvngx.dll not beside the executable, "
+            "not where the registry's NGXCore NGXPath/FullPath points, not on the library search path (System32)");
    return m;
 }
 #else
@@ -207,7 +231,12 @@ static ngx_proc_t ngx_sym(ngx_module_t m, const char *name)
 
 static ngx_module_t ngx_open(void)
 {
-   return dlopen("libnvidia-ngx.so.1", RTLD_NOW | RTLD_LOCAL);
+   void *m = dlopen("libnvidia-ngx.so.1", RTLD_NOW | RTLD_LOCAL);
+   if (m)
+      strlcpy(ngx_where, "libnvidia-ngx.so.1", sizeof(ngx_where));
+   else
+      ngx_status_set("no NGX core library: libnvidia-ngx.so.1 could not be loaded");
+   return m;
 }
 #endif
 
@@ -216,34 +245,98 @@ static ngx_module_t ngx_open(void)
       ngx_proc_t fn = ngx_sym(m, name); \
       memcpy(&(dst), &fn, sizeof(fn)); \
       if (!fn) \
+      { \
          complete = false; \
+         ngx_status_add(complete_first ? " lacks " : ", "); \
+         ngx_status_add(name); \
+         complete_first = false; \
+      } \
    } while (0)
 
-static bool ngx_resolve_param(ngx_module_t m, ngx_param_api_t *p)
+/* NVSDK_NGX_Parameter is a C++ interface: the core library exports no
+ * accessors, the SDK's static library calls the object's virtual
+ * methods. So does this, through the slots the SDK's static libraries
+ * use (read from them): on MSVC the overloads of Set and of Get sit in
+ * the vtable in the reverse of their declared order, on the Itanium
+ * ABI in that order. Set(ull, f, d, ui, i, ID3D11Resource*,
+ * ID3D12Resource*, void*), Get(the same, through pointers), Reset. The
+ * methods take the object first, as a C call does on both ABIs. */
+#if defined(_MSC_VER) || defined(_WIN32)
+#define NGX_SLOT_SET(declared)   (7 - (declared))
+#define NGX_SLOT_GET(declared)   (15 - (declared))
+#else
+#define NGX_SLOT_SET(declared)   (declared)
+#define NGX_SLOT_GET(declared)   (8 + (declared))
+#endif
+
+typedef void (NGX_CONV *ngx_method_t)(void);
+
+static ngx_method_t ngx_param_slot(ngx_parameter_t *p, unsigned slot)
 {
-   bool complete = true;
-   NGX_SYM(p->set_ull, "NVSDK_NGX_Parameter_SetULL");
-   NGX_SYM(p->set_f, "NVSDK_NGX_Parameter_SetF");
-   NGX_SYM(p->set_d, "NVSDK_NGX_Parameter_SetD");
-   NGX_SYM(p->set_ui, "NVSDK_NGX_Parameter_SetUI");
-   NGX_SYM(p->set_i, "NVSDK_NGX_Parameter_SetI");
-   NGX_SYM(p->set_d3d11_resource, "NVSDK_NGX_Parameter_SetD3d11Resource");
-   NGX_SYM(p->set_d3d12_resource, "NVSDK_NGX_Parameter_SetD3d12Resource");
-   NGX_SYM(p->set_void_pointer, "NVSDK_NGX_Parameter_SetVoidPointer");
-   NGX_SYM(p->get_ull, "NVSDK_NGX_Parameter_GetULL");
-   NGX_SYM(p->get_f, "NVSDK_NGX_Parameter_GetF");
-   NGX_SYM(p->get_d, "NVSDK_NGX_Parameter_GetD");
-   NGX_SYM(p->get_ui, "NVSDK_NGX_Parameter_GetUI");
-   NGX_SYM(p->get_i, "NVSDK_NGX_Parameter_GetI");
-   NGX_SYM(p->get_d3d11_resource, "NVSDK_NGX_Parameter_GetD3d11Resource");
-   NGX_SYM(p->get_d3d12_resource, "NVSDK_NGX_Parameter_GetD3d12Resource");
-   NGX_SYM(p->get_void_pointer, "NVSDK_NGX_Parameter_GetVoidPointer");
-   return complete;
+   ngx_method_t m;
+   const ngx_method_t *const *vtable = (const ngx_method_t *const *)p;
+   memcpy(&m, &(*vtable)[slot], sizeof(m));
+   return m;
+}
+
+#define NGX_PARAM_SET(suffix, type, declared) \
+   static void NGX_CONV ngx_param_set_##suffix(ngx_parameter_t *p, const char *name, type v) \
+   { \
+      void (NGX_CONV *fn)(ngx_parameter_t*, const char*, type); \
+      ngx_method_t m = ngx_param_slot(p, NGX_SLOT_SET(declared)); \
+      memcpy(&fn, &m, sizeof(fn)); \
+      fn(p, name, v); \
+   }
+#define NGX_PARAM_GET(suffix, type, declared) \
+   static ngx_result_t NGX_CONV ngx_param_get_##suffix(ngx_parameter_t *p, const char *name, type *v) \
+   { \
+      ngx_result_t (NGX_CONV *fn)(ngx_parameter_t*, const char*, type*); \
+      ngx_method_t m = ngx_param_slot(p, NGX_SLOT_GET(declared)); \
+      memcpy(&fn, &m, sizeof(fn)); \
+      return fn(p, name, v); \
+   }
+
+NGX_PARAM_SET(ull, uint64_t, 0)
+NGX_PARAM_SET(f, float, 1)
+NGX_PARAM_SET(d, double, 2)
+NGX_PARAM_SET(ui, unsigned, 3)
+NGX_PARAM_SET(i, int, 4)
+NGX_PARAM_SET(d3d11_resource, void *, 5)
+NGX_PARAM_SET(d3d12_resource, void *, 6)
+NGX_PARAM_SET(void_pointer, void *, 7)
+NGX_PARAM_GET(ull, uint64_t, 0)
+NGX_PARAM_GET(f, float, 1)
+NGX_PARAM_GET(d, double, 2)
+NGX_PARAM_GET(ui, unsigned, 3)
+NGX_PARAM_GET(i, int, 4)
+NGX_PARAM_GET(d3d11_resource, void *, 5)
+NGX_PARAM_GET(d3d12_resource, void *, 6)
+NGX_PARAM_GET(void_pointer, void *, 7)
+
+static void ngx_param_api_init(ngx_param_api_t *p)
+{
+   p->set_ull            = ngx_param_set_ull;
+   p->set_f              = ngx_param_set_f;
+   p->set_d              = ngx_param_set_d;
+   p->set_ui             = ngx_param_set_ui;
+   p->set_i              = ngx_param_set_i;
+   p->set_d3d11_resource = ngx_param_set_d3d11_resource;
+   p->set_d3d12_resource = ngx_param_set_d3d12_resource;
+   p->set_void_pointer   = ngx_param_set_void_pointer;
+   p->get_ull            = ngx_param_get_ull;
+   p->get_f              = ngx_param_get_f;
+   p->get_d              = ngx_param_get_d;
+   p->get_ui             = ngx_param_get_ui;
+   p->get_i              = ngx_param_get_i;
+   p->get_d3d11_resource = ngx_param_get_d3d11_resource;
+   p->get_d3d12_resource = ngx_param_get_d3d12_resource;
+   p->get_void_pointer   = ngx_param_get_void_pointer;
 }
 
 static bool ngx_resolve_d3d12(ngx_module_t m, ngx_d3d12_api_t *a)
 {
    bool complete = true;
+   bool complete_first = true;
    NGX_SYM(a->init_project_id, "NVSDK_NGX_D3D12_Init_ProjectID");
    NGX_SYM(a->shutdown1, "NVSDK_NGX_D3D12_Shutdown1");
    NGX_SYM(a->get_capability_parameters, "NVSDK_NGX_D3D12_GetCapabilityParameters");
@@ -259,6 +352,7 @@ static bool ngx_resolve_d3d12(ngx_module_t m, ngx_d3d12_api_t *a)
 static bool ngx_resolve_vulkan(ngx_module_t m, ngx_vulkan_api_t *a)
 {
    bool complete = true;
+   bool complete_first = true;
    NGX_SYM(a->required_extensions, "NVSDK_NGX_VULKAN_RequiredExtensions");
    NGX_SYM(a->get_feature_instance_extension_requirements,
          "NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements");
@@ -285,13 +379,19 @@ const ngx_lib_t *ngx_lib_get(void)
       ngx_probed = true;
       if (!(m = ngx_open()))
          return NULL;
+      ngx_status_set("NGX core library ");
+      ngx_status_add(ngx_where);
       d3d12  = ngx_resolve_d3d12(m, &ngx_lib.d3d12);
       vulkan = ngx_resolve_vulkan(m, &ngx_lib.vulkan);
-      if (!ngx_resolve_param(m, &ngx_lib.param) || !(d3d12 || vulkan))
+      ngx_param_api_init(&ngx_lib.param);
+      if (!(d3d12 || vulkan))
       {
+         ngx_status_add(": unusable");
          memset(&ngx_lib, 0, sizeof(ngx_lib));
          return NULL;
       }
+      ngx_status_add(d3d12 && vulkan ? ": Vulkan and Direct3D 12"
+            : vulkan ? ": Vulkan only" : ": Direct3D 12 only");
       if (!d3d12)
          memset(&ngx_lib.d3d12, 0, sizeof(ngx_lib.d3d12));
       if (!vulkan)
@@ -301,11 +401,21 @@ const ngx_lib_t *ngx_lib_get(void)
    return ngx_lib.handle ? &ngx_lib : NULL;
 }
 
+const char *ngx_lib_status(void)
+{
+   return ngx_status;
+}
+
 #else
 
 const ngx_lib_t *ngx_lib_get(void)
 {
    return NULL;
+}
+
+const char *ngx_lib_status(void)
+{
+   return "no NGX on this platform";
 }
 
 #endif
