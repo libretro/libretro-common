@@ -78,8 +78,6 @@ typedef struct
    unsigned               transfer_characteristics;
    unsigned               primaries;
    unsigned               colour_range;
-   /* Matroska siting: 0 unspecified, 1 colocated, 2 half. */
-   unsigned               chroma_siting_horz, chroma_siting_vert;
    /* HDR static metadata (0 = absent) */
    video_mastering_display_t mastering;
    unsigned               max_cll;     /* MaxCLL, nits                     */
@@ -195,8 +193,6 @@ int64_t rwebm_seek_time_ns(rwebm_t *webm, int64_t ns);
  * the owner must feed before read_packet() can resume. */
 int64_t rwebm_select_time_ns(rwebm_t *webm, int64_t ns);
 
-/* Query the selected cue timestamp without changing either cursor or residency. */
-int64_t rwebm_cue_time_ns(const rwebm_t *webm, int64_t ns);
 
 /* Restart packet reading from the first cluster. */
 void rwebm_rewind(rwebm_t *webm);

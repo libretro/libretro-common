@@ -718,16 +718,6 @@ void data_transfer_window_rebase(data_transfer_t *dt, size_t pos)
    return;
 }
 
-void data_transfer_window_skip(data_transfer_t *dt, size_t pos)
-{
-   if (!dt || !dt->window || !dt->map_len || dt->failed)
-      return;
-   if (pos > dt->len) pos = dt->len;
-   if (pos <= dt->whi) return;
-   data_transfer_wdecommit_to(dt, pos);
-   dt->wlo = dt->whi = pos;
-}
-
 void data_transfer_window_advance(data_transfer_t *dt, size_t lo)
 {
    if (!dt || !dt->window || !dt->map_len || dt->failed)
@@ -1216,20 +1206,18 @@ static size_t data_transfer_prefix_iterate(data_transfer_t *dt,
    return dt->avail;
 }
 
-/* Prefix fills retain their cursor; reserved windows own it outright. */
+/* Positioned read that leaves the fill's own file cursor alone. */
 static int data_transfer_read_at(data_transfer_t *dt, size_t off,
       uint8_t *dst, size_t n)
 {
    int64_t save = filestream_tell(dt->f);
    int64_t r;
    if (save < 0
-         || (save != (int64_t)off
-            && filestream_seek(dt->f, (int64_t)off,
-               RETRO_VFS_SEEK_POSITION_START) < 0))
+         || filestream_seek(dt->f, (int64_t)off,
+               RETRO_VFS_SEEK_POSITION_START) < 0)
       return 0;
    r = filestream_read(dt->f, dst, (int64_t)n);
-   if (!dt->window || !dt->map_len)
-      filestream_seek(dt->f, save, RETRO_VFS_SEEK_POSITION_START);
+   filestream_seek(dt->f, save, RETRO_VFS_SEEK_POSITION_START);
    return r == (int64_t)n;
 }
 

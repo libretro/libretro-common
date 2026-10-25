@@ -54,8 +54,7 @@ static INLINE bool rav1_hw_stream_open_sequence(rav1_hw_stream_t *s)
    }
    if (!rav1_hw_backend_open(&s->sequence, 9, &ops, &s->backend))
       return false;
-   if (!rav1_hw_session_init_mode(&s->session, &s->sequence, &ops, 9,
-            s->backend.packet_decoder))
+   if (!rav1_hw_session_init(&s->session, &s->sequence, &ops, 9))
    {
       s->backend.close(&ops);
       memset(&s->backend, 0, sizeof(s->backend));
@@ -93,32 +92,6 @@ static INLINE void rav1_hw_stream_close(rav1_hw_stream_t *s)
       s->backend.close(&s->session.ops);
    }
    memset(s, 0, sizeof(*s));
-}
-
-/* Raw backends accept a new reference chain without retiring GPU leases.
- * Opaque packet decoders require a platform flush instead. */
-static INLINE bool rav1_hw_stream_restart(rav1_hw_stream_t *s)
-{
-   rav1_hw_ops_t ops;
-   unsigned slots;
-   if (!s || !s->opened || s->error || s->session.broken
-         || s->backend.packet_decoder)
-      return false;
-   ops = s->session.ops;
-   slots = s->session.slots;
-   rav1_hw_session_cancel(&s->session);
-   if (!rav1_hw_session_init_mode(&s->session, &s->sequence, &ops, slots, false))
-   {
-      s->session.ops = ops;
-      s->error = -1;
-      return false;
-   }
-   s->packet = NULL;
-   s->size = s->offset = s->next = 0;
-   s->submitted = s->started = 0;
-   memset(&s->obu, 0, sizeof(s->obu));
-   memset(&s->hdr, 0, sizeof(s->hdr));
-   return true;
 }
 
 /* 0 borrowed, 1 previous packet active, negative invalid/unsupported.

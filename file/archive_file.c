@@ -140,9 +140,6 @@ static int file_archive_extract_cb(const char *name, const char *valid_exts,
    return 1;
 }
 
-/* The largest archive a 32-bit host maps whole. */
-#define ARCHIVE_MAP_CEILING_32 (256 * 1024 * 1024)
-
 static int file_archive_parse_file_init(file_archive_transfer_t *state,
       const char *file)
 {
@@ -157,17 +154,15 @@ static int file_archive_parse_file_init(file_archive_transfer_t *state,
    if (!(state->backend = file_archive_get_file_backend(path)))
       return -1;
 
-   /* Ask the VFS to map the archive. A 64-bit host maps it whatever
-    * its size, since pages are only faulted in as they are touched;
-    * a 32-bit one keeps the mapping to ARCHIVE_MAP_CEILING_32 so a
-    * huge archive cannot take the address space the core needs, and
-    * reads it through the stream instead. A URL scheme or a failed
-    * map just leaves no mapping, which every backend reads through
-    * the stream as well. */
+   /* Ask the VFS to map the archive, as the private mmap() over a
+    * second open() of the path used to: same 256 MiB ceiling, so a
+    * huge archive is still streamed rather than mapped whole.  The
+    * VFS handles what that code had to special-case - a URL scheme
+    * or a failed map just leaves no mapping - and it maps on Win32
+    * too, which the private mmap() never did. */
    {
       int64_t  sz    = path_get_size(path);
-      unsigned hints = (sz > 0 && (sizeof(size_t) >= 8
-               || sz <= ARCHIVE_MAP_CEILING_32))
+      unsigned hints = (sz > 0 && sz <= (256 * 1024 * 1024))
             ? RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS
             : RETRO_VFS_FILE_ACCESS_HINT_NONE;
 
@@ -194,31 +189,6 @@ static int file_archive_parse_file_init(file_archive_transfer_t *state,
    state->step_total   = 0;
 
    return state->backend->archive_parse_file_init(state, path);
-}
-
-int64_t file_archive_read_at(void *ud, uint64_t off, void *dst, size_t len)
-{
-   RFILE   *f    = (RFILE*)ud;
-   uint8_t *out  = (uint8_t*)dst;
-   size_t   done = 0;
-
-   if (     !f
-         || (int64_t)off < 0
-         || filestream_seek(f, (int64_t)off,
-               RETRO_VFS_SEEK_POSITION_START) < 0)
-      return -1;
-
-   while (done < len)
-   {
-      int64_t r = filestream_read(f, out + done, (int64_t)(len - done));
-      if (r < 0)
-         return -1;
-      if (r == 0)
-         break;
-      done += (size_t)r;
-   }
-
-   return (int64_t)done;
 }
 
 /* Drops the output of a member that will not complete: the temporary

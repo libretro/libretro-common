@@ -27,25 +27,13 @@
  * checksums, string-to-key and the PRF. The protocol itself (AS/TGS
  * exchanges, AP-REQ, GSS wrapping) sits on top in this file. */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include <net/net_krb5.h>
-#include <net/net_compat.h>
-#include <net/net_socket.h>
-#include <compat/strl.h>
 #include <crypto/crypto.h>
 #include <crypto/kdf.h>
 #include <lrc_hash.h>
-
-/* Hidden, so callers of MIT krb5's same-named functions can't bind here. */
-#if defined(__GNUC__) && __GNUC__ >= 4 && !defined(__DJGPP__) \
-   && (defined(__ELF__) || defined(__APPLE__))
-#pragma GCC visibility push(hidden)
-#define KRB5_VISIBILITY_PUSHED
-#endif
 
 #define KRB5_BLOCK 16
 
@@ -428,6 +416,12 @@ void krb5_prf(const struct krb5_key *key, const uint8_t *data, size_t len,
 /* ======================================================================
  * The protocol: DER, the KDC exchanges and the AP exchange
  * ====================================================================== */
+
+#include <stdio.h>
+#include <time.h>
+#include <net/net_compat.h>
+#include <net/net_socket.h>
+#include <compat/strl.h>
 
 /* ---- DER writer ------------------------------------------------ */
 
@@ -1619,8 +1613,3 @@ const char *krb5_realm(const struct krb5_ctx *c)
 {
    return c->realm;
 }
-
-#ifdef KRB5_VISIBILITY_PUSHED
-#pragma GCC visibility pop
-#undef KRB5_VISIBILITY_PUSHED
-#endif

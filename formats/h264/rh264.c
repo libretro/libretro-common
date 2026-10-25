@@ -1725,6 +1725,9 @@ static RH264_INLINE void rh264_pcm_put(const rh264_frame *f, uint8_t *p,
  * samples; the frame's sample width (bsh: 0 for a byte per sample, 1
  * for two) picks the instantiation.  The 8-bit path is exactly what
  * the kernels were before the split. */
+#define RH264_K2(f, name, p1, p2, ...) \
+   do { if ((f)->bsh) rh264_##name##_16((uint16_t*)(p1), (uint16_t*)(p2), __VA_ARGS__, (f)->bd); \
+        else          rh264_##name##_8 ((p1), (p2), __VA_ARGS__, 8); } while (0)
 static void rh264_add_bypass(const rh264_frame *f, uint8_t *dst, int stride,
       const int32_t *r, int rstride, int w, int h)
 {  if (f->bsh) rh264_add_bypass_16((uint16_t*)dst, stride, r, rstride, w, h, f->bd);
@@ -1792,6 +1795,7 @@ static void rh264_avg_block(const rh264_frame *f, uint8_t *d, int dstride,
       const uint8_t *s0, int s0s, const uint8_t *s1, int s1s, int w, int h)
 {  if (f->bsh) rh264_avg_block_16((uint16_t*)d, dstride, (const uint16_t*)s0, s0s, (const uint16_t*)s1, s1s, w, h, f->bd);
    else        rh264_avg_block_8(d, dstride, s0, s0s, s1, s1s, w, h, 8); }
+#undef RH264_K2
 
 /* Macroblock position from its address.  With macroblock-adaptive
  * frame/field coding the picture is scanned in vertical PAIRS:
@@ -11123,52 +11127,6 @@ void rh264_video_set_hw_readback(rh264_video *v, int enable)
 int rh264_video_is_hw(const rh264_video *v)
 {
    return (v && v->hw) ? 1 : 0;
-}
-
-int rh264_video_restart_hw(rh264_video **video)
-{
-   rh264_video *old, *v;
-   rh264_hw *hw;
-   if (!video || !(old = *video) || !old->hw || old->hw->broken)
-      return 0;
-   if (!(v = rh264_video_open()))
-      return 0;
-   if (!(hw = (rh264_hw*)calloc(1, sizeof(*hw))))
-   {
-      rh264_video_close(v);
-      return 0;
-   }
-   v->sps = old->sps;
-   v->pps = old->pps;
-   v->have_sps = old->have_sps;
-   v->have_pps = old->have_pps;
-   v->nal_length_size = old->nal_length_size;
-   v->dpb_size = old->dpb_size;
-   v->reorder_delay = old->reorder_delay;
-   v->max_lt_idx = -1;
-   v->hw_readback = old->hw_readback;
-   v->deferred_readback = old->deferred_readback;
-   retro_atomic_store_relaxed_int(&v->skip_nonref,
-         retro_atomic_load_relaxed_int(&old->skip_nonref));
-   hw->ops = old->hw->ops;
-   hw->dec = old->hw->dec;
-   hw->sps = old->hw->sps;
-   hw->pps = old->hw->pps;
-   hw->params_gen = old->hw->params_gen;
-   hw->nslots = old->hw->nslots;
-   hw->can_defer = old->hw->can_defer;
-   hw->bs = old->hw->bs;
-   hw->bs_cap = old->hw->bs_cap;
-   hw->cpu = old->hw->cpu;
-   hw->cpu_w = old->hw->cpu_w;
-   hw->cpu_h = old->hw->cpu_h;
-   old->hw->dec = NULL;
-   old->hw->bs = NULL;
-   old->hw->cpu = NULL;
-   v->hw = hw;
-   rh264_video_close(old);
-   *video = v;
-   return 1;
 }
 
 int rh264_video_hw_frame(const rh264_video *v, video_hw_frame_t *out)

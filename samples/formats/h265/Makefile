@@ -9,7 +9,6 @@ TARGET_TEST := rh265_lossless_test_nothreads
 TARGET_VOLATILE := rh265_lossless_test_volatile
 # Parameter sets with ue(v) codes past what any field holds
 TARGET_MALFORMED := rh265_malformed_test
-TARGET_WEIGHT := rh265_weight_test
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -38,13 +37,9 @@ ifneq ($(SANITIZER),)
    LDFLAGS := -fsanitize=$(SANITIZER) $(LDFLAGS)
 endif
 
-ifneq ($(findstring undefined,$(SANITIZER)),)
-   CFLAGS += -fno-sanitize-recover=undefined
-endif
-
 LDLIBS += -lm -lpthread
 
-all: $(TARGET) $(TARGET_TEST) $(TARGET_VOLATILE) $(TARGET_MALFORMED) $(TARGET_WEIGHT)
+all: $(TARGET) $(TARGET_TEST) $(TARGET_VOLATILE) $(TARGET_MALFORMED)
 
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
@@ -82,13 +77,10 @@ MALFORMED_OBJS := rh265_malformed_test.o $(filter-out rh265_lossless_test.o,$(OB
 $(TARGET_MALFORMED): $(MALFORMED_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-$(TARGET_WEIGHT): rh265_weight_test.c $(LIBRETRO_COMM_DIR)/formats/h265/rh265.c $(LIBRETRO_COMM_DIR)/formats/h265/rh265_bd.inc $(LIBRETRO_COMM_DIR)/include/formats/rh265.h
-	$(CC) $(filter-out -DHAVE_THREADS,$(CFLAGS)) -O3 $< -o $@ $(LDFLAGS) -lm
-
 clean:
 	rm -rf $(SAMPLE_OBJDIR)
 	rm -f $(TARGET) $(OBJS) $(TARGET_TEST) $(NOTHREADS_OBJS) \
 	   $(TARGET_VOLATILE) $(VOLATILE_OBJS) \
-	   $(TARGET_MALFORMED) rh265_malformed_test.o $(TARGET_WEIGHT)
+	   $(TARGET_MALFORMED) rh265_malformed_test.o
 
 .PHONY: clean

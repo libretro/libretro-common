@@ -54,8 +54,6 @@
 #define ID_PIXELHEIGHT     0xBAu
 #define ID_COLOUR          0x55B0u
 #define ID_MATRIXCOEFF     0x55B1u
-#define ID_CHROMASITINGHORZ 0x55B7u
-#define ID_CHROMASITINGVERT 0x55B8u
 #define ID_COLOURRANGE     0x55B9u
 #define ID_TRANSFERCHAR    0x55BAu
 #define ID_PRIMARIES       0x55BBu
@@ -464,18 +462,6 @@ static void parse_track_av(const uint8_t *p, const uint8_t *end,
                   case ID_MATRIXCOEFF:
                      trk->matrix_coefficients     = (unsigned)be_uint(cb, (size_t)csz);
                      break;
-                  case ID_CHROMASITINGHORZ:
-                  case ID_CHROMASITINGVERT:
-                  {
-                     uint64_t value = csz <= 8
-                           ? be_uint(cb, (size_t)csz) : 3;
-                     unsigned siting = value <= 2 ? (unsigned)value : 3;
-                     if (cid == ID_CHROMASITINGHORZ)
-                        trk->chroma_siting_horz = siting;
-                     else
-                        trk->chroma_siting_vert = siting;
-                     break;
-                  }
                   case ID_COLOURRANGE:
                      trk->colour_range            = (unsigned)be_uint(cb, (size_t)csz);
                      break;
@@ -658,7 +644,7 @@ int rwebm_num_cues(const rwebm_t *webm)
    return webm ? webm->num_cues : 0;
 }
 
-static int webm_cue_index(const rwebm_t *webm, int64_t ns)
+static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
 {
    int64_t ticks;
    int     lo, hi, best;
@@ -686,19 +672,6 @@ static int webm_cue_index(const rwebm_t *webm, int64_t ns)
       else
          hi = mid - 1;
    }
-   return best;
-}
-
-int64_t rwebm_cue_time_ns(const rwebm_t *webm, int64_t ns)
-{
-   int best = webm_cue_index(webm, ns);
-   return best < 0 ? -1 : webm->cues[best].time_ticks * webm->timestamp_scale;
-}
-
-static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
-{
-   int best = webm_cue_index(webm, ns);
-   if (best < 0) return -1;
    {
       const uint8_t *at = webm->seg_body + webm->cues[best].cluster_pos;
       /* Under a partial read the target may be past the wall; say so

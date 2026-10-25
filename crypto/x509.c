@@ -855,7 +855,7 @@ int x509_match_hostname(const struct x509_cert *c, const char *host)
 
 struct x509_anchor
 {
-   const uint8_t *der;
+   uint8_t *der;
    size_t   der_len;
    struct x509_cert cert;
 };
@@ -872,7 +872,6 @@ struct x509_store
    const char *src;       /* the source it was loaded from */
    size_t src_len;
    unsigned refs;         /* under the lock: the published slot's + walks' */
-   unsigned owns_der;     /* PEM: decoded copies; DER: read in place */
 };
 
 static struct x509_store *x509_store_cur = NULL;
@@ -904,9 +903,8 @@ static void x509_store_free(struct x509_store *st)
    unsigned i;
    if (!st)
       return;
-   if (st->owns_der)
-      for (i = 0; i < st->count; i++)
-         free((uint8_t*)st->anchors[i].der);
+   for (i = 0; i < st->count; i++)
+      free(st->anchors[i].der);
    free(st->anchors);
    free(st);
 }
@@ -938,32 +936,6 @@ void x509_trust_free(void)
    x509_store_free(old);
 }
 
-/* @der appended as an anchor: 1 when taken, 0 when it is unparseable
- * or has a key this code cannot use (P-384 roots), -1 out of memory. */
-static int x509_store_push(struct x509_store *st, const uint8_t *der,
-      size_t der_len)
-{
-   struct x509_anchor *a;
-   if (st->count == st->cap)
-   {
-      struct x509_anchor *grown;
-      unsigned cap = st->cap ? st->cap * 2 : 64;
-      grown = (struct x509_anchor*)realloc(st->anchors, cap * sizeof(*grown));
-      if (!grown)
-         return -1;
-      st->anchors = grown;
-      st->cap     = cap;
-   }
-   a          = &st->anchors[st->count];
-   a->der     = der;
-   a->der_len = der_len;
-   if (x509_parse(&a->cert, der, der_len) != 0
-         || a->cert.key_type == X509_KEY_NONE)
-      return 0;
-   st->count++;
-   return 1;
-}
-
 /* Every certificate in @pem added to @st's anchors. */
 static int x509_store_append_pem(struct x509_store *st, const char *pem, size_t len)
 {
@@ -978,8 +950,8 @@ static int x509_store_append_pem(struct x509_store *st, const char *pem, size_t 
       char   *clean;
       size_t  n;
       int     der_len = 0;
-      int     r;
       uint8_t *der;
+      struct x509_anchor *a;
 
       b = NULL;
       for (q = p; q + sizeof(begin) - 1 <= e; q++)
@@ -1017,32 +989,31 @@ static int x509_store_append_pem(struct x509_store *st, const char *pem, size_t 
          continue;
       }
 
-      r = x509_store_push(st, der, (size_t)der_len);
-      if (r <= 0)
+      if (st->count == st->cap)
+      {
+         struct x509_anchor *grown;
+         unsigned cap = st->cap ? st->cap * 2 : 64;
+         grown = (struct x509_anchor*)realloc(st->anchors, cap * sizeof(*grown));
+         if (!grown)
+         {
+            free(der);
+            return -1;
+         }
+         st->anchors = grown;
+         st->cap     = cap;
+      }
+      a          = &st->anchors[st->count];
+      a->der     = der;
+      a->der_len = (size_t)der_len;
+      if (x509_parse(&a->cert, der, (size_t)der_len) != 0
+            || a->cert.key_type == X509_KEY_NONE)
+      {
+         /* Unparseable, or a key this code cannot use (P-384 roots):
+          * not an anchor here. */
          free(der);
-      if (r < 0)
-         return -1;
-   }
-   return (int)st->count;
-}
-
-/* Every certificate in @blob, a run of DER SEQUENCEs, added to @st's
- * anchors in place. */
-static int x509_store_append_der(struct x509_store *st,
-      const uint8_t *blob, size_t len)
-{
-   struct der d;
-   d.p   = blob;
-   d.end = blob + len;
-   while (d.p < d.end)
-   {
-      const uint8_t *start = d.p;
-      const uint8_t *v;
-      size_t vl;
-      if (der_read(&d, DER_SEQUENCE, &v, &vl) != 0)
-         return -1;
-      if (x509_store_push(st, start, (size_t)(d.p - start)) < 0)
-         return -1;
+         continue;
+      }
+      st->count++;
    }
    return (int)st->count;
 }
@@ -1059,7 +1030,7 @@ static int x509_store_is(const struct x509_store *st, const char *src,
 }
 
 static int x509_trust_load(const char *const *parts, const size_t *lens,
-      unsigned count, const char *src, size_t src_len, int pem)
+      unsigned count, const char *src, size_t src_len)
 {
    struct x509_store *st, *old;
    unsigned i;
@@ -1074,11 +1045,8 @@ static int x509_trust_load(const char *const *parts, const size_t *lens,
 
    if (!(st = (struct x509_store*)calloc(1, sizeof(*st))))
       n = -1;
-   else
-      st->owns_der = pem ? 1 : 0;
    for (i = 0; i < count && n >= 0; i++)
-      n = pem ? x509_store_append_pem(st, parts[i], lens[i])
-              : x509_store_append_der(st, (const uint8_t*)parts[i], lens[i]);
+      n = x509_store_append_pem(st, parts[i], lens[i]);
 
    X509_LOCK();
    if (n >= 0 && x509_store_is(x509_store_cur, src, src_len))
@@ -1103,21 +1071,14 @@ static int x509_trust_load(const char *const *parts, const size_t *lens,
 
 int x509_trust_load_pem(const char *pem, size_t len)
 {
-   return x509_trust_load(&pem, &len, 1, pem, len, 1);
+   return x509_trust_load(&pem, &len, 1, pem, len);
 }
 
 int x509_trust_load_pem_parts(const char *const *parts, const size_t *lens,
       unsigned count)
 {
    /* the part table is the source: loaded once, as a single one is */
-   return x509_trust_load(parts, lens, count, (const char*)parts, count, 1);
-}
-
-int x509_trust_load_der_parts(const unsigned char *const *parts,
-      const size_t *lens, unsigned count)
-{
-   return x509_trust_load((const char *const*)parts, lens, count,
-         (const char*)parts, count, 0);
+   return x509_trust_load(parts, lens, count, (const char*)parts, count);
 }
 
 /* ---- chain -------------------------------------------------------- */

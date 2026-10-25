@@ -559,12 +559,10 @@ int64_t retro_vfs_file_read_nfs(libretro_vfs_implementation_file *stream,
    struct nfs_slot *slot;
    struct rnfs_ctx *c;
    int64_t r;
-   int64_t windowed = 0;
    if (!ns)
       return -1;
-   /* the prefetcher's windows first; what they do not cover, or all of
-    * it on a miss, the stream reads from the network itself, and the
-    * thread starts over from there */
+   /* the prefetcher's windows first; on a miss the stream reads the
+    * network itself, and the thread starts over from here */
    if (stream->nfs_prefetch)
    {
       struct nfs_prefetch *np = (struct nfs_prefetch*)(void*)(uintptr_t)stream->nfs_prefetch;
@@ -573,22 +571,17 @@ int64_t retro_vfs_file_read_nfs(libretro_vfs_implementation_file *stream,
       {
          rnfs_seek(NULL, ns->f, got, 1);
          np->from_window += (uint64_t)got;
-         /* all of it, or a window that ends the file */
-         if (got == 0 || (uint64_t)got == len)
-            return got;
-         windowed = got;
+         return got;
       }
    }
    if (!(c = nfs_stream_take(ns, &slot)))
-      return windowed ? windowed : -1;
-   r = rnfs_read(c, ns->f, (uint8_t*)buf + windowed, (size_t)(len - (uint64_t)windowed));
+      return -1;
+   r = rnfs_read(c, ns->f, buf, (size_t)len);
    nfs_give(c, slot);
-   /* what the prefetcher had nothing ready for */
+   /* a read the prefetcher had nothing ready for */
    if (r > 0 && stream->nfs_prefetch)
       ((struct nfs_prefetch*)(void*)(uintptr_t)stream->nfs_prefetch)->direct += (uint64_t)r;
-   if (r < 0)
-      return windowed ? windowed : r;
-   return windowed + r;
+   return r;
 }
 
 int64_t retro_vfs_file_write_nfs(libretro_vfs_implementation_file *stream,

@@ -85,7 +85,7 @@ typedef struct
    uint64_t               media_skip;
    /* Decoder setup data, owned by the demuxer until rmp4_close.
     * Opus: repacked OpusHead; Vorbis: xiph-laced headers from esds;
-    * H.264/HEVC/AV1: avcC/hvcC/av1C. VP8/VP9: complete vpcC payload. */
+    * H.264/HEVC/AV1: avcC/hvcC/av1C. VP8/VP9: usually empty. */
    const uint8_t         *codec_private;
    size_t                 codec_private_size;
    /* Sample-entry fourcc, NUL-terminated (e.g. "vp09", "avc1"). */
@@ -176,11 +176,6 @@ const int64_t *rmp4_track_pts(const rmp4_t *mp4, int track,
 /* Metadata-only key flag for a track sample: 0/1, -1 if invalid.
  * Does not read sample bytes or change any packet cursor. */
 int rmp4_track_sample_key(const rmp4_t *mp4, int track, uint32_t sample);
-
-/* Metadata-only half-open file span. Does not read sample bytes or
- * change cursors. Invalid input leaves the outputs unchanged. */
-int rmp4_track_sample_span(const rmp4_t *mp4, int track, uint32_t sample,
-      size_t *begin, size_t *end);
 
 /* Read only this track from sample onward until rewind. Other tracks
  * are parked at their ends. No sample bytes are read; the next read

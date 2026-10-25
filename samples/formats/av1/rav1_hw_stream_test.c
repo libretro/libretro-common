@@ -33,11 +33,8 @@ static int decode(void *owner, const uint8_t *data, size_t size,
                   const rav1_sequence_t *seq, const rav1_hw_picture_t *picture)
 {
    CHECK(owner == &factory && data == expected && size && seq->max_width == 64);
-   if (!picture->header.show_existing)
-      CHECK(picture->tile_group.data >= data &&
-            picture->tile_group.data + picture->tile_group.size <= data + size);
-   else
-      CHECK(stream.session.packet_decoder && picture->setup.size.width == 64);
+   CHECK(picture->tile_group.data >= data &&
+         picture->tile_group.data + picture->tile_group.size <= data + size);
    decodes++;
    return decode_busy;
 }
@@ -166,45 +163,6 @@ static void test_packet(void)
    video_hw_frame_abandon(&held);
    CHECK(abandons == 1);
    rav1_set_hw_backend(&factory);
-}
-
-static void test_packet_decoder(void)
-{
-   static const uint8_t replay[] = {0x18, 0x88};
-   video_hw_frame_t frame, held;
-   size_t frame_offset, replay_offset;
-   unsigned before = decodes, closed = closes;
-   unit_size = 0;
-   append(sequence_obu, sizeof(sequence_obu));
-   make_frame(0);
-   frame_offset = unit_size;
-   append(packet, packet_size);
-   replay_offset = unit_size;
-   append(replay, sizeof(replay));
-   factory.packet_decoder = true;
-   CHECK(rav1_hw_stream_init(&stream, NULL));
-   CHECK(!rav1_hw_stream_begin(&stream, unit, unit_size));
-   CHECK(rav1_hw_stream_step(&stream, &frame, false) == RAV1_HW_STREAM_PROGRESS);
-   CHECK(stream.session.packet_decoder && stream.backend.packet_decoder);
-   factory.packet_decoder = false;
-   expected = unit + frame_offset;
-   CHECK(rav1_hw_stream_step(&stream, &frame, false) == RAV1_HW_STREAM_PROGRESS);
-   CHECK(decodes == before + 1 && stream.offset == replay_offset);
-   expected = unit + replay_offset;
-   decode_busy = 1;
-   CHECK(rav1_hw_stream_step(&stream, &frame, false) == RAV1_HW_STREAM_BUSY);
-   CHECK(stream.offset == replay_offset && !stream.submitted);
-   decode_busy = 0;
-   output_busy = 1;
-   CHECK(rav1_hw_stream_step(&stream, &frame, false) == RAV1_HW_STREAM_BUSY);
-   CHECK(stream.submitted && decodes == before + 3);
-   output_busy = 0;
-   CHECK(rav1_hw_stream_step(&stream, &held, false) == RAV1_HW_STREAM_FRAME);
-   CHECK(held.image && decodes == before + 3);
-   CHECK(rav1_hw_stream_step(&stream, &frame, false) == RAV1_HW_STREAM_END);
-   rav1_hw_stream_close(&stream);
-   CHECK(closes == closed + 1 && held.image);
-   video_hw_frame_abandon(&held);
 }
 
 static void test_discard_and_cancel(void)
@@ -341,40 +299,6 @@ static void test_errors(void)
    rav1_hw_stream_close(&stream);
 }
 
-static void test_restart(void)
-{
-   video_hw_frame_t frame, held;
-   unsigned before, i;
-   CHECK(!rav1_hw_stream_restart(NULL));
-   CHECK(rav1_hw_stream_init(&stream, &sequence));
-   before = opens;
-   make_frame(1); expected = packet;
-   CHECK(!rav1_hw_stream_begin(&stream, packet, packet_size));
-   CHECK(rav1_hw_stream_step(&stream, &held, false) == RAV1_HW_STREAM_FRAME);
-   CHECK(held.image && stream.session.state.have_previous);
-   for (i = 0; i < 4; i++)
-   {
-      CHECK(rav1_hw_stream_restart(&stream));
-      CHECK(opens == before && !stream.packet && !stream.session.phase
-            && !stream.session.state.have_previous && !stream.hdr.present);
-      CHECK(held.image && held.owner == &factory);
-      CHECK(!rav1_hw_stream_begin(&stream, packet, packet_size));
-      decode_busy = 1;
-      CHECK(rav1_hw_stream_step(&stream, &frame, false) == RAV1_HW_STREAM_BUSY);
-      CHECK(stream.session.phase);
-      decode_busy = 0;
-   }
-   CHECK(rav1_hw_stream_restart(&stream));
-   stream.backend.packet_decoder = true;
-   CHECK(!rav1_hw_stream_restart(&stream));
-   stream.backend.packet_decoder = false;
-   stream.session.broken = 1;
-   CHECK(!rav1_hw_stream_restart(&stream));
-   rav1_hw_stream_close(&stream);
-   CHECK(held.image);
-   video_hw_frame_abandon(&held);
-}
-
 static void test_hdr(void)
 {
    static const uint8_t metadata[] = {42, 6, 1, 3, 232, 1, 144, 128};
@@ -413,12 +337,10 @@ int main(void)
    factory.close = close_backend;
    rav1_set_hw_backend(&factory);
    test_packet();
-   test_packet_decoder();
    test_discard_and_cancel();
    test_sequences();
    test_initial_sequence();
    test_decode_failure();
-   test_restart();
    test_hdr();
    test_errors();
    CHECK(opens == closes);
