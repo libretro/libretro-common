@@ -46,6 +46,13 @@ enum rmp4_track_type
    RMP4_TRACK_OTHER
 };
 
+enum rmp4_language_kind
+{
+   RMP4_LANGUAGE_NONE = 0,
+   RMP4_LANGUAGE_MDHD,
+   RMP4_LANGUAGE_BCP47
+};
+
 enum rmp4_codec
 {
    RMP4_CODEC_UNKNOWN = 0,
@@ -85,7 +92,7 @@ typedef struct
    uint64_t               media_skip;
    /* Decoder setup data, owned by the demuxer until rmp4_close.
     * Opus: repacked OpusHead; Vorbis: xiph-laced headers from esds;
-    * H.264/HEVC/AV1: avcC/hvcC/av1C. VP8/VP9: usually empty. */
+    * H.264/HEVC/AV1: avcC/hvcC/av1C. VP8/VP9: complete vpcC payload. */
    const uint8_t         *codec_private;
    size_t                 codec_private_size;
    /* Sample-entry fourcc, NUL-terminated (e.g. "vp09", "avc1"). */
@@ -129,6 +136,11 @@ int               rmp4_num_tracks(const rmp4_t *mp4);
 size_t            rmp4_media_floor(const rmp4_t *m);
 size_t            rmp4_consumed(const rmp4_t *m);
 const rmp4_track *rmp4_get_track(const rmp4_t *mp4, int index);
+/* Raw mdhd two-byte field or elng bytes (including terminator/padding).
+ * Borrowed with the input; supported elng takes precedence. No language
+ * validation or conversion, including Macintosh versus packed ISO639 mdhd codes. */
+const uint8_t *rmp4_get_track_language(const rmp4_t *mp4, int index,
+      size_t *length, enum rmp4_language_kind *kind);
 
 /* Total duration in nanoseconds (from mvhd), or 0 if the file does not
  * declare one. */
@@ -144,6 +156,9 @@ int64_t rmp4_duration_ns(const rmp4_t *mp4);
 #define RMP4_READ_AGAIN 2
 
 int rmp4_read_packet(rmp4_t *mp4, rmp4_packet *pkt);
+
+/* Next packet byte range from sample tables; reads no media bytes. */
+void rmp4_read_span(const rmp4_t *mp4, size_t *lo, size_t *hi);
 
 /* Open against a partially-read buffer: only the first 'avail' bytes
  * are valid (the rest may be uninitialised) and are never read.  Box
@@ -176,6 +191,20 @@ const int64_t *rmp4_track_pts(const rmp4_t *mp4, int track,
 /* Metadata-only key flag for a track sample: 0/1, -1 if invalid.
  * Does not read sample bytes or change any packet cursor. */
 int rmp4_track_sample_key(const rmp4_t *mp4, int track, uint32_t sample);
+
+/* Metadata-only half-open file span. Does not read sample bytes or
+ * change cursors. Invalid input leaves the outputs unchanged. */
+int rmp4_track_sample_span(const rmp4_t *mp4, int track, uint32_t sample,
+      size_t *begin, size_t *end);
+
+/* Exact text/other sample duration in nanoseconds, -1 if unavailable.
+ * Video/audio tracks do not retain an extra duration table. */
+int64_t rmp4_track_text_duration(const rmp4_t *mp4, int track, uint32_t sample);
+
+/* Text interval in movie nanoseconds, clipped to the supported edit.
+ * Equal endpoints mean the sample is outside that edit. No media reads. */
+int rmp4_track_text_time(const rmp4_t *mp4, int track, uint32_t sample,
+      int64_t *start, int64_t *end);
 
 /* Read only this track from sample onward until rewind. Other tracks
  * are parked at their ends. No sample bytes are read; the next read

@@ -19,6 +19,7 @@
 
 #ifdef RMP4_TEST_ALLOCATOR
 static unsigned fail_next_malloc;
+static unsigned fail_next_realloc;
 static void *rmp4_test_malloc(size_t size)
 {
    if (fail_next_malloc)
@@ -28,9 +29,20 @@ static void *rmp4_test_malloc(size_t size)
    }
    return malloc(size);
 }
+static void *rmp4_test_realloc(void *ptr, size_t size)
+{
+   if (fail_next_realloc)
+   {
+      fail_next_realloc = 0;
+      return NULL;
+   }
+   return realloc(ptr, size);
+}
 #define malloc rmp4_test_malloc
+#define realloc rmp4_test_realloc
 #include "../../../formats/mp4/rmp4.c"
 #undef malloc
+#undef realloc
 #endif
 
 static int failures;
@@ -75,7 +87,7 @@ static void head_private(buf_t *w, uint32_t dflt_size, uint32_t dflt_dur,
    b = box(w, "tkhd"); putz(w, 12); put32(w, 1); putz(w, 68); box_end(w, b);
    mdia = box(w, "mdia");
    b = box(w, "mdhd"); putz(w, 12); put32(w, 1000); putz(w, 8); box_end(w, b);
-   b = box(w, "hdlr"); putz(w, 8); put4cc(w, sample ? "vide" : "soun"); putz(w, 13);
+   b = box(w, "hdlr"); putz(w, 8); put4cc(w, sample && !strcmp(sample, "tx3g") ? "sbtl" : sample ? "vide" : "soun"); putz(w, 13);
    box_end(w, b);
    minf = box(w, "minf");
    stbl = box(w, "stbl");
@@ -101,6 +113,54 @@ static void head_private(buf_t *w, uint32_t dflt_size, uint32_t dflt_dur,
 static void head(buf_t *w, uint32_t dflt_size, uint32_t dflt_dur)
 {
    head_private(w, dflt_size, dflt_dur, NULL, NULL, NULL);
+}
+
+static void test_long_fragment(void)
+{
+   static buf_t w;
+   const uint32_t count = 262146;
+   uint32_t stored = 0, offset;
+   size_t moof, traf, b, data_offset, length;
+   uint8_t *bytes;
+   rmp4_t *m;
+   rmp4_packet packet;
+   memset(&w, 0, sizeof(w));
+   head(&w, 1, 1);
+   moof = box(&w, "moof");
+   traf = box(&w, "traf");
+   b = box(&w, "tfhd"); put32(&w, 0); put32(&w, 1); box_end(&w, b);
+   b = box(&w, "trun"); put32(&w, 1); put32(&w, count);
+   data_offset = w.n; put32(&w, 0); box_end(&w, b);
+   box_end(&w, traf); box_end(&w, moof);
+   put32(&w, count + 8); put4cc(&w, "mdat");
+   offset = (uint32_t)(w.n - moof);
+   w.b[data_offset] = offset >> 24; w.b[data_offset + 1] = offset >> 16;
+   w.b[data_offset + 2] = offset >> 8; w.b[data_offset + 3] = offset;
+   length = w.n + count;
+   bytes = (uint8_t*)calloc(length, 1);
+   CHECK(bytes != NULL, "long fragment: fixture allocation");
+   if (!bytes) return;
+   memcpy(bytes, w.b, w.n);
+   bytes[length - 1] = 73;
+   m = rmp4_open_memory(bytes, length);
+   CHECK(m != NULL, "long fragment: opens");
+   if (m)
+   {
+      CHECK(rmp4_track_pts(m, 0, &stored) && stored == count,
+            "long fragment: retain all samples, got %u", stored);
+      CHECK(rmp4_select_track_sample(m, 0, count - 1)
+            && rmp4_read_packet(m, &packet) == 1 && packet.size == 1
+            && packet.data[0] == 73, "long fragment: tail seek and read");
+      rmp4_close(m);
+   }
+#ifdef RMP4_TEST_ALLOCATOR
+   fail_next_realloc = 1;
+   m = rmp4_open_memory(bytes, length);
+   CHECK(!fail_next_realloc && !m,
+         "long fragment: allocation failure cannot publish a truncated movie");
+   rmp4_close(m);
+#endif
+   free(bytes);
 }
 
 /* A released metadata page can disappear while decoder configuration must
@@ -145,8 +205,20 @@ static int read_all(rmp4_t *m, const buf_t *w, const char *name,
 {
    rmp4_packet pkt;
    int n = 0, r;
-   while ((r = rmp4_read_packet(m, &pkt)) == 1)
+   for (;;)
    {
+      size_t lo = 17, hi = 19;
+      size_t again_lo = 23, again_hi = 29;
+      rmp4_read_span(m, &lo, &hi);
+      rmp4_read_span(m, &again_lo, &again_hi);
+      CHECK(lo == again_lo && hi == again_hi,
+            "%s: range query leaves the cursor intact", name);
+      r = rmp4_read_packet(m, &pkt);
+      if (r != 1)
+         break;
+      if (hi > lo)
+         CHECK(lo == (size_t)(pkt.data - w->b) && hi - lo == pkt.size,
+               "%s: predicted range matches packet %d", name, n);
       CHECK(pkt.data >= w->b && pkt.size <= w->n
             && (size_t)(pkt.data - w->b) <= w->n - pkt.size,
             "%s: packet %d points outside the file", name, n);
@@ -161,7 +233,16 @@ static int read_all(rmp4_t *m, const buf_t *w, const char *name,
 static void test_sample_cursor(rmp4_t *m, const buf_t *w, size_t payload)
 {
    rmp4_packet pkt;
+   size_t begin = 17, end = 19;
    rmp4_set_avail(m, 0);
+   CHECK(rmp4_track_sample_span(m, 0, 1, &begin, &end)
+         && begin == payload + 4 && end == payload + 8,
+         "sample span: metadata without resident media");
+   CHECK(!rmp4_track_sample_span(m, -1, 0, &begin, &end)
+         && !rmp4_track_sample_span(m, 0, 2, &begin, &end)
+         && !rmp4_track_sample_span(m, 0, 0, NULL, &end)
+         && begin == payload + 4 && end == payload + 8,
+         "sample span: invalid queries preserve outputs");
    CHECK(rmp4_track_sample_key(m, 0, 0) == 1,
          "sample cursor: key metadata without resident media");
    CHECK(rmp4_track_sample_key(m, -1, 0) == -1
@@ -170,8 +251,16 @@ static void test_sample_cursor(rmp4_t *m, const buf_t *w, size_t payload)
    CHECK(rmp4_select_track_sample(m, 0, 1), "sample cursor: select second");
    CHECK(rmp4_consumed(m) == payload + 4,
          "sample cursor: feeder anchor follows selected sample");
+   rmp4_read_span(m, &begin, &end);
+   CHECK(begin == payload + 4 && end == payload + 8,
+         "next packet range: metadata without resident media");
    CHECK(rmp4_read_packet(m, &pkt) == RMP4_READ_AGAIN,
          "sample cursor: read respects byte wall");
+   rmp4_read_span(m, NULL, &end);
+   rmp4_read_span(m, &begin, NULL);
+   CHECK(begin == payload + 4 && end == payload + 8
+         && rmp4_consumed(m) == payload + 4,
+         "next packet range: retry and nullable outputs preserve cursor");
    CHECK(!rmp4_select_track_sample(m, -1, 0)
          && !rmp4_select_track_sample(m, 0, 2)
          && rmp4_consumed(m) == payload + 4,
@@ -181,13 +270,168 @@ static void test_sample_cursor(rmp4_t *m, const buf_t *w, size_t payload)
          && pkt.data == w->b + payload + 4 && pkt.size == 4,
          "sample cursor: retry reads the selected sample");
    CHECK(rmp4_read_packet(m, &pkt) == 0, "sample cursor: selected track ends");
+   rmp4_read_span(m, &begin, &end);
+   CHECK(!begin && !end, "next packet range: EOF clears outputs");
    rmp4_rewind(m);
    CHECK(rmp4_consumed(m) == payload
          && rmp4_read_packet(m, &pkt) == 1 && pkt.data == w->b + payload,
          "sample cursor: rewind restores beginning");
+   rmp4_read_span(m, &begin, &end);
+   CHECK(begin == payload + 4 && end == payload + 8,
+         "next packet range: follows rewound cursor");
+#ifdef RMP4_TEST_ALLOCATOR
+   {
+      rmp4_itrack *track = &m->trk[0];
+      uint32_t cursor = track->cursor;
+      uint64_t offset = track->off[cursor];
+      uint32_t size = track->size[cursor];
+      track->off[cursor] = (uint64_t)m->len + 1;
+      rmp4_read_span(m, &begin, &end);
+      CHECK(!begin && !end, "next packet range: offset beyond file refused");
+      track->off[cursor] = offset;
+      track->size[cursor] = UINT32_MAX;
+      rmp4_read_span(m, &begin, &end);
+      CHECK(!begin && !end, "next packet range: end beyond file refused");
+      track->size[cursor] = size;
+   }
+#endif
+   rmp4_read_span(NULL, &begin, &end);
+   CHECK(!begin && !end, "next packet range: null stream clears outputs");
 }
 
 #ifdef RMP4_TEST_ALLOCATOR
+static void test_long_track(void)
+{
+   static buf_t sizes, times, chunks, offsets;
+   static const uint32_t counts[] = {262143, 262144, 262145, 500000};
+   rmp4_stbl tables;
+   unsigned c;
+   memset(&tables, 0, sizeof(tables));
+   for (c = 0; c < sizeof(counts) / sizeof(counts[0]); c++)
+   {
+      uint32_t count = counts[c], stored = 0;
+      uint8_t *bytes = (uint8_t*)calloc(count, 1);
+      rmp4_t *m = (rmp4_t*)calloc(1, sizeof(*m));
+      rmp4_packet packet;
+      const int64_t *pts;
+      CHECK(bytes && m, "long track: fixture allocation");
+      if (!bytes || !m) { free(bytes); free(m); return; }
+      sizes.n = times.n = chunks.n = offsets.n = 0;
+      put32(&sizes, 0); put32(&sizes, 1); put32(&sizes, count);
+      put32(&times, 0); put32(&times, 1);
+      put32(&times, count); put32(&times, 1);
+      put32(&chunks, 0); put32(&chunks, 1);
+      put32(&chunks, 1); put32(&chunks, count); put32(&chunks, 1);
+      put32(&offsets, 0); put32(&offsets, 1); put32(&offsets, 0);
+      tables.stsz = sizes.b; tables.stsz_size = sizes.n;
+      tables.stts = times.b; tables.stts_size = times.n;
+      tables.stsc = chunks.b; tables.stsc_size = chunks.n;
+      tables.stco = offsets.b; tables.stco_size = offsets.n;
+      m->trk[0].timescale = 30;
+      m->buf = bytes; m->len = m->avail = count; m->num_tracks = 1;
+      CHECK(rmp4_build_samples(&m->trk[0], &tables, count),
+            "long track: build %u samples", count);
+      pts = rmp4_track_pts(m, 0, &stored);
+      CHECK(pts && stored == count, "long track: retain all %u samples, got %u", count, stored);
+      bytes[count - 2] = 17; bytes[count - 1] = 29;
+      CHECK(rmp4_select_track_sample(m, 0, count - 2),
+            "long track: seek past old cutoff");
+      CHECK(rmp4_read_packet(m, &packet) == 1 && packet.size == 1
+            && packet.data[0] == 17, "long track: first tail sample");
+      CHECK(rmp4_read_packet(m, &packet) == 1 && packet.size == 1
+            && packet.data[0] == 29, "long track: playback continues after seek");
+      CHECK(rmp4_read_packet(m, &packet) == 0, "long track: actual end of track");
+      rmp4_close(m);
+      free(bytes);
+   }
+   {
+      rmp4_itrack *track = (rmp4_itrack*)calloc(1, sizeof(*track));
+      CHECK(track != NULL, "index budget: fixture allocation");
+      if (!track) return;
+      sizes.n = 0;
+      put32(&sizes, 0); put32(&sizes, 1); put32(&sizes, RMP4_MAX_SAMPLES + 1);
+      fail_next_malloc = 1;
+      CHECK(!rmp4_build_samples(track, &tables, RMP4_MAX_SAMPLES + 1)
+            && !track->count && !track->off && fail_next_malloc,
+            "index budget: reject excess before allocation instead of truncating");
+      fail_next_malloc = 0;
+      free(track);
+   }
+}
+
+static void test_text_timing(void)
+{
+   static buf_t sizes, times, chunks, offsets;
+   rmp4_stbl tables;
+   rmp4_t *m = (rmp4_t*)calloc(1, sizeof(*m));
+   unsigned i;
+   int64_t first = -9, last = -7;
+   CHECK(m != NULL, "text timing: allocation");
+   if (!m) return;
+   memset(&tables, 0, sizeof(tables));
+   sizes.n = times.n = chunks.n = offsets.n = 0;
+   put32(&sizes, 0); put32(&sizes, 1); put32(&sizes, 3);
+   put32(&times, 0); put32(&times, 3);
+   put32(&times, 1); put32(&times, 1501);
+   put32(&times, 1); put32(&times, 0);
+   put32(&times, 1); put32(&times, 2999);
+   put32(&chunks, 0); put32(&chunks, 1);
+   put32(&chunks, 1); put32(&chunks, 3); put32(&chunks, 1);
+   put32(&offsets, 0); put32(&offsets, 1); put32(&offsets, 0);
+   tables.stsz = sizes.b; tables.stsz_size = sizes.n;
+   tables.stts = times.b; tables.stts_size = times.n;
+   tables.stsc = chunks.b; tables.stsc_size = chunks.n;
+   tables.stco = offsets.b; tables.stco_size = offsets.n;
+   m->num_tracks = 1; m->len = 2048;
+   m->trk[0].timescale = 3000;
+   m->trk[0].pub.type = RMP4_TRACK_OTHER;
+   m->trk[0].pub.presentation_duration_ns = -1;
+   CHECK(rmp4_build_samples(&m->trk[0], &tables, m->len), "text timing: stts");
+   CHECK(rmp4_track_text_duration(m, 0, 0) == 500333333,
+         "text timing: exact rational duration");
+   CHECK(rmp4_track_text_duration(m, 0, 1) == 0,
+         "text timing: zero duration is retained");
+   CHECK(rmp4_track_text_duration(m, 0, 2) == 999666666,
+         "text timing: final sample needs no following PTS");
+   CHECK(rmp4_track_text_duration(m, -1, 0) == -1
+         && rmp4_track_text_duration(m, 0, 3) == -1
+         && rmp4_track_text_duration(NULL, 0, 0) == -1,
+         "text timing: invalid queries refused");
+   CHECK(rmp4_track_text_time(m, 0, 0, &first, &last)
+         && first == 0 && last == 500333333,
+         "text timing: unedited movie interval");
+   m->trk[0].pub.media_skip = 1500;
+   m->trk[0].pub.presentation_delay_ns = 250000000;
+   m->trk[0].pub.presentation_duration_ns = 700000000;
+   CHECK(rmp4_track_text_time(m, 0, 0, &first, &last)
+         && first == 250000000 && last == 250333333,
+         "text timing: trim across first cue and leading delay");
+   CHECK(rmp4_track_text_time(m, 0, 2, &first, &last)
+         && first == 250333333 && last == 950000000,
+         "text timing: cue clipped to edit end");
+   m->trk[0].pts[0] = (int64_t)((~(uint64_t)0) >> 1) - 1;
+   first = -9; last = -7;
+   CHECK(!rmp4_track_text_time(m, 0, 0, &first, &last) && first == -9 && last == -7,
+         "text timing: unrepresentable endpoint leaves outputs intact");
+   for (i = 0; i < 1024; i++)
+      CHECK(rmp4_track_append(&m->trk[0], 3 + i, 1,
+               1500000000 + (int64_t)i * 1000000, i + 1, 1),
+            "text timing: fragment append %u", i);
+   CHECK(rmp4_track_text_duration(m, 0, 1026) == 341333333,
+         "text timing: fragment duration survives array growth");
+   rmp4_close(m);
+   m = (rmp4_t*)calloc(1, sizeof(*m));
+   CHECK(m != NULL, "text timing: audio allocation");
+   if (!m) return;
+   m->num_tracks = 1; m->len = 2048;
+   m->trk[0].timescale = 3000;
+   m->trk[0].pub.type = RMP4_TRACK_AUDIO;
+   CHECK(rmp4_build_samples(&m->trk[0], &tables, m->len)
+         && !m->trk[0].duration && rmp4_track_text_duration(m, 0, 0) == -1,
+         "text timing: no extra table for audio/video");
+   rmp4_close(m);
+}
+
 static void test_track_selection(void)
 {
    static const uint8_t bytes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -198,6 +442,7 @@ static void test_track_selection(void)
    rmp4_t *m = (rmp4_t*)calloc(1, sizeof(*m));
    rmp4_packet packet;
    int i;
+   size_t begin = 17, end = 19;
    CHECK(m != NULL, "track selection: allocation");
    if (!m) return;
    m->buf = bytes;
@@ -213,24 +458,78 @@ static void test_track_selection(void)
    }
    CHECK(rmp4_track_sample_key(m, 0, 1) == 0,
          "track selection: non-key metadata");
-   CHECK(rmp4_select_track_sample(m, 0, 1)
-         && rmp4_read_packet(m, &packet) == 1
+   CHECK(rmp4_select_track_sample(m, 0, 1), "track selection: select second sample");
+   rmp4_read_span(m, &begin, &end);
+   CHECK(begin == 4 && end == 6,
+         "next packet range: selected track parks the other cursor");
+   CHECK(rmp4_read_packet(m, &packet) == 1
          && packet.track == 0 && packet.data == bytes + 4
          && rmp4_read_packet(m, &packet) == 0,
          "track selection: other track parked at end");
    rmp4_rewind(m);
    for (i = 0; i < 4; i++)
+   {
+      rmp4_read_span(m, &begin, &end);
+      CHECK(begin == (size_t)i * 2 && end == (size_t)i * 2 + 2,
+            "next packet range: interleaved tracks follow file order");
       CHECK(rmp4_read_packet(m, &packet) == 1
             && packet.track == (i & 1) && packet.data == bytes + i * 2,
             "track selection: rewind restores both tracks");
+   }
+   rmp4_read_span(m, &begin, &end);
+   CHECK(!begin && !end, "next packet range: all tracks exhausted");
    rmp4_rewind(m);
+   begin = 17;
+   end = 19;
+   offsets0[1] = sizeof(bytes) - 1;
+   CHECK(!rmp4_track_sample_span(m, 0, 1, &begin, &end)
+         && begin == 17 && end == 19,
+         "sample span: rejects range beyond file");
    offsets0[1] = (uint64_t)-1;
+   CHECK(!rmp4_track_sample_span(m, 0, 1, &begin, &end)
+         && begin == 17 && end == 19,
+         "sample span: rejects wrapped offset");
    CHECK(!rmp4_select_track_sample(m, 0, 1)
          && rmp4_read_packet(m, &packet) == 1 && packet.data == bytes,
          "track selection: malformed offset leaves cursors unchanged");
    free(m);
 }
 #endif
+
+static void test_text_fragment(void)
+{
+   static buf_t w;
+   size_t unused, moof, traf, b, data_offset, payload;
+   rmp4_t *m;
+   uint32_t delta;
+   memset(&w, 0, sizeof(w));
+   head_private(&w, 4, 17, "tx3g", "free", &unused);
+   moof = box(&w, "moof");
+   traf = box(&w, "traf");
+   b = box(&w, "tfhd"); put32(&w, 0); put32(&w, 1); box_end(&w, b);
+   b = box(&w, "trun"); put32(&w, 0x000101); put32(&w, 2);
+   data_offset = w.n; put32(&w, 0);
+   put32(&w, 1201); put32(&w, 701);
+   box_end(&w, b); box_end(&w, traf); box_end(&w, moof);
+   b = box(&w, "mdat"); payload = w.n;
+   put32(&w, 0x00026869); put32(&w, 0x00026f6b); box_end(&w, b);
+   delta = (uint32_t)(payload - moof);
+   w.b[data_offset] = delta >> 24; w.b[data_offset + 1] = delta >> 16;
+   w.b[data_offset + 2] = delta >> 8; w.b[data_offset + 3] = delta;
+   m = rmp4_open_memory(w.b, w.n);
+   CHECK(m && rmp4_num_tracks(m) == 1, "text fragment: opens");
+   if (!m) return;
+   CHECK(rmp4_get_track(m, 0)->type == RMP4_TRACK_OTHER
+         && !strcmp(rmp4_get_track(m, 0)->codec_id, "tx3g"),
+         "text fragment: codec identity");
+   CHECK(rmp4_track_text_duration(m, 0, 0) == 1201000000
+         && rmp4_track_text_duration(m, 0, 1) == 701000000,
+         "text fragment: per-sample duration overrides trex");
+   memset(w.b, 0, w.n);
+   CHECK(rmp4_track_text_duration(m, 0, 1) == 701000000,
+         "text fragment: duration survives released encoded metadata");
+   rmp4_close(m);
+}
 
 static void test_valid(void)
 {
@@ -433,8 +732,12 @@ static void test_edit_lists(void)
 int main(void)
 {
    test_valid();
+   test_text_fragment();
+   test_long_fragment();
 #ifdef RMP4_TEST_ALLOCATOR
+   test_long_track();
    test_track_selection();
+   test_text_timing();
    test_edit_lists();
 #endif
    test_wrap();
@@ -442,6 +745,8 @@ int main(void)
    test_private("avc1", "avcC", RMP4_CODEC_H264);
    test_private("hvc1", "hvcC", RMP4_CODEC_H265);
    test_private("av01", "av1C", RMP4_CODEC_AV1);
+   test_private("vp08", "vpcC", RMP4_CODEC_VP8);
+   test_private("vp09", "vpcC", RMP4_CODEC_VP9);
    if (failures)
    {
       printf("%d failure(s)\n", failures);

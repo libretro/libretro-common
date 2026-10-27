@@ -73,8 +73,21 @@ RETRO_BEGIN_DECLS
 
 typedef struct rh264_video rh264_video;
 
+typedef struct rh264_video_color
+{
+   unsigned primaries, transfer, matrix, full_range;
+   int video_signal_present, description_present;
+} rh264_video_color_t;
+
+/* SPS VUI color; unspecified CICP values are 2. Failure clears out. */
+int rh264_video_get_color(const rh264_video *v, rh264_video_color_t *out);
+
 /* Create a decoder. Returns NULL on allocation failure. */
 rh264_video *rh264_video_open(void);
+
+/* Restart at an IDR while retaining a healthy hardware session. On success
+ * replaces *video; on failure leaves it unchanged. Software returns 0. */
+int rh264_video_restart_hw(rh264_video **video);
 
 /* Supply the avcC (AVCDecoderConfigurationRecord) extradata from the sample
  * description, which carries the SPS/PPS and the NAL length size. Optional
@@ -95,6 +108,7 @@ int rh264_video_decode(rh264_video *v, const uint8_t *data, size_t len);
  * data, for end of stream. Returns 0 when a picture became available through
  * rh264_video_plane, -1 when nothing is pending. */
 /* 2 when hardware output is busy; retry later. */
+/* -2 on terminal hardware failure; -1 means no pending output. */
 int rh264_video_drain(rh264_video *v);
 
 /* Bits per sample of the decoded pictures (8..14).  Above 8 the planes
@@ -160,6 +174,7 @@ void rh264_video_row_wait_stats(int *waits, int *rows_short_x100);
 int rh264_video_jobs_at_once(void);
 
 int rh264_video_bit_depth(const rh264_video *v);
+unsigned rh264_video_reorder_depth(const rh264_video *v);
 
 /* Borrow a decoded plane (0=Y, 1=U, 2=V). Valid until the next decode call. */
 const uint8_t *rh264_video_plane(const rh264_video *v, int plane,

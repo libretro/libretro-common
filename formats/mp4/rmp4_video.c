@@ -43,6 +43,8 @@
 #include <formats/rvp8.h>
 #ifdef HAVE_RVP9
 #include <formats/rvp9.h>
+#include <formats/rvp9_config.h>
+#include <formats/rvp9_color.h>
 #endif
 /* The 10-bit / HDR I420->RGB blits are shared (image_hdr_blit.c) but still
  * declared in rwebm_video.h; the implementation is demuxer-independent.
@@ -79,19 +81,32 @@ struct rmp4_video_stream
    rmp4_t      *demux;
    rmp4_packet pending_packet;
    size_t pending_floor;
+   const uint8_t *input;
+   size_t input_len, input_avail;
    int pending, waiting;
    rvp8_video  *vp8;
 #ifdef HAVE_RVP9
    rvp9_dec    *vp9;
+   video_color_metadata_t vp9_color;
+   int vp9_have_config;
+   rvp9_config_t vp9_config;
 #endif
    rh264_video *h264;
    rh265_video *h265;
+   rh265_output_timing_t h265_timing;
+   int64_t h265_timestamp, h265_display_timestamp;
+   size_t h265_probe_offset, h265_probe_need, h265_need_lo, h265_need_hi;
+   uint32_t h265_decode_sample, h265_probe_sample;
+   int h265_picture_pending, h265_timing_active, h265_have_time;
 #ifdef HAVE_RAV1
    rav1_hw_stream_t *av1;
+   uint8_t *av1_sequence_bytes;
+   size_t av1_sequence_size;
    rav1_hdr_metadata_t av1_hdr_initial, av1_hdr_seed;
    rmp4_av1_hdr_point_t *av1_hdr_points;
    rav1_hdr_metadata_t av1_hdr_scanned;
    size_t av1_hdr_count, av1_hdr_capacity, av1_hdr_scan_offset;
+   size_t av1_hdr_scan_need;
    uint32_t av1_hdr_scan_sample, av1_decode_sample;
    rav1_sequence_t av1_hdr_probe_sequence;
    size_t av1_hdr_probe_offset;
@@ -120,6 +135,7 @@ struct rmp4_video_stream
     * the old seek-only 'catchup' blit suppression). */
    int          rndr_kind;     /* 0 none, 1 vp8, 2 vp9, 3 h264, 4 h265 */
    int          rndr_vp9_show; /* fbs index of the vp9 picture       */
+   int completed;
    int          wait_key;   /* a reference failed; hold out for a key */
    int          catchup;    /* dropping droppable pictures to catch up */
    int          track;      /* index of the chosen video track        */
@@ -585,6 +601,15 @@ static void rmp4_video_hevc_color(rmp4_video_stream_t *s, const rmp4_track *t)
 }
 
 #ifdef HAVE_RAV1
+static bool rmp4_video_av1_retain(void *user,
+      const rav1_sequence_t *sequence, const rav1_obu_t *obu)
+{
+   rmp4_video_stream_t *s = (rmp4_video_stream_t*)user;
+   (void)sequence;
+   return rav1_hw_stream_retain_config(
+         &s->av1_sequence_bytes, &s->av1_sequence_size, obu);
+}
+
 static bool rmp4_video_av1_open(rmp4_video_stream_t *s)
 {
    const rmp4_track *t = rmp4_get_track(s->demux, s->track);
@@ -593,10 +618,19 @@ static bool rmp4_video_av1_open(rmp4_video_stream_t *s)
    if (!t ||
        !rav1_config_parse(&config, t->codec_private, t->codec_private_size))
       return false;
+   if (s->av1_sequence_bytes)
+   {
+      size_t offset = 0;
+      if (rav1_obu_next(&config.sequence, s->av1_sequence_bytes,
+               s->av1_sequence_size, &offset, true) != 1)
+         return false;
+   }
    s->av1 = (rav1_hw_stream_t *)calloc(1, sizeof(*s->av1));
    if (!s->av1)
       return false;
    rav1_hw_stream_init(s->av1, NULL);
+   s->av1->retain_sequence = rmp4_video_av1_retain;
+   s->av1->sequence_user = s;
    seq = &s->av1->sequence;
    if (!rav1_config_sequence(seq, &config) || seq->max_width != s->width ||
        seq->max_height != s->height)
@@ -625,7 +659,17 @@ static bool rmp4_video_av1_open(rmp4_video_stream_t *s)
       goto fail;
    s->av1_hdr_seed = s->av1->hdr;
    if (s->av1_hdr_initial_set) s->av1->hdr = s->av1_hdr_initial;
-   if (!rmp4_video_hw_color_allowed(s) || !rav1_hw_stream_open_sequence(s->av1))
+   s->av1->sequence_obu = config.sequence;
+   s->av1->color.primaries = s->primaries;
+   s->av1->color.transfer = s->transfer;
+   s->av1->color.matrix = s->matrix;
+   s->av1->color.range = s->range ? 2 : 1;
+   s->av1->color.mastering = s->mastering;
+   s->av1->color.max_cll = s->max_cll;
+   s->av1->color.max_fall = s->max_fall;
+   if (!rav1_hdr_metadata_merge(&s->av1->color, &s->av1->hdr)
+         || !rmp4_video_hw_color_allowed(s)
+         || !rav1_hw_stream_open_sequence(s->av1))
       goto fail;
    return true;
 fail:
@@ -633,6 +677,60 @@ fail:
    free(s->av1);
    s->av1 = NULL;
    return false;
+}
+#endif
+
+#ifdef HAVE_RVP9
+static bool rmp4_video_vp9_configure(rmp4_video_stream_t *s,
+      const rmp4_track *track)
+{
+   video_color_metadata_t color;
+   memset(&color, 0, sizeof(color));
+   color.primaries = track->color_primaries;
+   color.transfer = track->transfer_characteristics;
+   color.matrix = track->matrix_coefficients;
+   color.range = track->range_present ? (track->full_range ? 2 : 1) : 0;
+   color.mastering = track->mastering;
+   color.max_cll = track->max_cll;
+   color.max_fall = track->max_fall;
+   if (track->codec_private_size)
+   {
+      if (!rvp9_config_parse(track->codec_private, track->codec_private_size,
+               &s->vp9_config)
+            || !rvp9_config_apply_color(&s->vp9_config, &color, &color))
+         return false;
+      s->vp9_have_config = 1;
+   }
+   if (s->vp9_have_config && s->vp9_config.bit_depth != 10
+         && (color.transfer == 16 || color.transfer == 18))
+      return false;
+   s->vp9_color = color;
+   s->primaries = color.primaries;
+   s->transfer = color.transfer;
+   s->matrix = color.matrix;
+   s->range = color.range == 2;
+   return true;
+}
+
+static bool rmp4_video_vp9_color(rmp4_video_stream_t *s)
+{
+   const rvp9_hdr *header = &s->vp9->hd;
+   const rvp9_config_t *config = &s->vp9_config;
+   video_color_metadata_t color;
+   if (s->vp9_have_config
+         && (config->profile != header->profile
+               || config->bit_depth != header->bit_depth
+               || config->full_range != header->color_range
+               || header->subsampling_x != (config->chroma != 3)
+               || header->subsampling_y != (config->chroma < 2)))
+      return false;
+   if (!rvp9_color_resolve(header, &s->vp9_color, &color))
+      return false;
+   s->primaries = color.primaries;
+   s->transfer = color.transfer;
+   s->matrix = color.matrix;
+   s->range = color.range == 2;
+   return true;
 }
 #endif
 
@@ -808,6 +906,10 @@ static rmp4_video_stream_t *rmp4_video_stream_open_begin(
          need_lo, need_hi)))
       goto fail;
 
+   s->input = buf;
+   s->input_len = len;
+   s->input_avail = avail > len ? len : avail;
+
    /* Pick the first video track whose codec we can decode. */
    s->track   = -1;
    num_tracks = rmp4_num_tracks(s->demux);
@@ -843,6 +945,10 @@ static rmp4_video_stream_t *rmp4_video_stream_open_begin(
    }
    if (s->track < 0)
       goto fail;
+#ifdef HAVE_RVP9
+   if (s->codec == RMP4_CODEC_VP9 && !rmp4_video_vp9_configure(s, trk))
+      goto fail;
+#endif
 
    s->width  = trk->width;
    s->height = trk->height;
@@ -980,6 +1086,7 @@ void rmp4_video_stream_close(rmp4_video_stream_t *s)
       rmp4_close(s->demux);
 #ifdef HAVE_RAV1
    free(s->av1_hdr_points);
+   free(s->av1_sequence_bytes);
 #endif
    free(s->ts);
    free(s->frame);
@@ -1029,6 +1136,127 @@ static int rmp4_video_duration_ms(const rmp4_video_stream_t *s, int idx)
    return (int)(t1 / 1000000 - t0 / 1000000);
 }
 
+static int rmp4_video_timestamp_index(const rmp4_video_stream_t *s, int64_t time)
+{
+   int lo = 0, hi = s->ts_count;
+   while (lo < hi)
+   {
+      int mid = lo + (hi - lo) / 2;
+      if (s->ts[mid] < time) lo = mid + 1;
+      else hi = mid;
+   }
+   return lo;
+}
+
+static int rmp4_video_h265_probe(rmp4_video_stream_t *s,
+      const int64_t *pts)
+{
+   const rmp4_track *track = rmp4_get_track(s->demux, s->track);
+   rh265_slice_info_t slice;
+   size_t begin, end, length = 0, bytes;
+   unsigned i, width, type;
+   int ret;
+   if (!track || track->codec_private_size < 22) return -1;
+   width = 1 + (track->codec_private[21] & 3);
+   if (!rmp4_track_sample_span(s->demux, s->track, s->h265_probe_sample,
+            &begin, &end) || s->h265_probe_offset > end - begin) return -1;
+   begin += s->h265_probe_offset;
+   if (begin == end)
+   {
+      s->h265_probe_sample++;
+      s->h265_probe_offset = s->h265_probe_need = 0;
+      return 0;
+   }
+   if (end - begin < width + 2) return -1;
+   s->h265_need_lo = begin;
+   s->h265_need_hi = begin + width + 2;
+   if (s->h265_need_hi > s->input_avail) return 2;
+   for (i = 0; i < width; i++) length = (length << 8) | s->input[begin + i];
+   if (length < 2 || length > end - begin - width) return -1;
+   begin += width;
+   type = (s->input[begin] >> 1) & 63;
+   if (type > 31)
+   {
+      s->h265_probe_offset += width + length;
+      return 0;
+   }
+   bytes = s->h265_probe_need ? s->h265_probe_need : 256;
+   if (bytes > length) bytes = length;
+   s->h265_need_hi = begin + bytes;
+   if (s->h265_need_hi > s->input_avail) return 2;
+   ret = rh265_video_get_slice(s->h265, s->input + begin, bytes, &slice);
+   if (ret < 0)
+   {
+      if (bytes == length || bytes >= 65536) return -1;
+      s->h265_probe_need = bytes * 2;
+      return 0;
+   }
+   ret = rh265_video_output_timing_advance(s->h265, &s->h265_timing,
+         &slice, pts[s->h265_probe_sample], s->h265_timestamp);
+   s->h265_probe_sample++;
+   s->h265_probe_offset = s->h265_probe_need = 0;
+   return ret < 0 ? -1 : 0;
+}
+
+static int rmp4_video_h265_picture(rmp4_video_stream_t *s, int *duration_ms)
+{
+   rh265_output_timing_t *timing = &s->h265_timing;
+   uint32_t count = 0;
+   const int64_t *pts = rmp4_track_pts(s->demux, s->track, &count);
+   unsigned budget = 16;
+   if (!pts) return -1;
+   if (!s->h265_timing_active)
+   {
+      if (rh265_video_output_timing(s->h265, s->h265_timestamp, timing)) return -1;
+      s->h265_probe_sample = s->h265_decode_sample;
+      s->h265_probe_offset = s->h265_probe_need = 0;
+      s->h265_timing_active = 1;
+   }
+   while (!timing->next_valid && s->h265_probe_sample < count && budget--)
+   {
+      int ret = rmp4_video_h265_probe(s, pts);
+      if (ret < 0) return -1;
+      if (ret == 2)
+      {
+         s->waiting = RMP4_VIDEO_WAIT_INPUT;
+         return 2;
+      }
+   }
+   if (!timing->next_valid && s->h265_probe_sample < count)
+   {
+      s->waiting = RMP4_VIDEO_WAIT_DECODER;
+      return 2;
+   }
+   if (!timing->next_valid)
+   {
+      unsigned i;
+      for (i = 0; i < timing->count; i++)
+         if (timing->pending[i] > s->h265_timestamp
+               && (!timing->next_valid || timing->pending[i] < timing->next_timestamp))
+         {
+            timing->next_timestamp = timing->pending[i];
+            timing->next_valid = 1;
+         }
+   }
+   s->disp_idx = timing->next_valid
+      ? rmp4_video_timestamp_index(s, timing->next_timestamp) : s->ts_count;
+   if (duration_ms)
+   {
+      if (timing->next_valid)
+      {
+         int64_t delta = timing->next_timestamp / 1000000
+            - s->h265_timestamp / 1000000;
+         *duration_ms = delta > 0 && delta <= 2147483647 ? (int)delta : 0;
+      }
+      else *duration_ms = rmp4_video_duration_ms(s, s->ts_count - 1);
+   }
+   s->h265_have_time = 1;
+   s->h265_display_timestamp = s->h265_timestamp;
+   s->h265_picture_pending = s->h265_timing_active = 0;
+   s->h265_need_lo = s->h265_need_hi = 0;
+   return 1;
+}
+
 #ifdef HAVE_RAV1
 static int rmp4_video_av1_hdr_point(rmp4_video_stream_t *s, uint32_t sample);
 
@@ -1042,9 +1270,55 @@ static int rmp4_video_av1_learn_hdr(rmp4_video_stream_t *s)
    }
    s->av1_hdr_scanned = s->av1->hdr;
    if (!rmp4_video_av1_hdr_point(s, s->av1_decode_sample + 1)) return 0;
-   s->av1_hdr_scan_offset = 0;
+   s->av1_hdr_scan_offset = s->av1_hdr_scan_need = 0;
    s->av1_hdr_scan_sample++;
    return 1;
+}
+
+static int rmp4_video_av1_result(rmp4_video_stream_t *s,
+      int ret, video_hw_frame_t *frame)
+{
+   if (ret == RAV1_HW_STREAM_FRAME)
+   {
+      if (frame->width != s->width || frame->height != s->height)
+      {
+         video_hw_frame_abandon(frame);
+         return -1;
+      }
+      if (s->matrix == 1)
+         frame->yuv |= IMAGE_YUV_FLAG_BT709;
+      else
+         frame->yuv &= ~IMAGE_YUV_FLAG_BT709;
+      frame->color.mastering = s->mastering;
+      frame->color.max_cll = s->max_cll;
+      frame->color.max_fall = s->max_fall;
+      frame->color.primaries = s->primaries;
+      frame->color.transfer = s->transfer;
+      frame->color.matrix = s->matrix;
+      frame->color.range = s->range ? 2 : 1;
+      if (!rav1_hdr_metadata_merge(&frame->color, &s->av1->output_hdr))
+      {
+         video_hw_frame_abandon(frame);
+         s->av1->error = -1;
+         return -1;
+      }
+      rmp4_video_hwf_drop(s);
+      s->hwf = *frame;
+      s->hwf_untaken = 1;
+      s->rndr_kind = 5;
+      return 3;
+   }
+   if (ret == RAV1_HW_STREAM_DISCARDED)
+   {
+      rmp4_video_hwf_drop(s);
+      s->rndr_kind = 0;
+      return 3;
+   }
+   if (ret == RAV1_HW_STREAM_PROGRESS || ret == RAV1_HW_STREAM_PENDING)
+      return 4;
+   if (ret == RAV1_HW_STREAM_BUSY)
+      return 2;
+   return ret;
 }
 
 static int rmp4_video_av1_packet(rmp4_video_stream_t *s, const rmp4_packet *pkt,
@@ -1067,52 +1341,21 @@ static int rmp4_video_av1_packet(rmp4_video_stream_t *s, const rmp4_packet *pkt,
       s->av1_decode_sample++;
    }
    if (!s->av1_hdr_initial_set &&
-       (ret == RAV1_HW_STREAM_FRAME || ret == RAV1_HW_STREAM_DISCARDED))
+       (ret == RAV1_HW_STREAM_FRAME || ret == RAV1_HW_STREAM_DISCARDED
+             || ret == RAV1_HW_STREAM_PENDING))
    {
-      s->av1_hdr_initial = s->av1->hdr;
+      s->av1_hdr_initial = s->av1->output_hdr;
       s->av1_hdr_initial_set = 1;
    }
-   if (ret == RAV1_HW_STREAM_FRAME)
-   {
-      if (frame.width != s->width || frame.height != s->height)
-      {
-         video_hw_frame_abandon(&frame);
-         return -1;
-      }
-      if (s->matrix == 1)
-         frame.yuv |= IMAGE_YUV_FLAG_BT709;
-      else
-         frame.yuv &= ~IMAGE_YUV_FLAG_BT709;
-      frame.color.mastering = s->mastering;
-      frame.color.max_cll = s->max_cll;
-      frame.color.max_fall = s->max_fall;
-      frame.color.primaries = s->primaries;
-      frame.color.transfer = s->transfer;
-      frame.color.matrix = s->matrix;
-      frame.color.range = s->range ? 2 : 1;
-      if (!rav1_hdr_metadata_merge(&frame.color, &s->av1->hdr))
-      {
-         video_hw_frame_abandon(&frame);
-         s->av1->error = -1;
-         return -1;
-      }
-      rmp4_video_hwf_drop(s);
-      s->hwf = frame;
-      s->hwf_untaken = 1;
-      s->rndr_kind = 5;
-      return 3;
-   }
-   if (ret == RAV1_HW_STREAM_DISCARDED)
-   {
-      rmp4_video_hwf_drop(s);
-      s->rndr_kind = 0;
-      return 3;
-   }
-   if (ret == RAV1_HW_STREAM_PROGRESS)
-      return 4;
-   if (ret == RAV1_HW_STREAM_BUSY)
-      return 2;
-   return ret;
+   return rmp4_video_av1_result(s, ret, &frame);
+}
+
+static int rmp4_video_av1_output(rmp4_video_stream_t *s, int discard, int terminal)
+{
+   video_hw_frame_t frame;
+   int ret = terminal ? rav1_hw_stream_finish(s->av1, &frame, discard != 0)
+                      : rav1_hw_stream_output(s->av1, &frame, discard != 0);
+   return rmp4_video_av1_result(s, ret, &frame);
 }
 #endif
 
@@ -1152,7 +1395,7 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
       for (i = 0; i < nf; i++)
       {
          r = rvp9_decode_frame(s->vp9, frame, sizes[i], &show);
-         if (r < 0)
+         if (r < 0 || !rmp4_video_vp9_color(s))
             return -1;
          if (show >= 0)
             last_show = show;
@@ -1240,11 +1483,14 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
       if (s->wait_key && !pkt->keyframe)
       {
          s->disp_idx++;  /* the sample's presentation slot is gone */
+         s->h265_decode_sample++;
          return 0;
       }
-      dec = rh265_video_decode(s->h265, pkt->data, pkt->size);
+      dec = rh265_video_decode_timed(s->h265, pkt->data, pkt->size,
+            pkt->timestamp, &s->h265_timestamp);
       if (dec == 2) return 2;
       if (dec == 3) return rmp4_video_hwf_take(s) == 0 ? 3 : -1;
+      s->h265_decode_sample++;
       if (dec < 0)
       {
          if (pkt->keyframe)
@@ -1283,6 +1529,12 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
 {
    rmp4_packet pkt;
    int drained = -1;
+#ifdef HAVE_RAV1
+   int av1_eof = 0;
+#endif
+
+   if (s->h265_picture_pending)
+      return rmp4_video_h265_picture(s, duration_ms);
 
    for (;;)
    {
@@ -1303,11 +1555,30 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
           * the H.264 reorder queue now would present its held
           * pictures early and out of order. */
       {
+#ifdef HAVE_RAV1
+         if (s->av1 && s->av1->backend.drain)
+         {
+            int output = rmp4_video_av1_output(s, discard, 0);
+            if (output < 0) return -1;
+            if (output == 3)
+            {
+               if (duration_ms) *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
+               s->disp_idx++;
+               return 1;
+            }
+         }
+#endif
          s->waiting = RMP4_VIDEO_WAIT_INPUT;
          return 2;
       }
       if (r != 1)
+      {
+         if (r < 0) return -1;
+#ifdef HAVE_RAV1
+         av1_eof = r == 0;
+#endif
          break;
+      }
       if (pkt.track != s->track)
          continue;
       r = rmp4_video_decode_packet(s, &pkt, discard);
@@ -1322,6 +1593,11 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
             s->waiting = RMP4_VIDEO_WAIT_DECODER;
             return 2;
          }
+         if (s->h265)
+         {
+            s->h265_picture_pending = 1;
+            return rmp4_video_h265_picture(s, duration_ms);
+         }
          if (duration_ms) *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
          s->disp_idx++;
          return 1;
@@ -1331,11 +1607,37 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
          return -1;      /* decode error: end the animation */
       if (r == 0)
          return 0;       /* non-shown frame                  */
+      if (s->h265)
+      {
+         s->h265_picture_pending = 1;
+         return rmp4_video_h265_picture(s, duration_ms);
+      }
       if (duration_ms)
          *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
       s->disp_idx++;
       return 1;
    }
+#ifdef HAVE_RAV1
+   if (s->av1)
+   {
+      int output;
+      if (!av1_eof) return -1;
+      output = rmp4_video_av1_output(s, discard, 1);
+      if (output == 2)
+      {
+         s->waiting = RMP4_VIDEO_WAIT_DECODER;
+         return 2;
+      }
+      if (output == 3)
+      {
+         if (duration_ms) *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
+         s->disp_idx++;
+         return 1;
+      }
+      s->completed = output == 0;
+      return -1;
+   }
+#endif
    /* Out of packets. Display reordering can leave the last few pictures
     * queued inside the H.264 decoder; hand them out before ending the
     * pass, one per call, on the same presentation clock. */
@@ -1344,6 +1646,8 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
       s->waiting = RMP4_VIDEO_WAIT_DECODER;
       return 2;
    }
+   if (s->h264 && drained < -1)
+      return -1;
    if (s->h264 && drained == 0)
    {
       s->rndr_kind = 0;   /* the drain replaced the current picture */
@@ -1365,30 +1669,31 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
          return 1;
       }
    }
-   if (s->h265 && (drained = rh265_video_drain(s->h265)) == 2)
+   if (s->h265 && (drained = rh265_video_drain_timed(s->h265,
+               &s->h265_timestamp)) == 2)
    {
       s->waiting = RMP4_VIDEO_WAIT_DECODER;
       return 2;
    }
+   if (s->h265 && drained < -1)
+      return -1;
    if (s->h265 && drained == 0)
    {
       s->rndr_kind = 0;   /* the drain replaced the current picture */
       if (rh265_video_is_hw(s->h265))
       {
          if (rmp4_video_hwf_take(s) != 0) return -1;
-         if (duration_ms) *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
-         s->disp_idx++;
-         return 1;
+         s->h265_picture_pending = 1;
+         return rmp4_video_h265_picture(s, duration_ms);
       }
       if (rh265_video_plane(s->h265, 0, NULL, NULL, NULL))
       {
          s->rndr_kind = 4;
-         if (duration_ms)
-            *duration_ms = rmp4_video_duration_ms(s, s->disp_idx);
-         s->disp_idx++;
-         return 1;
+         s->h265_picture_pending = 1;
+         return rmp4_video_h265_picture(s, duration_ms);
       }
    }
+   s->completed = 1;
    return -1;             /* end of one pass */
 }
 
@@ -1402,6 +1707,7 @@ static int rmp4_video_stream_advance(rmp4_video_stream_t *s,
 
    if (!s)
       return -1;
+   s->completed = 0;
    s->waiting = 0;
 #ifdef HAVE_RAV1
    if (s->codec == RMP4_CODEC_AV1)
@@ -1502,7 +1808,7 @@ void rmp4_video_stream_stop_hw(rmp4_video_stream_t *s)
 int rmp4_video_stream_hw_frame(rmp4_video_stream_t *s,
       video_hw_frame_t *out)
 {
-   if (!s || s->rndr_kind != 5 || !s->hwf_untaken || !out)
+   if (!s || s->h265_picture_pending || s->rndr_kind != 5 || !s->hwf_untaken || !out)
       return 0;
    *out           = s->hwf;
    s->hwf_untaken = 0;
@@ -1714,7 +2020,10 @@ static void rmp4_video_blit_frame(rmp4_video_stream_t *s,
 void rmp4_video_stream_set_avail(rmp4_video_stream_t *s, size_t avail)
 {
    if (s)
+   {
+      s->input_avail = avail > s->input_len ? s->input_len : avail;
       rmp4_set_avail(s->demux, avail);
+   }
 }
 
 size_t rmp4_video_stream_media_floor(rmp4_video_stream_t *s)
@@ -1722,9 +2031,49 @@ size_t rmp4_video_stream_media_floor(rmp4_video_stream_t *s)
    return s ? rmp4_media_floor(s->demux) : 0;
 }
 
+int rmp4_video_stream_seek_span(rmp4_video_stream_t *s,
+      size_t *lo, size_t *hi)
+{
+#ifdef HAVE_RAV1
+   size_t begin, end, need;
+   if (!s || !lo || !hi || s->seek_state != 5
+         || s->av1_hdr_scan_sample >= (uint32_t)s->seek_scan
+         || !rmp4_track_sample_span(s->demux, s->track,
+            s->av1_hdr_scan_sample, &begin, &end)
+         || s->av1_hdr_scan_offset > end - begin)
+      return 0;
+   begin += s->av1_hdr_scan_offset;
+   need = s->av1_hdr_scan_need > 10 ? s->av1_hdr_scan_need : 10;
+   *lo = begin;
+   *hi = end - begin > need ? begin + need : end;
+   return 1;
+#else
+   (void)s; (void)lo; (void)hi;
+   return 0;
+#endif
+}
+
 size_t rmp4_video_stream_consumed(rmp4_video_stream_t *s)
 {
-   return s ? (s->pending ? s->pending_floor : rmp4_consumed(s->demux)) : 0;
+   size_t lo, hi, consumed;
+   if (rmp4_video_stream_seek_span(s, &lo, &hi)) return lo;
+   if (!s) return 0;
+   consumed = s->pending ? s->pending_floor : rmp4_consumed(s->demux);
+   if (s->h265_picture_pending && s->h265_need_hi
+         && s->h265_need_lo < consumed) consumed = s->h265_need_lo;
+   return consumed;
+}
+
+void rmp4_video_stream_read_span(const rmp4_video_stream_t *s,
+      size_t *lo, size_t *hi)
+{
+   if (s && s->h265_picture_pending && s->h265_need_hi > s->input_avail)
+   {
+      if (lo) *lo = s->h265_need_lo;
+      if (hi) *hi = s->h265_need_hi;
+      return;
+   }
+   rmp4_read_span(s && !s->pending ? s->demux : NULL, lo, hi);
 }
 
 int64_t rmp4_video_stream_duration_ns(rmp4_video_stream_t *s)
@@ -1735,7 +2084,7 @@ int64_t rmp4_video_stream_duration_ns(rmp4_video_stream_t *s)
 const uint32_t *rmp4_video_stream_render(rmp4_video_stream_t *s)
 {
    uint32_t *dst;
-   if (!s)
+   if (!s || s->h265_picture_pending)
       return NULL;
    dst        = s->out ? s->out : s->frame;
    s->is_fp16 = 0;
@@ -1779,8 +2128,8 @@ const uint32_t *rmp4_video_stream_render(rmp4_video_stream_t *s)
          unsigned h = (unsigned)fb->h < s->height ? (unsigned)fb->h : s->height;
          if (s->vp9->hd.bit_depth == 10)
          {
-            /* Colour metadata comes from the sample entry's colr box when
-             * present; untagged files pass zeros and the shared blit picks
+            /* Colour metadata comes from the sample entry and coded header;
+             * untagged files pass zeros and the shared blit picks
              * HD-appropriate defaults (BT.2020-ncl for PQ, BT.709/601 by
              * resolution), matching untagged webm content. Without this
              * branch the 10-bit (uint16) planes were handed to the 8-bit
@@ -1939,11 +2288,20 @@ const uint32_t *rmp4_video_stream_next(rmp4_video_stream_t *s,
    return rmp4_video_stream_render(s);
 }
 
+int rmp4_video_stream_completed(const rmp4_video_stream_t *s)
+{
+   return s && s->completed;
+}
+
 void rmp4_video_stream_rewind(rmp4_video_stream_t *s)
 {
    if (!s)
       return;
+   s->completed = 0;
    s->pending = s->waiting = s->seek_state = 0;
+   s->h265_decode_sample = 0;
+   s->h265_picture_pending = s->h265_timing_active = s->h265_have_time = 0;
+   s->h265_need_lo = s->h265_need_hi = 0;
 #ifdef HAVE_RAV1
    s->av1_hdr_probe_started = 0;
    s->av1_decode_sample = 0;
@@ -1955,6 +2313,16 @@ void rmp4_video_stream_rewind(rmp4_video_stream_t *s)
    s->wait_key = 0;
    /* The stream restarts at a key frame, so a fresh decoder (empty
     * reference chain, default probabilities) is the correct state. */
+#ifdef HAVE_RAV1
+   if (s->want_hw && s->av1 && rav1_hw_stream_restart(s->av1))
+   {
+      s->av1->hdr = s->av1_hdr_initial_set
+         ? s->av1_hdr_initial : s->av1_hdr_seed;
+      return;
+   }
+#endif
+   if (s->want_hw && s->h264 && rh264_video_restart_hw(&s->h264))
+      return;
    rmp4_video_stream_close_decoder(s);
    rmp4_video_stream_open_decoder(s);
 }
@@ -1983,6 +2351,9 @@ static int64_t rmp4_video_stream_movie_time_ns(const rmp4_video_stream_t *s,
 
 int64_t rmp4_video_stream_frame_time_ns(const rmp4_video_stream_t *s)
 {
+   if (s && s->h265)
+      return s->h265_have_time ? rmp4_video_stream_movie_time_ns(s,
+            rmp4_video_timestamp_index(s, s->h265_display_timestamp)) : -1;
    return s ? rmp4_video_stream_movie_time_ns(s, s->disp_idx - 1) : -1;
 }
 
@@ -2065,47 +2436,48 @@ static const rav1_hdr_metadata_t *rmp4_video_av1_hdr_at(
    return lo ? &s->av1_hdr_points[lo - 1].hdr : &s->av1_hdr_seed;
 }
 
-/* Header-only prefix scan: one resident OBU, yielding before a new sample. */
+/* Only OBU headers and metadata payloads need resident storage. */
 static int rmp4_video_av1_scan_hdr(rmp4_video_stream_t *s)
 {
-   rmp4_packet packet;
    rav1_obu_t obu;
+   size_t begin, end, lo, hi, next;
    int ret;
    if (!s->av1_hdr_count)
    {
       s->av1_hdr_scanned = s->av1_hdr_seed;
       if (!rmp4_video_av1_hdr_point(s, 0)) return -1;
-      if (!rmp4_select_track_sample(s->demux, s->track, 0)) return -1;
-      return 2;
    }
-   if (!rmp4_select_track_sample(s->demux, s->track, s->av1_hdr_scan_sample))
-      return -1;
-   if (!s->pending) s->pending_floor = rmp4_consumed(s->demux);
-   ret = rmp4_read_packet(s->demux, &packet);
-   if (ret == RMP4_READ_AGAIN)
+   if (!rmp4_track_sample_span(s->demux, s->track,
+            s->av1_hdr_scan_sample, &begin, &end)
+         || !rmp4_video_stream_seek_span(s, &lo, &hi)) return -1;
+   if (hi > s->input_avail)
    {
       s->waiting = RMP4_VIDEO_WAIT_INPUT;
       return 0;
    }
-   if (ret != 1 || packet.track != s->track) return -1;
-   s->pending_packet = packet;
-   s->pending = 1;
-   ret = rav1_obu_next(&obu, packet.data, packet.size,
-         &s->av1_hdr_scan_offset, true);
+   next = s->av1_hdr_scan_offset;
+   ret = rav1_obu_next(&obu, s->input + begin, end - begin, &next, true);
    if (ret < 0) return -1;
    if (!ret)
    {
       if (!rmp4_video_av1_hdr_point(s, s->av1_hdr_scan_sample + 1)) return -1;
-      s->pending = 0;
-      s->av1_hdr_scan_offset = 0;
+      s->av1_hdr_scan_offset = s->av1_hdr_scan_need = 0;
       s->av1_hdr_scan_sample++;
-      if (!rmp4_select_track_sample(s->demux, s->track, s->av1_hdr_scan_sample))
-         return -1;
       return 2;
    }
    if (obu.temporal_id || obu.spatial_id) return -1;
-   if (obu.type == 5 && rav1_hdr_metadata_obu(&s->av1_hdr_scanned, &obu) < 0)
-      return -1;
+   if (obu.type == 5)
+   {
+      s->av1_hdr_scan_need = obu.size;
+      if (begin + next > s->input_avail)
+      {
+         s->waiting = RMP4_VIDEO_WAIT_INPUT;
+         return 0;
+      }
+      if (rav1_hdr_metadata_obu(&s->av1_hdr_scanned, &obu) < 0) return -1;
+   }
+   s->av1_hdr_scan_offset = next;
+   s->av1_hdr_scan_need = 0;
    return 0;
 }
 
@@ -2190,6 +2562,7 @@ int rmp4_video_stream_seek_begin_ns(rmp4_video_stream_t *s, int64_t ns)
    int lo = 0, hi;
    if (!s || s->ts_count <= 0)
       return 0;
+   s->completed = 0;
    if (ns < 0) ns = 0;
    hi = s->ts_count;
    while (lo < hi)
@@ -2306,6 +2679,7 @@ int rmp4_video_stream_seek_step(rmp4_video_stream_t *s, int64_t *position_us)
                else hi = mid;
             }
             s->disp_idx = lo;
+            s->h265_decode_sample = (uint32_t)sample;
             s->seek_state = 2;
             return 0;
          }
@@ -2363,7 +2737,7 @@ failed:
    {
       if (s->seek_state == 5)
       {
-         s->av1_hdr_scan_offset = 0;
+         s->av1_hdr_scan_offset = s->av1_hdr_scan_need = 0;
          s->av1_hdr_scanned = *rmp4_video_av1_hdr_at(s, s->av1_hdr_scan_sample);
       }
       s->pending = s->av1_hdr_probe_started = 0;
@@ -2415,6 +2789,7 @@ int64_t rmp4_video_stream_seek_frame(rmp4_video_stream_t *s, int frame)
       n++;
    }
    s->disp_idx = kf;
+   s->h265_decode_sample = (uint32_t)kf;
    while (s->disp_idx < tidx)
       if (rmp4_video_stream_discard(s, NULL) != 1)
          break;

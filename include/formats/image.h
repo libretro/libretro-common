@@ -564,12 +564,24 @@ void *image_transfer_anim_stream_new_hw_avail(void *buf, size_t len,
       size_t avail, enum image_type_enum type, int *need_more,
       size_t *need_lo, size_t *need_hi);
 
+/* Metadata-first GPU-player open. Software preference is unchanged; native-only
+ * candidates are returned without opening a backend. The decoder owner must
+ * call set_hw(true) before advancing such a candidate. Admission can still
+ * fail, including when no native backend is available. */
+void *image_transfer_anim_stream_new_hw_deferred_avail(void *buf, size_t len,
+      size_t avail, enum image_type_enum type, int *need_more,
+      size_t *need_lo, size_t *need_hi);
+
 void image_transfer_anim_stream_free(void *stream,
       enum image_type_enum type);
 
 void image_transfer_anim_stream_get_info(void *stream,
       enum image_type_enum type,
       unsigned *width, unsigned *height, int *num_frames, int *loop_count);
+
+/* Decoder owner: the last movie advance reached clean EOF. */
+bool image_transfer_anim_stream_completed(const void *stream,
+      enum image_type_enum type);
 
 const uint32_t *image_transfer_anim_stream_next(void *stream,
       enum image_type_enum type, int *duration_ms);
@@ -635,8 +647,12 @@ bool image_transfer_anim_stream_set_output_stride(void *stream,
  * be. A stream under way starts over. The frame of each shown frame is
  * then taken with _hw_frame after _next - whose pointer only says a
  * frame came - and read or abandoned by the caller. */
+/* enable=false only queries an already admitted backend. */
 bool image_transfer_anim_stream_set_hw(void *stream,
       enum image_type_enum type, bool enable);
+/* Exclusive decoder owner, after decode jobs settle: withdraw hardware
+ * preference and restart the software stream where that type supports it. */
+bool image_transfer_anim_stream_stop_hw(void *stream, enum image_type_enum type);
 bool image_transfer_anim_stream_waiting(const void *stream,
       enum image_type_enum type);
 bool image_transfer_anim_stream_hw_frame(void *stream,
@@ -715,6 +731,8 @@ size_t image_transfer_anim_stream_consumed(void *stream,
 size_t image_transfer_anim_stream_feed_frontier(void *stream, enum image_type_enum type);
 void image_transfer_anim_stream_pin_span(void *stream, enum image_type_enum type,
       size_t *lo, size_t *hi);
+int image_transfer_anim_stream_seek_span(void *stream,
+      enum image_type_enum type, size_t *lo, size_t *hi);
 void image_transfer_anim_stream_next_span(void *stream,
       enum image_type_enum type, size_t *lo, size_t *hi);
 

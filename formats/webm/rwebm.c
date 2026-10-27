@@ -20,8 +20,8 @@
  * before a timestamp.  A file muxed without Cues, or one whose index
  * lies past a partial read's wall, delivers packets in file order only.
  *
- * What it does not implement: SeekHead (Cues are found by the header
- * walk reaching them, not by following a pointer to them), chapters,
+ * SeekHead may name a bounded Cues span for the input owner to admit.
+ * What it does not implement: chapters,
  * tags, attachments, subtitle tracks, and encrypted streams. Unrecognised
  * codecs retain their raw CodecID so callers can skip their packets.
  *
@@ -39,6 +39,11 @@
 #define ID_EBML            0x1A45DFA3u
 #define ID_SEGMENT         0x18538067u
 #define ID_INFO            0x1549A966u
+#define ID_SEEKHEAD        0x114D9B74u
+#define ID_SEEK            0x4DBBu
+#define ID_SEEKID          0x53ABu
+#define ID_SEEKPOSITION    0x53ACu
+#define ID_CUETRACK        0xF7u
 #define ID_TIMESTAMPSCALE  0x2AD7B1u
 #define ID_DURATION        0x4489u
 #define ID_TRACKS          0x1654AE6Bu
@@ -47,6 +52,8 @@
 #define ID_TRACKTYPE       0x83u
 #define ID_CODECID         0x86u
 #define ID_CODECPRIVATE    0x63A2u
+#define ID_LANGUAGE        0x22B59Cu
+#define ID_LANGUAGEBCP47   0x22B59Du
 #define ID_CODECDELAY      0x56AAu
 #define ID_DEFAULTDURATION 0x23E383u
 #define ID_VIDEO           0xE0u
@@ -54,6 +61,8 @@
 #define ID_PIXELHEIGHT     0xBAu
 #define ID_COLOUR          0x55B0u
 #define ID_MATRIXCOEFF     0x55B1u
+#define ID_CHROMASITINGHORZ 0x55B7u
+#define ID_CHROMASITINGVERT 0x55B8u
 #define ID_COLOURRANGE     0x55B9u
 #define ID_TRANSFERCHAR    0x55BAu
 #define ID_PRIMARIES       0x55BBu
@@ -67,7 +76,10 @@
 #define ID_SIMPLEBLOCK     0xA3u
 #define ID_BLOCKGROUP      0xA0u
 #define ID_BLOCK           0xA1u
+#define ID_BLOCKDURATION   0x9Bu
+#define ID_BLOCKADDITIONS  0x75A1u
 #define ID_DISCARDPADDING  0x75A2u
+#define ID_REFERENCEBLOCK  0xFBu
 #define ID_CUES            0x1C53BB6Bu
 #define ID_CUEPOINT        0xBBu
 #define ID_CUETIME         0xB3u
@@ -260,6 +272,13 @@ struct rwebm_cue
    uint64_t cluster_pos;   /* CueClusterPosition, from seg_body         */
 };
 
+struct rwebm_language
+{
+   const char *text;
+   size_t length;
+   enum rwebm_language_kind kind;
+};
+
 struct rwebm
 {
    const uint8_t *data;
@@ -279,6 +298,8 @@ struct rwebm
     * the header walk before them (they are usually written last). */
    struct rwebm_cue *cues;
    int            num_cues;
+   size_t         cues_at;
+   int            cues_loaded;
    /* End of the bytes that have actually been read into the buffer.
     * Equal to segment_end for a fully-resident file; a partial reader
     * raises it with rwebm_set_avail as bytes arrive.  The packet walk
@@ -287,14 +308,18 @@ struct rwebm
    const uint8_t *avail_end;
    /* Packet-read cursor. */
    const uint8_t *cur;              /* walk position inside the segment    */
+   const uint8_t *pending_additions;
+   size_t pending_additions_size;
    size_t         need_hi;          /* blocked element end, or zero         */
    rwebm_inert_range_cb_t inert_cb;
    void *inert_user;
    int64_t        cluster_ts;       /* current cluster timestamp (ticks)   */
    /* Lacing: a SimpleBlock may carry several frames; we emit them one at a
     * time, so remember where we are within a block. */
+   int64_t pending_duration;
    int64_t pending_discard;         /* DiscardPadding for the next Block   */
    int64_t lace_discard;            /* padding owed by the laced block     */
+   int64_t lace_duration;
    const uint8_t *lace_data;        /* payload after the block header      */
    const uint32_t *lace_sizes;      /* not used (see note); kept simple    */
    int            lace_count;
@@ -304,16 +329,14 @@ struct rwebm
    int            lace_track;
    int64_t        lace_ts;
    int            lace_keyframe;
+   int            pending_reference;
+   struct rwebm_language languages[RWEBM_MAX_TRACKS];
 };
 
-/* Parse a Cues element into the seek index.  Each CuePoint carries a
- * CueTime and one CueTrackPositions per indexed track; for the
- * audio-only files this demuxer is asked to seek in there is one, and
- * where there are more the first serves - every track's positions name
- * the same cluster.  Points that parse short are dropped rather than
- * failing the open: Cues are an optimisation, and a file whose index
- * is damaged is still perfectly playable in file order. */
-static void parse_cues(rwebm_t *w, const uint8_t *p, const uint8_t *end)
+/* Positive TrackNumber selects its positions, including when another
+ * track precedes it in the same CuePoint. Zero retains the legacy first
+ * position. Damaged optional points do not prevent sequential playback. */
+static void parse_cues(rwebm_t *w, const uint8_t *p, const uint8_t *end, int track)
 {
    ebml_reader r;
    int         cap = 0;
@@ -324,7 +347,7 @@ static void parse_cues(rwebm_t *w, const uint8_t *p, const uint8_t *end)
       uint32_t id   = ebml_read_id(&r);
       uint64_t sz   = ebml_read_vint(&r, 1, &ok);
       const uint8_t *body = r.p;
-      if (!id || !ok || body + sz > r.end)
+      if (!id || !ok || sz > (uint64_t)(r.end - body))
          break;
       if (id == ID_CUEPOINT)
       {
@@ -339,13 +362,15 @@ static void parse_cues(rwebm_t *w, const uint8_t *p, const uint8_t *end)
             uint32_t cid  = ebml_read_id(&c);
             uint64_t csz  = ebml_read_vint(&c, 1, &cok);
             const uint8_t *cbody = c.p;
-            if (!cid || !cok || cbody + csz > c.end)
+            if (!cid || !cok || csz > (uint64_t)(c.end - cbody))
                break;
             if (cid == ID_CUETIME)
                t = (int64_t)be_uint(cbody, (size_t)csz);
             else if (cid == ID_CUETRACKPOS && !havep)
             {
                ebml_reader q;
+               uint64_t cue_track = 0, cue_pos = 0;
+               int cue_have_pos = 0;
                q.p = cbody; q.end = cbody + csz;
                while (q.p < q.end)
                {
@@ -353,27 +378,36 @@ static void parse_cues(rwebm_t *w, const uint8_t *p, const uint8_t *end)
                   uint32_t qid  = ebml_read_id(&q);
                   uint64_t qsz  = ebml_read_vint(&q, 1, &qok);
                   const uint8_t *qbody = q.p;
-                  if (!qid || !qok || qbody + qsz > q.end)
+                  if (!qid || !qok || qsz > (uint64_t)(q.end - qbody))
                      break;
                   if (qid == ID_CUECLUSTERPOS)
                   {
-                     pos   = be_uint(qbody, (size_t)qsz);
-                     havep = 1;
+                     cue_pos = be_uint(qbody, (size_t)qsz);
+                     cue_have_pos = 1;
                   }
+                  else if (qid == ID_CUETRACK)
+                     cue_track = be_uint(qbody, (size_t)qsz);
                   q.p = qbody + qsz;
+               }
+               if (cue_have_pos && (!track || cue_track == (uint64_t)track))
+               {
+                  pos = cue_pos;
+                  havep = 1;
                }
             }
             c.p = cbody + csz;
          }
          /* A point is only useful with both halves, and the cluster it
           * names has to be inside the segment. */
-         if (t >= 0 && havep && w->seg_body + pos < w->segment_end)
+         if (t >= 0 && havep && pos < (uint64_t)(w->segment_end - w->seg_body))
          {
             if (w->num_cues >= cap)
             {
                int   ncap = cap ? cap * 2 : 64;
-               void *nb   = realloc(w->cues,
-                     (size_t)ncap * sizeof(*w->cues));
+               void *nb;
+               if (ncap <= w->num_cues)
+                  ncap = w->num_cues + 1;
+               nb = realloc(w->cues, (size_t)ncap * sizeof(*w->cues));
                if (!nb)
                   return;
                w->cues = (struct rwebm_cue*)nb;
@@ -404,6 +438,7 @@ static enum rwebm_codec codec_from_id(const char *id)
    if (!strcmp(id, "A_VORBIS")) return RWEBM_CODEC_VORBIS;
    if (!strcmp(id, "A_OPUS"))   return RWEBM_CODEC_OPUS;
    if (!strcmp(id, "V_MPEG4/ISO/AVC")) return RWEBM_CODEC_H264;
+   if (!strcmp(id, "V_MPEGH/ISO/HEVC")) return RWEBM_CODEC_H265;
    /* A_AAC with a profile suffix (e.g. A_AAC/MPEG4/LC) appears in older
     * muxes; the CodecPrivate AudioSpecificConfig is authoritative
     * either way. */
@@ -462,6 +497,18 @@ static void parse_track_av(const uint8_t *p, const uint8_t *end,
                   case ID_MATRIXCOEFF:
                      trk->matrix_coefficients     = (unsigned)be_uint(cb, (size_t)csz);
                      break;
+                  case ID_CHROMASITINGHORZ:
+                  case ID_CHROMASITINGVERT:
+                  {
+                     uint64_t value = csz <= 8
+                           ? be_uint(cb, (size_t)csz) : 3;
+                     unsigned siting = value <= 2 ? (unsigned)value : 3;
+                     if (cid == ID_CHROMASITINGHORZ)
+                        trk->chroma_siting_horz = siting;
+                     else
+                        trk->chroma_siting_vert = siting;
+                     break;
+                  }
                   case ID_COLOURRANGE:
                      trk->colour_range            = (unsigned)be_uint(cb, (size_t)csz);
                      break;
@@ -496,11 +543,14 @@ static void parse_track_av(const uint8_t *p, const uint8_t *end,
 
 /* Parse one TrackEntry into 'trk'. Range is [p,end). */
 static void parse_track_entry(const uint8_t *p, const uint8_t *end,
-      rwebm_track *trk)
+      rwebm_track *trk, struct rwebm_language *language)
 {
    ebml_reader r;
    r.p = p; r.end = end;
    memset(trk, 0, sizeof(*trk));
+   language->text = "eng";
+   language->length = 3;
+   language->kind = RWEBM_LANGUAGE_LEGACY;
    while (r.p < r.end)
    {
       int      ok;
@@ -532,6 +582,18 @@ static void parse_track_entry(const uint8_t *p, const uint8_t *end,
             trk->codec       = codec_from_id(trk->codec_id);
             break;
          }
+         case ID_LANGUAGE:
+            if (language->kind == RWEBM_LANGUAGE_BCP47)
+               break;
+            language->text = (const char*)body;
+            language->length = (size_t)sz;
+            language->kind = RWEBM_LANGUAGE_LEGACY;
+            break;
+         case ID_LANGUAGEBCP47:
+            language->text = (const char*)body;
+            language->length = (size_t)sz;
+            language->kind = RWEBM_LANGUAGE_BCP47;
+            break;
          case ID_CODECPRIVATE:
             trk->codec_private      = body;
             trk->codec_private_size = (size_t)sz;
@@ -594,6 +656,8 @@ size_t rwebm_consumed(const rwebm_t *m)
    const uint8_t *next;
    if (!m || !m->cur) return 0;
    next = m->cur;
+   if (m->pending_additions && m->pending_additions < next)
+      next = m->pending_additions;
    if (m->lace_index < m->lace_count && m->lace_frame_ptr[m->lace_index] < next)
       next = m->lace_frame_ptr[m->lace_index];
    return (size_t)(next - m->data);
@@ -604,6 +668,20 @@ const rwebm_track *rwebm_get_track(const rwebm_t *webm, int index)
    if (!webm || index < 0 || index >= webm->num_tracks)
       return NULL;
    return &webm->tracks[index];
+}
+
+const char *rwebm_get_track_language(const rwebm_t *webm, int index,
+      size_t *length, enum rwebm_language_kind *kind)
+{
+   const struct rwebm_language *language;
+   if (length) *length = 0;
+   if (kind) *kind = RWEBM_LANGUAGE_NONE;
+   if (!webm || index < 0 || index >= webm->num_tracks)
+      return NULL;
+   language = &webm->languages[index];
+   if (length) *length = language->length;
+   if (kind) *kind = language->kind;
+   return language->text;
 }
 
 void rwebm_close(rwebm_t *webm)
@@ -644,7 +722,7 @@ int rwebm_num_cues(const rwebm_t *webm)
    return webm ? webm->num_cues : 0;
 }
 
-static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
+static int webm_cue_index(const rwebm_t *webm, int64_t ns)
 {
    int64_t ticks;
    int     lo, hi, best;
@@ -672,6 +750,19 @@ static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
       else
          hi = mid - 1;
    }
+   return best;
+}
+
+int64_t rwebm_cue_time_ns(const rwebm_t *webm, int64_t ns)
+{
+   int best = webm_cue_index(webm, ns);
+   return best < 0 ? -1 : webm->cues[best].time_ticks * webm->timestamp_scale;
+}
+
+static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
+{
+   int best = webm_cue_index(webm, ns);
+   if (best < 0) return -1;
    {
       const uint8_t *at = webm->seg_body + webm->cues[best].cluster_pos;
       /* Under a partial read the target may be past the wall; say so
@@ -686,6 +777,10 @@ static int64_t webm_select_time_ns(rwebm_t *webm, int64_t ns, int resident)
    webm->lace_count      = 0;
    webm->lace_index      = 0;
    webm->pending_discard = 0;
+   webm->pending_duration = -1;
+   webm->pending_additions = NULL;
+   webm->pending_additions_size = 0;
+   webm->pending_reference = 0;
    webm->need_hi         = 0;
    return webm->cues[best].time_ticks * webm->timestamp_scale;
 }
@@ -708,6 +803,10 @@ void rwebm_rewind(rwebm_t *webm)
    webm->cluster_ts = 0;
    webm->lace_count = 0;
    webm->lace_index = 0;
+   webm->pending_duration = -1;
+   webm->pending_additions = NULL;
+   webm->pending_additions_size = 0;
+   webm->pending_reference = 0;
    webm->need_hi    = 0;
 }
 
@@ -732,10 +831,12 @@ void rwebm_set_inert_callback(rwebm_t *webm,
  * the Block (already captured in pending_discard) or after it within
  * the same BlockGroup, so scan the remaining group siblings. */
 static int64_t webm_group_discard(rwebm_t *webm, const uint8_t *p,
-      const uint8_t *group_end)
+      const uint8_t *group_end, int *keyframe)
 {
    int64_t v = webm->pending_discard;
    ebml_reader s;
+   *keyframe = !webm->pending_reference;
+   webm->pending_reference = 0;
    webm->pending_discard = 0;
    s.p   = p;
    s.end = group_end;
@@ -748,19 +849,225 @@ static int64_t webm_group_discard(rwebm_t *webm, const uint8_t *p,
          break;
       if (id == ID_DISCARDPADDING && sz >= 1 && sz <= 8)
          v = ebml_sint(s.p, (size_t)sz);
+      if (id == ID_REFERENCEBLOCK)
+         *keyframe = 0;
       s.p += sz;
    }
    return v;
 }
 
-int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
+static int64_t webm_duration_ns(rwebm_t *webm, const uint8_t *data, size_t size)
+{
+   uint64_t ticks, limit = (~(uint64_t)0) >> 1;
+   if (!size || size > 8 || webm->timestamp_scale <= 0)
+      return -2;
+   ticks = be_uint(data, size);
+   if (ticks > limit / (uint64_t)webm->timestamp_scale)
+      return -2;
+   return (int64_t)(ticks * (uint64_t)webm->timestamp_scale);
+}
+
+static void webm_group_metadata(rwebm_t *webm, const uint8_t *p,
+      const uint8_t *group_end, rwebm_packet *pkt)
+{
+   ebml_reader reader;
+   pkt->duration_ns = webm->pending_duration;
+   pkt->block_additions = webm->pending_additions;
+   pkt->block_additions_size = webm->pending_additions_size;
+   webm->pending_duration = -1;
+   webm->pending_additions = NULL;
+   webm->pending_additions_size = 0;
+   reader.p = p; reader.end = group_end;
+   while (reader.p < reader.end)
+   {
+      int ok;
+      uint32_t id = ebml_read_id(&reader);
+      uint64_t size = ebml_read_vint(&reader, 1, &ok);
+      if (!id || !ok || size > (uint64_t)(reader.end - reader.p))
+         break;
+      if (id == ID_BLOCKDURATION)
+         pkt->duration_ns = webm_duration_ns(webm, reader.p, (size_t)size);
+      else if (id == ID_BLOCKADDITIONS)
+      {
+         pkt->block_additions = reader.p;
+         pkt->block_additions_size = (size_t)size;
+      }
+      reader.p += (size_t)size;
+   }
+}
+
+int rwebm_packet_addition(const rwebm_packet *packet, uint64_t wanted,
+      const uint8_t **data, size_t *size)
+{
+   ebml_reader reader;
+   unsigned walked = 0;
+   int found = 0;
+   if (!packet || !data || !size || !wanted)
+      return -1;
+   *data = NULL;
+   *size = 0;
+   if (!packet->block_additions_size)
+      return 0;
+   if (!packet->block_additions)
+      return -1;
+   reader.p = packet->block_additions;
+   reader.end = reader.p + packet->block_additions_size;
+   while (reader.p < reader.end)
+   {
+      int ok;
+      uint32_t id;
+      uint64_t length;
+      if (++walked > 256) return -1;
+      id = ebml_read_id(&reader);
+      length = ebml_read_vint(&reader, 1, &ok);
+      if (!id || !ok || length > (uint64_t)(reader.end - reader.p)) return -1;
+      if (id == 0xa6)
+      {
+         ebml_reader more;
+         uint64_t add_id = 1;
+         const uint8_t *payload = NULL;
+         size_t payload_size = 0;
+         int have_id = 0;
+         more.p = reader.p;
+         more.end = more.p + (size_t)length;
+         while (more.p < more.end)
+         {
+            uint32_t child;
+            uint64_t bytes;
+            if (++walked > 256) return -1;
+            child = ebml_read_id(&more);
+            bytes = ebml_read_vint(&more, 1, &ok);
+            if (!child || !ok || bytes > (uint64_t)(more.end - more.p)) return -1;
+            if (child == 0xee)
+            {
+               if (have_id || !bytes || bytes > 8) return -1;
+               add_id = be_uint(more.p, (size_t)bytes);
+               if (!add_id) return -1;
+               have_id = 1;
+            }
+            else if (child == 0xa5)
+            {
+               if (payload) return -1;
+               payload = more.p;
+               payload_size = (size_t)bytes;
+            }
+            more.p += (size_t)bytes;
+         }
+         if (!payload) return -1;
+         if (add_id == wanted)
+         {
+            if (found) return -1;
+            found = 1;
+            *data = payload;
+            *size = payload_size;
+         }
+      }
+      reader.p += (size_t)length;
+   }
+   return found;
+}
+
+static int webm_group_selected(rwebm_t *webm, const uint8_t *body,
+      size_t size, int selected)
+{
+   const uint8_t *end = body + size;
+   ebml_reader group;
+   unsigned walked = 0;
+   group.p = body;
+   group.end = end < webm->avail_end ? end : webm->avail_end;
+   while (group.p < end)
+   {
+      int ok;
+      uint32_t id;
+      uint64_t length;
+      const uint8_t *child = group.p;
+      if (walked++ == 256) return 1;
+      id = ebml_read_id(&group);
+      length = ebml_read_vint(&group, 1, &ok);
+      if (!id || !ok)
+      {
+         size_t prefix = (size_t)(end - child);
+         if (prefix > 12) prefix = 12;
+         if ((size_t)(group.end - child) >= prefix) return -1;
+         webm->need_hi = (size_t)(child - webm->data) + prefix;
+         return RWEBM_READ_AGAIN;
+      }
+      if (length > (uint64_t)(end - group.p)) return -1;
+      if (id == ID_BLOCK)
+      {
+         uint64_t number;
+         size_t prefix = length < 11 ? (size_t)length : 11;
+         ebml_reader block;
+         block.p = group.p;
+         block.end = length < (uint64_t)(group.end - group.p)
+            ? group.p + (size_t)length : group.end;
+         number = ebml_read_vint(&block, 1, &ok);
+         if (!ok || block.end - block.p < 3)
+         {
+            if ((size_t)(group.end - group.p) >= prefix) return -1;
+            webm->need_hi = (size_t)(group.p - webm->data) + prefix;
+            return RWEBM_READ_AGAIN;
+         }
+         return number == (uint64_t)webm->tracks[selected].number;
+      }
+      group.p += (size_t)length;
+      if (group.p > group.end)
+      {
+         size_t prefix = (size_t)(end - group.p);
+         if (!prefix) return -1;
+         if (prefix > 12) prefix = 12;
+         webm->need_hi = (size_t)(group.p - webm->data) + prefix;
+         return RWEBM_READ_AGAIN;
+      }
+   }
+   return -1;
+}
+
+static int webm_lace_time(rwebm_t *webm, rwebm_packet *pkt, unsigned index)
+{
+   const rwebm_track *track = &webm->tracks[webm->lace_track];
+   uint64_t offset, limit = (~(uint64_t)0) >> 1;
+   if (track->type != RWEBM_TRACK_VIDEO)
+      return 1;
+   if (webm->lace_duration == -2)
+      return -1;
+   if (webm->lace_duration >= 0)
+   {
+      uint64_t duration = (uint64_t)webm->lace_duration;
+      uint64_t count = (unsigned)webm->lace_count;
+      uint64_t whole = duration / count, part = duration % count;
+      offset = whole * index + part * index / count;
+      pkt->duration_ns = (int64_t)(whole * (index + 1)
+            + part * (index + 1) / count - offset);
+   }
+   else
+   {
+      if (index && track->default_duration_ns > limit / index)
+         return -1;
+      offset = track->default_duration_ns * index;
+   }
+   if (pkt->timestamp > (int64_t)(limit - offset))
+      return -1;
+   pkt->timestamp += (int64_t)offset;
+   return 1;
+}
+
+static int rwebm_read_packet_filtered(rwebm_t *webm, rwebm_packet *pkt,
+      int selected)
 {
    ebml_reader r;
+   unsigned walked = 0;
    if (!webm || !pkt)
       return -1;
    webm->need_hi = 0;
    pkt->timestamp_continuation = 0;
+   pkt->duration_ns = -1;
+   pkt->block_additions = NULL;
+   pkt->block_additions_size = 0;
 
+   /* A caller changing tracks must not receive the previous track's lace. */
+   if (selected >= 0 && webm->lace_track != selected)
+      webm->lace_index = webm->lace_count;
    /* Drain a laced block first. */
    if (webm->lace_index < webm->lace_count)
    {
@@ -773,7 +1080,7 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
       pkt->keyframe  = webm->lace_keyframe;
       pkt->discard_padding = (webm->lace_index == webm->lace_count)
          ? webm->lace_discard : 0;
-      return 1;
+      return webm_lace_time(webm, pkt, (unsigned)i);
    }
 
    /* Parse against the available prefix only: bytes past avail_end are
@@ -781,12 +1088,23 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
     * so an element crossing it must not be parsed - or consumed.  When
     * avail_end == segment_end this clamp is the old behaviour. */
    r.p = webm->cur; r.end = webm->avail_end;
-   while (r.p < r.end)
+   while (r.p < r.end
+         || (selected >= 0 && r.p < webm->avail_end))
    {
-      int      ok;
-      uint32_t id  = ebml_read_id(&r);
-      uint64_t sz  = ebml_read_vint(&r, 1, &ok);
-      const uint8_t *body = r.p;
+      int ok;
+      uint32_t id;
+      uint64_t sz;
+      const uint8_t *body;
+      if (selected >= 0 && r.p >= r.end)
+         r.end = webm->avail_end;
+      if (selected >= 0 && walked++ == 256)
+      {
+         webm->cur = r.p;
+         return RWEBM_READ_YIELD;
+      }
+      id = ebml_read_id(&r);
+      sz = ebml_read_vint(&r, 1, &ok);
+      body = r.p;
       if (!id || !ok)
       {
          if (webm->avail_end < webm->segment_end)
@@ -825,6 +1143,44 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
          continue;
       }
       if (sz > (uint64_t)(webm->segment_end - body)) return -1;
+      if (selected >= 0 && id == ID_BLOCKGROUP)
+      {
+         int match = webm_group_selected(webm, body, (size_t)sz, selected);
+         if (match < 0 || match == RWEBM_READ_AGAIN) return match;
+         if (!match)
+         {
+            r.p = body + (size_t)sz;
+            webm->cur = r.p;
+            continue;
+         }
+      }
+      if (selected >= 0 && id == ID_SIMPLEBLOCK)
+      {
+         ebml_reader block;
+         uint64_t number;
+         size_t prefix = sz < 11 ? (size_t)sz : 11;
+         block.p = body;
+         block.end = body + ((uint64_t)(r.end - body) < sz
+               ? (size_t)(r.end - body) : (size_t)sz);
+         number = ebml_read_vint(&block, 1, &ok);
+         if (!ok || block.end - block.p < 3)
+         {
+            if ((size_t)(r.end - body) < prefix)
+            {
+               webm->need_hi = (size_t)(body - webm->data) + prefix;
+               return RWEBM_READ_AGAIN;
+            }
+            return -1;
+         }
+         if (number != (uint64_t)webm->tracks[selected].number)
+         {
+            /* Only this cursor ignores the payload. It is not globally
+             * inert: a separate video cursor may still need its bytes. */
+            r.p = body + (size_t)sz;
+            webm->cur = r.p;
+            continue;
+         }
+      }
       if (sz > (uint64_t)(r.end - body))
       {
          /* Truncated at the wall: if the file continues past it, the
@@ -851,8 +1207,31 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
          /* Descend: BlockGroup wraps a single Block (plus
           * DiscardPadding/duration/refs). Scan children. */
          webm->pending_discard = 0;
+         webm->pending_reference = 0;
+         webm->pending_duration = -1;
+         webm->pending_additions = NULL;
+         webm->pending_additions_size = 0;
          r.p   = body;
          r.end = body + sz;
+         continue;
+      }
+      if (id == ID_REFERENCEBLOCK)
+      {
+         webm->pending_reference = 1;
+         r.p = body + sz;
+         continue;
+      }
+      if (id == ID_BLOCKDURATION)
+      {
+         webm->pending_duration = webm_duration_ns(webm, body, (size_t)sz);
+         r.p = body + sz;
+         continue;
+      }
+      if (id == ID_BLOCKADDITIONS)
+      {
+         webm->pending_additions = body;
+         webm->pending_additions_size = (size_t)sz;
+         r.p = body + sz;
          continue;
       }
       if (id == ID_DISCARDPADDING)
@@ -907,8 +1286,11 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
                               webm->timestamp_scale);
                pkt->keyframe  = (id == ID_SIMPLEBLOCK)
                               ? ((flags & 0x80) != 0) : 1;
+               if (id == ID_BLOCK)
+                  webm_group_metadata(webm, body + sz, r.end, pkt);
                pkt->discard_padding = (id == ID_BLOCK)
-                  ? webm_group_discard(webm, body + sz, r.end) : 0;
+                  ? webm_group_discard(webm, body + sz, r.end,
+                        &pkt->keyframe) : 0;
                webm->cur      = body + sz;
                return 1;
             }
@@ -1015,10 +1397,20 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
                   webm->lace_ts    = webm_scale_ts(
                                      webm->cluster_ts + rel_ts,
                                      webm->timestamp_scale);
-               webm->lace_discard = (id == ID_BLOCK)
-                  ? webm_group_discard(webm, body + sz, r.end) : 0;
                   webm->lace_keyframe = (id == ID_SIMPLEBLOCK)
                                       ? ((flags & 0x80) != 0) : 1;
+                  webm->lace_duration = -1;
+                  if (id == ID_BLOCK)
+                  {
+                     webm_group_metadata(webm, body + sz, r.end, pkt);
+                     webm->lace_duration = pkt->duration_ns;
+                     pkt->duration_ns = -1;
+                     pkt->block_additions = NULL;
+                     pkt->block_additions_size = 0;
+                  }
+                  webm->lace_discard = (id == ID_BLOCK)
+                     ? webm_group_discard(webm, body + sz, r.end,
+                           &webm->lace_keyframe) : 0;
                   for (j = 0; j < nframes; j++)
                   {
                      webm->lace_frame[j]     = sizes[j];
@@ -1037,7 +1429,7 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
                      pkt->discard_padding =
                         (webm->lace_index == webm->lace_count)
                         ? webm->lace_discard : 0;
-                     return 1;
+                     return webm_lace_time(webm, pkt, (unsigned)i);
                   }
                }
             }
@@ -1056,6 +1448,107 @@ int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
    }
    webm->cur = r.end;
    return 0;
+}
+
+int rwebm_read_packet(rwebm_t *webm, rwebm_packet *pkt)
+{
+   return rwebm_read_packet_filtered(webm, pkt, -1);
+}
+
+int rwebm_read_packet_track(rwebm_t *webm, int track, rwebm_packet *pkt)
+{
+   if (!webm || track < 0 || track >= webm->num_tracks)
+      return -1;
+   return rwebm_read_packet_filtered(webm, pkt, track);
+}
+
+/* SeekHead positions are relative to Segment data, not the file header. */
+static void parse_seekhead(rwebm_t *w, const uint8_t *p, const uint8_t *end)
+{
+   ebml_reader r;
+   r.p = p;
+   r.end = end;
+   while (r.p < r.end)
+   {
+      int ok;
+      uint32_t id = ebml_read_id(&r);
+      uint64_t size = ebml_read_vint(&r, 1, &ok);
+      const uint8_t *body = r.p;
+      if (!id || !ok || size > (uint64_t)(r.end - body))
+         break;
+      if (id == ID_SEEK)
+      {
+         ebml_reader q;
+         uint64_t target = 0, position = 0;
+         int have_position = 0;
+         q.p = body;
+         q.end = body + (size_t)size;
+         while (q.p < q.end)
+         {
+            uint32_t child = ebml_read_id(&q);
+            uint64_t length = ebml_read_vint(&q, 1, &ok);
+            const uint8_t *value = q.p;
+            if (!child || !ok || length > (uint64_t)(q.end - value))
+               break;
+            if (child == ID_SEEKID && length <= 4)
+               target = be_uint(value, (size_t)length);
+            else if (child == ID_SEEKPOSITION && length && length <= 8)
+            {
+               position = be_uint(value, (size_t)length);
+               have_position = 1;
+            }
+            q.p = value + (size_t)length;
+         }
+         if (target == ID_CUES && have_position
+               && position < (uint64_t)(w->segment_end - w->seg_body))
+            w->cues_at = (size_t)(w->seg_body - w->data) + (size_t)position;
+      }
+      r.p = body + (size_t)size;
+   }
+}
+
+size_t rwebm_cues_offset(const rwebm_t *w)
+{
+   return w && !w->cues_loaded ? w->cues_at : 0;
+}
+
+/* Decode only the separately admitted index span. No packet cursor moves. */
+int rwebm_load_cues(rwebm_t *w, const uint8_t *data, size_t available,
+      int track, size_t *needed)
+{
+   ebml_reader r;
+   uint32_t id;
+   uint64_t size;
+   size_t header;
+   int ok;
+   if (needed)
+      *needed = 12;
+   if (!w || !data || !needed || track <= 0
+         || w->cues_at > w->size || available > w->size - w->cues_at)
+      return -1;
+   if (available < 12)
+      return 0;
+   r.p = data;
+   r.end = data + available;
+   id = ebml_read_id(&r);
+   size = ebml_read_vint(&r, 1, &ok);
+   header = (size_t)(r.p - data);
+   if (id != ID_CUES || !ok || size > 4u * 1024u * 1024u
+         || w->cues_at > w->size || header > w->size - w->cues_at
+         || size > w->size - w->cues_at - header)
+   {
+      w->cues_loaded = 1;
+      return -1;
+   }
+   *needed = header + (size_t)size;
+   if (available < *needed)
+      return 0;
+   free(w->cues);
+   w->cues = NULL;
+   w->num_cues = 0;
+   parse_cues(w, r.p, r.p + (size_t)size, track);
+   w->cues_loaded = 1;
+   return 1;
 }
 
 /* ===== Open ===== */
@@ -1133,7 +1626,9 @@ rwebm_t *rwebm_open_memory_avail(const uint8_t *data, size_t size,
          const uint8_t *ebody = s.p;
          if (!eid || !ok || ebody + esz > s.end)
             break;
-         if (eid == ID_INFO)
+         if (eid == ID_SEEKHEAD)
+            parse_seekhead(w, ebody, ebody + esz);
+         else if (eid == ID_INFO)
          {
             ebml_reader ir;
             ir.p = ebody; ir.end = ebody + esz;
@@ -1171,15 +1666,18 @@ rwebm_t *rwebm_open_memory_avail(const uint8_t *data, size_t size,
                if (!tid || !tok || tbody + tsz > tr.end)
                   break;
                if (tid == ID_TRACKENTRY)
+               {
                   parse_track_entry(tbody, tbody + tsz,
-                        &w->tracks[w->num_tracks++]);
+                        &w->tracks[w->num_tracks], &w->languages[w->num_tracks]);
+                  w->num_tracks++;
+               }
                tr.p = tbody + tsz;
             }
             /* First cluster/data starts right after Tracks. */
             w->clusters_begin = ebody + esz;
          }
          else if (eid == ID_CUES)
-            parse_cues(w, ebody, ebody + esz);
+            parse_cues(w, ebody, ebody + esz, 0);
          s.p = ebody + esz;
       }
    }

@@ -62,6 +62,7 @@
  * contract for that lives with set_demuxed_ptr in the header. */
 
 #include <stdlib.h>
+#include <features/features_cpu.h>
 #include <string.h>
 
 #include <file/file_path.h>
@@ -1662,7 +1663,8 @@ static int audio_transfer_vorbis_pull(struct audio_transfer_vorbis *v,
       {
          int r;
          if ((v->seek_phase || v->time.enabled) && walked++ == 256) return -3;
-         r = rwebm_read_packet(v->demux, &pkt);
+         r = rwebm_read_packet_track(v->demux, v->track_idx, &pkt);
+         if (r == RWEBM_READ_YIELD) return -3;
          /* The walk reached the resident wall rather than the end of
           * the stream: the feeder has not got here yet.  Report it
           * apart from end of stream, so the drain returns short and
@@ -2718,12 +2720,12 @@ static int audio_transfer_flac_next(struct audio_transfer_flac *fl)
       rwebm_packet pkt;
       for (;;)
       {
-         int r = rwebm_read_packet(fl->demux, &pkt);
+         int r = rwebm_read_packet_track(fl->demux, fl->track_idx, &pkt);
          /* The resident wall is not the end of the stream.  The pull
           * still reports "no chunk" - nothing here consumed anything,
           * so the retry is exact - but the wall flag lets the read
           * surface the difference instead of ending the sound. */
-         if (r == RWEBM_READ_AGAIN)
+         if (r == RWEBM_READ_AGAIN || r == RWEBM_READ_YIELD)
          {
             fl->wall = 1;
             return 0;
@@ -4529,7 +4531,8 @@ static int audio_transfer_opus_pull(struct audio_transfer_opus *op,
       {
          int r;
          if ((op->seek_pending || op->time.enabled) && walked++ == 256) return -3;
-         r = rwebm_read_packet(op->demux, &pkt);
+         r = rwebm_read_packet_track(op->demux, op->track_idx, &pkt);
+         if (r == RWEBM_READ_YIELD) return -3;
          /* Resident wall, not end of stream: see the Vorbis pull. */
          if (r == RWEBM_READ_AGAIN)
          {
@@ -4935,7 +4938,8 @@ static int audio_transfer_aac_pull(struct audio_transfer_aac *ac,
          {
             int r;
             if (walked++ == 256) return 3; /* metadata yield, not a byte wall */
-            r = rwebm_read_packet(ac->wdemux, &wpkt);
+            r = rwebm_read_packet_track(ac->wdemux, ac->wtrack_idx, &wpkt);
+            if (r == RWEBM_READ_YIELD) return 3;
             /* Resident wall, not end of stream - the same distinction
              * the rmp4 branch below has always drawn; conflating them
              * here had a Matroska AAC voice end (and a looping one
@@ -5578,8 +5582,12 @@ opus_failed:
          const int64_t *pts = rmp4_track_pts(ac->demux, ac->track_idx, &count);
          unsigned walked;
          int found = 0;
+         int64_t started = cpu_features_get_time_usec();
          if (!flen || !pts || !count) goto failed;
-         for (walked = 0; ac->seek_scan < count && walked < 256; walked++)
+         /* These steps inspect resident timing tables, not coded audio.
+          * Yield by elapsed work rather than once per 256 packets: a
+          * long movie otherwise pays a worker wakeup for every batch. */
+         for (walked = 0; ac->seek_scan < count && walked < 65536; walked++)
          {
             size_t frames = (size_t)flen, trimmed;
             int64_t source;
@@ -5600,6 +5608,9 @@ opus_failed:
                      && ac->time.pending + (int64_t)frames > (int64_t)ac->seek_target))
             { found = 1; break; }
             ac->seek_scan++;
+            if (!(walked & 255)
+                  && cpu_features_get_time_usec() - started >= 4000)
+               break;
          }
          if (!found && ac->seek_scan < count) return 0;
          prime = ac->seek_scan > AUDIO_AAC_PREROLL

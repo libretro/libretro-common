@@ -27,6 +27,13 @@
 #include <retro_inline.h>
 #include <formats/rvp9_hw.h>
 #include <retro_atomic.h>
+#if defined(__GNUC__)
+#define RVP9_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER) && _MSC_VER >= 1300
+#define RVP9_NOINLINE __declspec(noinline)
+#else
+#define RVP9_NOINLINE
+#endif
 #ifdef HAVE_THREADS
 #include <rthreads/tpool.h>
 #include <rthreads/rthreads.h>
@@ -50,23 +57,79 @@ void rvp9_set_hw_backend(const rvp9_hw_backend_t *backend)
 #endif
 }
 
-bool rvp9_hw_backend_open(const rvp9_hdr *header, unsigned slots,
-      rvp9_hw_ops_t *ops, rvp9_hw_backend_t *backend)
+int rvp9_unset_hw_backend(const rvp9_hw_backend_t *backend)
+{
+   if (!backend)
+      return 0;
+#ifdef RETRO_ATOMIC_HAS_PTR
+   return retro_atomic_cas_ptr(&rvp9_backend, (void*)backend, NULL);
+#else
+   if (rvp9_backend != backend)
+      return 0;
+   rvp9_backend = NULL;
+   return 1;
+#endif
+}
+
+bool rvp9_hw_backend_open_config(const rvp9_hdr *header,
+      const video_color_metadata_t *color, const rvp9_config_t *config,
+      unsigned slots, rvp9_hw_ops_t *ops, rvp9_hw_backend_t *backend)
 {
    const rvp9_hw_backend_t *factory = RVP9_BACKEND_GET();
-   if (!ops || !backend) return false;
-   memset(ops, 0, sizeof(*ops)); memset(backend, 0, sizeof(*backend));
-   if (!header || slots < 10 || slots > 32 || !factory || !factory->open || !factory->close)
+   video_color_metadata_t resolved;
+   bool opened;
+   if (!ops || !backend)
       return false;
-   if (!factory->open(factory->user, header, slots, ops)
-         || !ops->decoder || !ops->decode || !ops->output)
+   memset(ops, 0, sizeof(*ops));
+   memset(backend, 0, sizeof(*backend));
+   if (!header || slots < 10 || slots > 32 || !factory
+         || (!factory->open && !factory->open_color && !factory->open_config)
+         || !factory->close)
+      return false;
+   if (factory->drain && !factory->packet_decoder)
+      return false;
+   if (config)
    {
-      if (ops->decoder) factory->close(ops);
+      if (config->profile != header->profile
+            || config->bit_depth != header->bit_depth || config->chroma > 3
+            || config->full_range != header->color_range
+            || header->subsampling_x != (config->chroma != 3)
+            || header->subsampling_y != (config->chroma < 2)
+            || (!factory->open_config && config->chroma != 1)
+            || !rvp9_config_apply_color(config, color, &resolved))
+         return false;
+      color = &resolved;
+   }
+   if ((config || (!factory->open && !factory->open_color))
+         && factory->open_config)
+      opened = factory->open_config(factory->user, header, color,
+            config, slots, ops);
+   else
+      opened = factory->open_color
+         ? factory->open_color(factory->user, header, color, slots, ops)
+         : factory->open(factory->user, header, slots, ops);
+   if (!opened || !ops->decoder || !ops->decode || !ops->output)
+   {
+      if (ops->decoder)
+         factory->close(ops);
       memset(ops, 0, sizeof(*ops));
       return false;
    }
    *backend = *factory;
    return true;
+}
+
+bool rvp9_hw_backend_open_color(const rvp9_hdr *header,
+      const video_color_metadata_t *color, unsigned slots,
+      rvp9_hw_ops_t *ops, rvp9_hw_backend_t *backend)
+{
+   return rvp9_hw_backend_open_config(header, color, NULL, slots, ops, backend);
+}
+
+bool rvp9_hw_backend_open(const rvp9_hdr *header, unsigned slots,
+      rvp9_hw_ops_t *ops, rvp9_hw_backend_t *backend)
+{
+   return rvp9_hw_backend_open_color(header, NULL, slots, ops, backend);
 }
 
 /* Tile columns decoded side by side at most; VP9 allows 64. */
@@ -348,15 +411,6 @@ static const int16_t rvp9_nb_0_2[34] = {
    6,6,2,2,3,3,10,10,7,7,11,11,0,0
 };
 
-static const int16_t rvp9_scan_0_3[16] = {
-   0,4,1,5,8,2,12,9,3,6,13,10,7,14,11,15
-};
-
-static const int16_t rvp9_nb_0_3[34] = {
-   0,0,0,0,0,0,1,4,4,4,1,1,8,8,5,8,2,2,2,5,
-   9,12,6,9,3,6,10,13,7,10,11,14,0,0
-};
-
 static const int16_t rvp9_scan_1_0[64] = {
    0,8,1,16,9,2,17,24,10,3,18,25,32,11,4,26,33,19,40,12,
    34,27,5,41,20,48,13,35,42,28,21,6,49,56,36,43,29,7,14,50,
@@ -406,23 +460,6 @@ static const int16_t rvp9_nb_1_2[130] = {
    5,5,21,21,51,51,29,29,6,6,44,44,14,14,6,6,37,37,52,52,
    22,22,7,7,30,30,45,45,15,15,38,38,23,23,53,53,31,31,46,46,
    39,39,54,54,47,47,55,55,0,0
-};
-
-static const int16_t rvp9_scan_1_3[64] = {
-   0,8,1,16,9,2,17,24,10,3,18,25,32,11,4,26,33,19,40,12,
-   34,27,5,41,20,48,13,35,42,28,21,6,49,56,36,43,29,7,14,50,
-   57,44,22,37,15,51,58,30,45,23,52,59,38,31,60,53,46,39,61,54,
-   47,62,55,63
-};
-
-static const int16_t rvp9_nb_1_3[130] = {
-   0,0,0,0,0,0,8,8,1,8,1,1,9,16,16,16,2,9,2,2,
-   10,17,17,24,24,24,3,10,3,3,18,25,25,32,11,18,32,32,4,11,
-   26,33,19,26,4,4,33,40,12,19,40,40,5,12,27,34,34,41,20,27,
-   13,20,5,5,41,48,48,48,28,35,35,42,21,28,6,6,6,13,42,49,
-   49,56,36,43,14,21,29,36,7,14,43,50,50,57,22,29,37,44,15,22,
-   44,51,51,58,30,37,23,30,52,59,45,52,38,45,31,38,53,60,46,53,
-   39,46,54,61,47,54,55,62,0,0
 };
 
 static const int16_t rvp9_scan_2_0[256] = {
@@ -558,51 +595,6 @@ static const int16_t rvp9_nb_2_2[514] = {
    95,95,219,219,142,142,204,204,235,235,111,111,158,158,127,127,189,189,220,220,
    143,143,174,174,205,205,236,236,159,159,190,190,221,221,175,175,237,237,206,206,
    222,222,191,191,238,238,207,207,223,223,239,239,0,0
-};
-
-static const int16_t rvp9_scan_2_3[256] = {
-   0,16,1,32,17,2,48,33,18,3,64,34,49,19,65,80,50,4,35,66,
-   20,81,96,51,5,36,82,97,67,112,21,52,98,37,83,113,6,68,128,53,
-   22,99,114,84,7,129,38,69,100,115,144,130,85,54,23,8,145,39,70,116,
-   101,131,160,146,55,86,24,71,132,117,161,40,9,102,147,176,162,87,56,25,
-   133,118,177,148,72,103,41,163,10,192,178,88,57,134,149,119,26,164,73,104,
-   193,42,179,208,11,135,89,165,120,150,58,194,180,27,74,209,105,151,136,43,
-   90,224,166,195,181,121,210,59,12,152,106,167,196,75,137,225,211,240,182,122,
-   91,28,197,13,226,168,183,153,44,212,138,107,241,60,29,123,198,184,227,169,
-   242,76,213,154,45,92,14,199,139,61,228,214,170,185,243,108,77,155,30,15,
-   200,229,124,215,244,93,46,186,171,201,109,140,230,62,216,245,31,125,78,156,
-   231,47,187,202,217,94,246,141,63,232,172,110,247,157,79,218,203,126,233,188,
-   248,95,173,142,219,111,249,234,158,127,189,204,250,235,143,174,220,205,159,251,
-   190,221,175,236,237,191,206,252,222,253,207,238,223,254,239,255
-};
-
-static const int16_t rvp9_nb_2_3[514] = {
-   0,0,0,0,0,0,16,16,1,16,1,1,32,32,17,32,2,17,2,2,
-   48,48,18,33,33,48,3,18,49,64,64,64,34,49,3,3,19,34,50,65,
-   4,19,65,80,80,80,35,50,4,4,20,35,66,81,81,96,51,66,96,96,
-   5,20,36,51,82,97,21,36,67,82,97,112,5,5,52,67,112,112,37,52,
-   6,21,83,98,98,113,68,83,6,6,113,128,22,37,53,68,84,99,99,114,
-   128,128,114,129,69,84,38,53,7,22,7,7,129,144,23,38,54,69,100,115,
-   85,100,115,130,144,144,130,145,39,54,70,85,8,23,55,70,116,131,101,116,
-   145,160,24,39,8,8,86,101,131,146,160,160,146,161,71,86,40,55,9,24,
-   117,132,102,117,161,176,132,147,56,71,87,102,25,40,147,162,9,9,176,176,
-   162,177,72,87,41,56,118,133,133,148,103,118,10,25,148,163,57,72,88,103,
-   177,192,26,41,163,178,192,192,10,10,119,134,73,88,149,164,104,119,134,149,
-   42,57,178,193,164,179,11,26,58,73,193,208,89,104,135,150,120,135,27,42,
-   74,89,208,208,150,165,179,194,165,180,105,120,194,209,43,58,11,11,136,151,
-   90,105,151,166,180,195,59,74,121,136,209,224,195,210,224,224,166,181,106,121,
-   75,90,12,27,181,196,12,12,210,225,152,167,167,182,137,152,28,43,196,211,
-   122,137,91,106,225,240,44,59,13,28,107,122,182,197,168,183,211,226,153,168,
-   226,241,60,75,197,212,138,153,29,44,76,91,13,13,183,198,123,138,45,60,
-   212,227,198,213,154,169,169,184,227,242,92,107,61,76,139,154,14,29,14,14,
-   184,199,213,228,108,123,199,214,228,243,77,92,30,45,170,185,155,170,185,200,
-   93,108,124,139,214,229,46,61,200,215,229,244,15,30,109,124,62,77,140,155,
-   215,230,31,46,171,186,186,201,201,216,78,93,230,245,125,140,47,62,216,231,
-   156,171,94,109,231,246,141,156,63,78,202,217,187,202,110,125,217,232,172,187,
-   232,247,79,94,157,172,126,141,203,218,95,110,233,248,218,233,142,157,111,126,
-   173,188,188,203,234,249,219,234,127,142,158,173,204,219,189,204,143,158,235,250,
-   174,189,205,220,159,174,220,235,221,236,175,190,190,205,236,251,206,221,237,252,
-   191,206,222,237,207,222,238,253,223,238,239,254,0,0
 };
 
 static const int16_t rvp9_scan_3_0[1024] = {
@@ -1728,6 +1720,16 @@ static void rvp9_diff_update_prob(rvp9_br *r, uint8_t *p)
    }
 }
 
+/* Bound probability-loop unrolling and its address-register spills. */
+static RVP9_NOINLINE void rvp9_update_coef_band(rvp9_br *r,
+      uint8_t probs[RVP9_COEFF_CONTEXTS][RVP9_UNCONSTRAINED], int contexts)
+{
+   int context, node;
+   for (context = 0; context < contexts; context++)
+      for (node = 0; node < RVP9_UNCONSTRAINED; node++)
+         rvp9_diff_update_prob(r, &probs[context][node]);
+}
+
 /* ==================================================================== */
 /* Frame context: probability tables adapted across frames.             */
 /* Sizes per libvpx vp9_entropymode.h / vp9_entropy.h.                  */
@@ -1740,7 +1742,7 @@ static int rvp9_parse_compressed_intra(const uint8_t *data, size_t sz,
       const rvp9_hdr *hd, rvp9_frame_ctx *fc, rvp9_br *r_out)
 {
    rvp9_br r;
-   int tx_mode, i, j, k, l, m;
+   int tx_mode, i, j, k, l;
    static const int band_ctx[RVP9_COEF_BANDS] = { 3, 6, 6, 6, 6, 6 };
    static const int biggest_tx[5] = { 0, 1, 2, 3, 3 };
 
@@ -1769,13 +1771,7 @@ static int rvp9_parse_compressed_intra(const uint8_t *data, size_t sz,
          for (j = 0; j < RVP9_PLANE_TYPES; j++)
             for (k = 0; k < RVP9_REF_TYPES; k++)
                for (l = 0; l < RVP9_COEF_BANDS; l++)
-               {
-                  int c;
-                  for (c = 0; c < band_ctx[l]; c++)
-                     for (m = 0; m < RVP9_UNCONSTRAINED; m++)
-                        rvp9_diff_update_prob(&r,
-                           &fc->coef[i][j][k][l][c][m]);
-               }
+                  rvp9_update_coef_band(&r, fc->coef[i][j][k][l], band_ctx[l]);
    }
    for (i = 0; i < RVP9_SKIP_CONTEXTS; i++)
       rvp9_diff_update_prob(&r, &fc->skip[i]);
@@ -2700,7 +2696,8 @@ static int rvp9_decode_coefs(rvp9_dec *d, int plane_type, int is_inter,
    unsigned (*eob_counts)[RVP9_COEFF_CONTEXTS] =
       d->cnt.eob_branch[tx_size][plane_type][is_inter];
    const uint8_t *prob;
-   uint8_t token_cache[32 * 32];
+   /* Entropy decode finishes before inverse transforms use this workspace. */
+   uint8_t *token_cache = (uint8_t*)d->iht_scratch;
    const uint8_t *band_translate =
       (tx_size == RVP9_TX_4X4) ? rvp9_coefband_4x4 : rvp9_coefband_8x8p;
    const int dq_shift = (tx_size == RVP9_TX_32X32);
@@ -2790,17 +2787,18 @@ static int rvp9_decode_coefs(rvp9_dec *d, int plane_type, int is_inter,
    return c;
 }
 
-/* scan order lookup: [tx][type] flattened via the dumped tables */
+/* scan order lookup: [tx][type] flattened via the dumped tables;
+ * ADST_ADST (type 3) scans as DCT_DCT does below 32x32 */
 static const int16_t *rvp9_scan_tab(int tx, int ty)
 {
    switch (tx * 4 + ty)
    {
       case 0:  return rvp9_scan_0_0;  case 1:  return rvp9_scan_0_1;
-      case 2:  return rvp9_scan_0_2;  case 3:  return rvp9_scan_0_3;
+      case 2:  return rvp9_scan_0_2;  case 3:  return rvp9_scan_0_0;
       case 4:  return rvp9_scan_1_0;  case 5:  return rvp9_scan_1_1;
-      case 6:  return rvp9_scan_1_2;  case 7:  return rvp9_scan_1_3;
+      case 6:  return rvp9_scan_1_2;  case 7:  return rvp9_scan_1_0;
       case 8:  return rvp9_scan_2_0;  case 9:  return rvp9_scan_2_1;
-      case 10: return rvp9_scan_2_2;  case 11: return rvp9_scan_2_3;
+      case 10: return rvp9_scan_2_2;  case 11: return rvp9_scan_2_0;
       default: return rvp9_scan_3_0;
    }
 }
@@ -2809,11 +2807,11 @@ static const int16_t *rvp9_nb_tab(int tx, int ty)
    switch (tx * 4 + ty)
    {
       case 0:  return rvp9_nb_0_0;  case 1:  return rvp9_nb_0_1;
-      case 2:  return rvp9_nb_0_2;  case 3:  return rvp9_nb_0_3;
+      case 2:  return rvp9_nb_0_2;  case 3:  return rvp9_nb_0_0;
       case 4:  return rvp9_nb_1_0;  case 5:  return rvp9_nb_1_1;
-      case 6:  return rvp9_nb_1_2;  case 7:  return rvp9_nb_1_3;
+      case 6:  return rvp9_nb_1_2;  case 7:  return rvp9_nb_1_0;
       case 8:  return rvp9_nb_2_0;  case 9:  return rvp9_nb_2_1;
-      case 10: return rvp9_nb_2_2;  case 11: return rvp9_nb_2_3;
+      case 10: return rvp9_nb_2_2;  case 11: return rvp9_nb_2_0;
       default: return rvp9_nb_3_0;
    }
 }

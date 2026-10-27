@@ -184,7 +184,11 @@ enum ngx_dlss_render_preset
 #define NGX_PARAM_PERF_QUALITY   "PerfQualityValue"
 #define NGX_PARAM_JITTER_OFFSET_X "Jitter.Offset.X"
 #define NGX_PARAM_JITTER_OFFSET_Y "Jitter.Offset.Y"
-#define NGX_PARAM_TRANSPARENCY_MASK "TransparencyMask"
+/* The mask of pixels to take from this frame over the history
+ * (particles, translucency): "TransparencyMask" is reserved, unread */
+#define NGX_PARAM_BIAS_CURRENT_COLOR_MASK   "DLSS.Input.Bias.Current.Color.Mask"
+#define NGX_PARAM_BIAS_CURRENT_COLOR_BASE_X "DLSS.Input.Bias.Current.Color.Subrect.Base.X"
+#define NGX_PARAM_BIAS_CURRENT_COLOR_BASE_Y "DLSS.Input.Bias.Current.Color.Subrect.Base.Y"
 #define NGX_PARAM_EXPOSURE_TEXTURE  "ExposureTexture"
 #define NGX_PARAM_DLSS_CREATE_FLAGS "DLSS.Feature.Create.Flags"
 /* The render preset a mode uses (ngx_dlss_render_preset), one hint a mode */
@@ -510,6 +514,12 @@ bool ngx_stand_in_in(const char *dir);
 /* Loads NGX_STAND_IN_NAME from @dir, kept loaded: only before
  * ngx_lib_get() has loaded the core library. True once it is in. */
 bool ngx_lib_load_stand_in(const char *dir);
+
+/* Keeps the feature libraries NGX has loaded from @dir (DLSS's, Neural
+ * Rendering's) loaded until the process ends, so that NGX made again on
+ * another device finds them in instead of loading them again. Call
+ * after a feature is made; loads nothing itself. */
+void ngx_lib_keep_features(const char *dir);
 
 /* Whether there is an NGX core library to load (NGX_PRESENT_FOUND)
  * and whether it is OptiScaler (NGX_PRESENT_OPTISCALER), as a status
