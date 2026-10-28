@@ -255,6 +255,109 @@ int r7z_bcj2_decode_part(r7z_bcj2_state_t *st,
    return RBCJ2_OK;
 }
 
+/* Whether @in has @n octets left, or is all there is */
+#define BCJ2_HAS(in, n) ((in)->len - (in)->pos >= (n) || !(in)->more)
+
+int r7z_bcj2_decode_in(r7z_bcj2_state_t *st,
+      uint8_t *dst, size_t dst_cap, size_t *wrote,
+      r7z_bcj2_in_t *main_in, r7z_bcj2_in_t *call_in,
+      r7z_bcj2_in_t *jump_in, r7z_bcj2_in_t *rc_in)
+{
+   size_t pos = 0;
+   *wrote = 0;
+   if (!st || dst_cap <= 4)
+      return RBCJ2_ERROR_PARAM;
+
+   if (!st->started)
+   {
+      const uint8_t *r = rc_in->p + rc_in->pos;
+      if (!BCJ2_HAS(rc_in, 5))
+         return RBCJ2_PENDING;
+      if (rc_in->len - rc_in->pos < 5 || r[0] != 0)
+         return RBCJ2_ERROR_DATA;
+      st->code = ((uint32_t)r[1] << 24) | ((uint32_t)r[2] << 16)
+               | ((uint32_t)r[3] << 8)  |  (uint32_t)r[4];
+      if (st->code == 0xFFFFFFFFu)
+         return RBCJ2_ERROR_DATA;
+      st->range    = 0xFFFFFFFFu;
+      rc_in->pos  += 5;
+      st->started  = 1;
+   }
+
+   /* with room for a converted branch's four octets */
+   while (pos < dst_cap - 4 && main_in->pos < main_in->len)
+   {
+      uint8_t        b = main_in->p[main_in->pos];
+      uint32_t       idx, bound, ttt, val;
+      r7z_bcj2_in_t *t;
+
+      if (!IS_E8_OR_E9(b) && !IS_NEAR_JMP(st->prev, b))
+      {
+         dst[pos++] = b;
+         main_in->pos++;
+         st->ip++;
+         st->prev = b;
+         continue;
+      }
+
+      /* a candidate: what its bit and its target may take is there, or
+       * it waits, unread, for more */
+      t = b == 0xE8 ? call_in : jump_in;
+      if (!BCJ2_HAS(rc_in, 1) || !BCJ2_HAS(t, 4))
+         break;
+      dst[pos++] = b;
+      main_in->pos++;
+      st->ip++;
+
+      if (b == 0xE8)
+         idx = 2 + (uint32_t)st->prev;
+      else if (b == 0xE9)
+         idx = 1;
+      else
+         idx = 0;
+
+      if (st->range < TOP_VALUE)
+      {
+         if (rc_in->pos == rc_in->len)
+            return RBCJ2_ERROR_DATA;
+         st->range <<= 8;
+         st->code = (st->code << 8) | (uint32_t)rc_in->p[rc_in->pos++];
+      }
+
+      ttt   = (uint32_t)st->probs[idx];
+      bound = (st->range >> NUM_MODEL_BITS) * ttt;
+      if (st->code < bound)
+      {
+         st->range      = bound;
+         st->probs[idx] = (uint16_t)(ttt
+               + ((BIT_MODEL_TOTAL - ttt) >> NUM_MOVE_BITS));
+         st->prev       = b;
+         continue;
+      }
+      st->range     -= bound;
+      st->code      -= bound;
+      st->probs[idx] = (uint16_t)(ttt - (ttt >> NUM_MOVE_BITS));
+
+      if (t->len - t->pos < 4)
+         return RBCJ2_ERROR_DATA;
+      val = ((uint32_t)t->p[t->pos]     << 24)
+          | ((uint32_t)t->p[t->pos + 1] << 16)
+          | ((uint32_t)t->p[t->pos + 2] << 8)
+          |  (uint32_t)t->p[t->pos + 3];
+      t->pos  += 4;
+      st->ip  += 4;
+      val     -= st->ip;
+      dst[pos]     = (uint8_t)( val        & 0xFF);
+      dst[pos + 1] = (uint8_t)((val >>  8) & 0xFF);
+      dst[pos + 2] = (uint8_t)((val >> 16) & 0xFF);
+      dst[pos + 3] = (uint8_t)((val >> 24) & 0xFF);
+      pos         += 4;
+      st->prev     = (uint8_t)((val >> 24) & 0xFF);
+   }
+   *wrote = pos;
+   return RBCJ2_PENDING;
+}
+
 int r7z_bcj2_decode(uint8_t *dst, size_t dst_len,
       const uint8_t *main_buf, size_t main_len,
       const uint8_t *call_buf, size_t call_len,

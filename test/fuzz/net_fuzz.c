@@ -88,6 +88,17 @@ static void listener_start(void)
    pthread_create(&t, NULL, serve, NULL);
    pthread_detach(t);
 }
+
+/* The input is the fuzzer's only for the duration of the call: set for
+ * it and cleared at its end, so a connection the listener accepts
+ * after that gets nothing rather than a freed input. */
+static void fuzz_input(const uint8_t *data, size_t len)
+{
+   pthread_mutex_lock(&fuzz_lock);
+   fuzz_data = data;
+   fuzz_len  = len;
+   pthread_mutex_unlock(&fuzz_lock);
+}
 #endif
 
 #if defined(TARGET_TLS)
@@ -99,9 +110,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
    struct addrinfo *addr = NULL;
    int fd; void *ssl; uint8_t buf[64];
    if (listen_fd < 0) { network_init(); listener_start(); ssl_socket_set_verify_mode(2); }
-   pthread_mutex_lock(&fuzz_lock); fuzz_data = data; fuzz_len = len; pthread_mutex_unlock(&fuzz_lock);
+   fuzz_input(data, len);
    fd = socket_init((void**)&addr, listen_port, "127.0.0.1", SOCKET_TYPE_STREAM, AF_INET);
-   if (fd < 0 || !addr) return 0;
+   if (fd < 0 || !addr) { fuzz_input(NULL, 0); return 0; }
    ssl = ssl_socket_init(fd, "localhost");
    if (ssl)
    {
@@ -114,6 +125,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
       ssl_socket_free(ssl);
    }
    freeaddrinfo_retro(addr);
+   fuzz_input(NULL, 0);
    return 0;
 }
 #elif defined(TARGET_SMB)
@@ -123,10 +135,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
    struct rsmb_ctx *c;
    char server[64];
    if (listen_fd < 0) { network_init(); listener_start(); }
-   pthread_mutex_lock(&fuzz_lock); fuzz_data = data; fuzz_len = len; pthread_mutex_unlock(&fuzz_lock);
+   fuzz_input(data, len);
    snprintf(server, sizeof(server), "127.0.0.1");
    c = rsmb_new();
-   if (!c) return 0;
+   if (!c) { fuzz_input(NULL, 0); return 0; }
    rsmb_set_port(c, (uint16_t)listen_port);
    rsmb_set_credentials(c, "u", "p", "D");
    rsmb_set_timeout(c, 1);
@@ -134,14 +146,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
    {
       struct rsmb_stat st;
       struct rsmb_dir *d;
+      struct rsmb_file *f;
       rsmb_stat(c, "a", &st);
       if ((d = rsmb_opendir(c, "/")))
       {
          while (rsmb_readdir(c, d)) ;
          rsmb_closedir(c, d);
       }
+      /* READ replies are received into the caller's buffer */
+      if ((f = rsmb_open(c, "a", RSMB_O_RDONLY)))
+      {
+         static uint8_t buf[1 << 16];
+         rsmb_read(c, f, buf, sizeof(buf));
+         rsmb_close(c, f);
+      }
    }
    rsmb_free(c);
+   fuzz_input(NULL, 0);
    return 0;
 }
 #elif defined(TARGET_NFS)
@@ -150,9 +171,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
 {
    struct rnfs_ctx *c;
    if (listen_fd < 0) { network_init(); listener_start(); }
-   pthread_mutex_lock(&fuzz_lock); fuzz_data = data; fuzz_len = len; pthread_mutex_unlock(&fuzz_lock);
+   fuzz_input(data, len);
    c = rnfs_new();
-   if (!c) return 0;
+   if (!c) { fuzz_input(NULL, 0); return 0; }
    rnfs_set_ports(c, (uint16_t)listen_port, (uint16_t)listen_port);
    rnfs_set_timeout(c, 1);
    if (rnfs_connect(c, "127.0.0.1", "/export") == 0)
@@ -174,6 +195,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t len)
       }
    }
    rnfs_free(c);
+   fuzz_input(NULL, 0);
    return 0;
 }
 #elif defined(TARGET_X509)

@@ -45,13 +45,20 @@
 #define ZSTD_MAGIC         "\x28\xB5\x2F\xFD"
 #define ZSTD_MAGIC_LEN     4
 
+/* Bigger than this, a file bound for disk is written out a block at a
+ * time */
+#define ZSTD_STREAM_OVER   (256 * 1024)
+
 struct zstd_file_context
 {
+   file_archive_transfer_t *state;
    uint8_t *decompressed_data;
+   rzstd_blocks_t *zs;      /* the frame going out a block at a time */
+   uint8_t *in;             /* a block of it read, where it is not lent */
+   int64_t in_at;           /* where the next is read from */
    char inner_filename[PATH_MAX_LENGTH];
-   char archive_path[PATH_MAX_LENGTH];
    int64_t archive_size;
-   uint32_t decompressed_size;
+   size_t decompressed_size;
    bool parsed;
 };
 
@@ -65,6 +72,84 @@ static void zstd_derive_inner_filename(const char *path, char *s, size_t len)
    ext = strrchr(s, '.');
    if (ext && string_is_equal_noncase(ext, ".zst"))
       ((char*)ext)[0] = '\0';
+}
+
+/* The frame to be decoded a block at a time: from where the stream lends
+ * it whole, or else read a block at a time into a buffer of one */
+static bool zstd_src_begin(struct zstd_file_context *ctx)
+{
+   RFILE         *f   = ctx->state->archive_file;
+   const uint8_t *src = NULL;
+
+   rzstd_blocks_free(ctx->zs);
+   free(ctx->in);
+   ctx->zs    = NULL;
+   ctx->in    = NULL;
+   ctx->in_at = 0;
+   if ((uint64_t)ctx->archive_size <= (uint64_t)((size_t)-1))
+   {
+      filestream_seek(f, 0, RETRO_VFS_SEEK_POSITION_START);
+      if (filestream_view(f, ctx->archive_size, &src) == ctx->archive_size)
+         return (ctx->zs = rzstd_blocks_begin(src,
+                  (size_t)ctx->archive_size)) != NULL;
+   }
+   return    (ctx->in = (uint8_t*)malloc(RZSTD_WANT_MAX))
+          && (ctx->zs = rzstd_blocks_open());
+}
+
+/* The frame's next decoded octets: RZSTD_PROCESS_NEXT with some, or
+ * RZSTD_PROCESS_END or RZSTD_PROCESS_ERROR */
+static int zstd_src_next(struct zstd_file_context *ctx,
+      const uint8_t **data, size_t *len)
+{
+   RFILE *f = ctx->state->archive_file;
+
+   *data = NULL;
+   *len  = 0;
+   if (!ctx->in)
+      return rzstd_blocks_step(ctx->zs, data, len);
+   for (;;)
+   {
+      size_t want = rzstd_blocks_want(ctx->zs);
+      /* all of it out, and nothing after it */
+      if (!want)
+         return ctx->in_at == ctx->archive_size
+            ? RZSTD_PROCESS_END : RZSTD_PROCESS_ERROR;
+      if (want > RZSTD_WANT_MAX)
+         return RZSTD_PROCESS_ERROR;
+      filestream_seek(f, ctx->in_at, RETRO_VFS_SEEK_POSITION_START);
+      if (filestream_read(f, ctx->in, (int64_t)want) != (int64_t)want)
+         return RZSTD_PROCESS_ERROR;
+      ctx->in_at += (int64_t)want;
+      if (rzstd_blocks_give(ctx->zs, ctx->in, want, data, len)
+            != RZSTD_PROCESS_NEXT)
+         return RZSTD_PROCESS_ERROR;
+      if (*len)
+         return RZSTD_PROCESS_NEXT;
+   }
+}
+
+static void zstd_src_end(struct zstd_file_context *ctx)
+{
+   rzstd_blocks_free(ctx->zs);
+   free(ctx->in);
+   ctx->zs = NULL;
+   ctx->in = NULL;
+}
+
+/* The CRC of what the frame holds, decoded a block at a time */
+static bool zstd_frame_crc(struct zstd_file_context *ctx, uint32_t *crc)
+{
+   const uint8_t *blk;
+   size_t         len;
+   int            e = RZSTD_PROCESS_ERROR;
+
+   *crc = 0;
+   if (zstd_src_begin(ctx))
+      while ((e = zstd_src_next(ctx, &blk, &len)) == RZSTD_PROCESS_NEXT)
+         *crc = encoding_crc32(*crc, blk, len);
+   zstd_src_end(ctx);
+   return e == RZSTD_PROCESS_END;
 }
 
 static int zstd_parse_file_init(file_archive_transfer_t *state,
@@ -90,8 +175,8 @@ static int zstd_parse_file_init(file_archive_transfer_t *state,
 
    zstd_derive_inner_filename(file, ctx->inner_filename,
          sizeof(ctx->inner_filename));
-   strlcpy(ctx->archive_path, file, sizeof(ctx->archive_path));
    ctx->archive_size = state->archive_size;
+   ctx->state        = state;
 
    state->context    = ctx;
    state->step_total = 1;
@@ -147,13 +232,13 @@ static int zstd_parse_file_iterate_step(void *context,
       || content_size == ZSTD_SIZE_ERROR)
       return -1;
 
-   /* decompressed_size is a uint32_t and feeds a later malloc; reject
-    * values that would truncate to a smaller size and mismatch the
-    * length the decode actually produces. */
-   if (content_size > UINT32_MAX)
+   /* decompressed_size feeds a later malloc; reject values that would
+    * truncate on a 32-bit host and mismatch the length the decode
+    * actually produces. */
+   if ((uint64_t)content_size > (uint64_t)SIZE_MAX)
       return -1;
 
-   ctx->decompressed_size = (uint32_t)content_size;
+   ctx->decompressed_size = (size_t)content_size;
 
    strlcpy(userdata->current_file_path, ctx->inner_filename,
          sizeof(userdata->current_file_path));
@@ -161,10 +246,14 @@ static int zstd_parse_file_iterate_step(void *context,
    userdata->crc  = 0;
    userdata->size = (uint64_t)content_size;
 
+   /* A frame holds no CRC of its content */
+   if (userdata->crc_wanted && !zstd_frame_crc(ctx, &userdata->crc))
+      return -1;
+
    if (file_cb && !file_cb(ctx->inner_filename, valid_exts,
             NULL, 0,
-            (uint32_t)state->archive_size, (uint32_t)content_size,
-            0, userdata))
+            (uint64_t)state->archive_size, (uint64_t)content_size,
+            userdata->crc, userdata))
       return 0;
 
    return 1;
@@ -177,30 +266,51 @@ static void zstd_parse_file_free(void *context)
       return;
    if (ctx->decompressed_data)
       free(ctx->decompressed_data);
+   rzstd_blocks_free(ctx->zs);
+   free(ctx->in);
    free(ctx);
 }
 
 static bool zstd_stream_decompress_data_to_file_init(
       void *context, file_archive_file_handle_t *handle,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size)
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size)
 {
    struct zstd_file_context *ctx = (struct zstd_file_context*)context;
    if (!ctx)
       return false;
-   return true;
+   if (!ctx->state->pending_sink || size <= ZSTD_STREAM_OVER)
+      return true;
+   return zstd_src_begin(ctx);
 }
 
 static int zstd_stream_decompress_data_to_file_iterate(
       void *context, file_archive_file_handle_t *handle)
 {
    struct zstd_file_context *ctx = (struct zstd_file_context*)context;
-   void *compressed_data = NULL;
+   void          *owned = NULL;
+   const uint8_t *src;
    size_t result;
    int    e;
-   RFILE *file;
 
    if (!ctx || !handle)
       return -1;
+
+   if (ctx->zs)
+   {
+      /* a block to the file per call */
+      const uint8_t *blk;
+      size_t         len;
+      e = zstd_src_next(ctx, &blk, &len);
+      if (     e == RZSTD_PROCESS_ERROR
+            || (len && filestream_write(ctx->state->pending_sink, blk,
+                  (int64_t)len) != (int64_t)len))
+         return -1;
+      if (e == RZSTD_PROCESS_NEXT)
+         return 0;
+      zstd_src_end(ctx);
+      handle->data = NULL;
+      return 1;
+   }
 
    if (ctx->decompressed_data)
    {
@@ -208,40 +318,21 @@ static int zstd_stream_decompress_data_to_file_iterate(
       return 1;
    }
 
-   /* Read the entire compressed file */
-   file = filestream_open(ctx->archive_path,
-         RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
-   if (!file)
+   if (!(src = file_archive_whole(ctx->state->archive_file, ctx->archive_size,
+               &owned)))
       return -1;
-
-   compressed_data = malloc((size_t)ctx->archive_size);
-   if (!compressed_data)
-   {
-      filestream_close(file);
-      return -1;
-   }
-
-   if (filestream_read(file, compressed_data, ctx->archive_size)
-         != ctx->archive_size)
-   {
-      free(compressed_data);
-      filestream_close(file);
-      return -1;
-   }
-   filestream_close(file);
 
    ctx->decompressed_data = (uint8_t*)malloc(ctx->decompressed_size);
    if (!ctx->decompressed_data)
    {
-      free(compressed_data);
+      free(owned);
       return -1;
    }
 
    e = (rzstd_decode(ctx->decompressed_data, ctx->decompressed_size,
-         compressed_data, (size_t)ctx->archive_size, &result)
+         src, (size_t)ctx->archive_size, &result)
          != RZSTD_PROCESS_END);
-   free(compressed_data);
+   free(owned);
 
    if (e)
    {
@@ -263,56 +354,34 @@ static int64_t zstd_file_read(
       const char *optional_outfile)
 {
    char inner_name[PATH_MAX_LENGTH];
-   int64_t file_size;
-   void *compressed_data    = NULL;
-   uint8_t *decompressed    = NULL;
-   int64_t            content_size;
-   size_t result;
-   int    e;
-   RFILE *file;
+   int64_t        file_size;
+   int64_t        content_size;
+   void          *owned        = NULL;
+   const uint8_t *src;
+   uint8_t       *decompressed = NULL;
+   size_t         result       = 0;
+   int            e            = 1;
+   RFILE         *file;
 
    zstd_derive_inner_filename(path, inner_name, sizeof(inner_name));
 
    if (!string_is_equal(inner_name, needle))
       return -1;
 
-   file = filestream_open(path,
-         RETRO_VFS_FILE_ACCESS_READ,
-         RETRO_VFS_FILE_ACCESS_HINT_NONE);
-   if (!file)
+   if (!(file = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+               file_archive_open_hints(path_get_size(path)))))
       return -1;
 
-   file_size = filestream_get_size(file);
-   if (file_size <= 0)
-   {
-      filestream_close(file);
-      return -1;
-   }
+   /* The frame is decoded where the stream lends it, so the stream
+    * stays open until it is */
+   if (     (file_size = filestream_get_size(file)) <= 0
+         || !(src = file_archive_whole(file, file_size, &owned)))
+      goto done;
 
-   compressed_data = malloc((size_t)file_size);
-   if (!compressed_data)
-   {
-      filestream_close(file);
-      return -1;
-   }
-
-   if (filestream_read(file, compressed_data, (int64_t)file_size) != file_size)
-   {
-      free(compressed_data);
-      filestream_close(file);
-      return -1;
-   }
-
-   filestream_close(file);
-
-   content_size = rzstd_frame_content_size(compressed_data,
-         (size_t)file_size);
+   content_size = rzstd_frame_content_size(src, (size_t)file_size);
    if (  content_size == ZSTD_SIZE_UNKNOWN
       || content_size == ZSTD_SIZE_ERROR)
-   {
-      free(compressed_data);
-      return -1;
-   }
+      goto done;
 
    /* Reject sizes that would overflow the "+1" NUL-byte allocation or
     * truncate when cast to size_t on 32-bit hosts.  Without this guard
@@ -320,22 +389,18 @@ static int64_t zstd_file_read(
     * malloc(0) may return a non-NULL pointer, and the following
     * decode writes 4 GiB into it. */
    if ((uint64_t)content_size >= (uint64_t)SIZE_MAX)
-   {
-      free(compressed_data);
-      return -1;
-   }
+      goto done;
 
-   decompressed = (uint8_t*)malloc((size_t)(content_size + 1));
-   if (!decompressed)
-   {
-      free(compressed_data);
-      return -1;
-   }
+   if (!(decompressed = (uint8_t*)malloc((size_t)(content_size + 1))))
+      goto done;
 
    e = (rzstd_decode(decompressed, (size_t)content_size,
-         compressed_data, (size_t)file_size, &result)
+         src, (size_t)file_size, &result)
          != RZSTD_PROCESS_END);
-   free(compressed_data);
+
+done:
+   free(owned);
+   filestream_close(file);
 
    if (e)
    {

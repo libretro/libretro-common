@@ -50,12 +50,29 @@
 struct rar_context_t
 {
    rrar_archive_t *archive;
+   file_archive_transfer_t *state;
    /* The last extracted member, owned here so the handle handed to the
     * caller stays valid until the next call. */
    uint8_t        *output;
    uint32_t        parse_index;
    uint32_t        decompress_index;
+   bool            to_sink;   /* the member goes to the file as it comes */
 };
+
+/* A member bound for a file, bigger than this, goes to it as it is
+ * unpacked rather than whole through memory */
+#define RAR_SINK_OVER (256 * 1024)
+
+static int rar_sink_write(void *ud, const uint8_t *data, size_t len)
+{
+   return filestream_write((RFILE*)ud, data, (int64_t)len) != (int64_t)len;
+}
+
+static int rar_crc_write(void *ud, const uint8_t *data, size_t len)
+{
+   *(uint32_t*)ud = encoding_crc32(*(uint32_t*)ud, data, len);
+   return 0;
+}
 
 static int rar_open_archive(struct rar_context_t *ctx,
       file_archive_transfer_t *state)
@@ -99,7 +116,7 @@ typedef struct
 static int rar_file_decompressed(
       const char *name, const char *valid_exts,
       const uint8_t *cdata, unsigned cmode,
-      uint32_t csize, uint32_t size,
+      uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata)
 {
    rar_decomp_state_t *st = (rar_decomp_state_t*)userdata->cb_data;
@@ -130,16 +147,12 @@ static int rar_file_decompressed(
                   &member, &member_len) != RRAR_OK)
          return 1;
 
-      /* RetroArch expects a NUL after the data. */
-      if ((*st->buf = malloc(member_len + 1)))
-      {
-         ((char*)(*st->buf))[member_len] = '\0';
-         if (member_len)
-            memcpy(*st->buf, member, member_len);
-         st->size  = member_len;
-         st->found = true;
-      }
-      free(member);
+      /* the caller's to keep, with a NUL after the data in the octet
+       * to spare */
+      member[member_len] = '\0';
+      *st->buf  = member;
+      st->size  = member_len;
+      st->found = true;
    }
 
    return 0;
@@ -203,20 +216,20 @@ static int64_t rar_file_read(
 
 static bool rar_stream_decompress_data_to_file_init(
       void *context, file_archive_file_handle_t *handle,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size)
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size)
 {
    struct rar_context_t *ctx = (struct rar_context_t*)context;
 
    (void)handle;
    (void)cmode;
    (void)csize;
-   (void)size;
 
    if (!ctx)
       return false;
 
    /* The parse step hands the entry index through cdata. */
    ctx->decompress_index = (uint32_t)(size_t)cdata;
+   ctx->to_sink          = ctx->state->pending_sink && size > RAR_SINK_OVER;
    return true;
 }
 
@@ -229,9 +242,22 @@ static int rar_stream_decompress_data_to_file_iterate(
    uint8_t *member     = NULL;
    size_t   member_len = 0;
 
-   if (     !ctx || !ctx->archive
-         || rrar_archive_extract(ctx->archive, ctx->decompress_index,
-               &member, &member_len) != RRAR_OK)
+   if (!ctx || !ctx->archive)
+      return -1;
+
+   /* in the file as it comes, whole */
+   if (ctx->to_sink)
+   {
+      if (rrar_archive_extract_sink(ctx->archive, ctx->decompress_index,
+               rar_sink_write, ctx->state->pending_sink) != RRAR_OK)
+         return -1;
+      if (handle)
+         handle->data = NULL;
+      return 1;
+   }
+
+   if (rrar_archive_extract(ctx->archive, ctx->decompress_index,
+            &member, &member_len) != RRAR_OK)
       return -1;
 
    /* The caller reads through handle->data until it calls back in, so
@@ -268,6 +294,7 @@ static int rar_parse_file_init(file_archive_transfer_t *state,
       goto error;
 
    state->context = ctx;
+   ctx->state     = state;
 
    if (!rar_open_archive(ctx, state))
       goto error;
@@ -301,29 +328,30 @@ static int rar_parse_file_iterate_step(void *context,
 
    entry = rrar_archive_entry(ctx->archive, ctx->parse_index);
 
-   /* Directories, members this reader cannot unpack (solid, encrypted,
-    * an older packer) and members of 4 GiB or more, which the uint32_t
-    * sizes here cannot describe, are passed over: the rest of the
+   /* Directories and members this reader cannot unpack (solid,
+    * encrypted, an older packer) are passed over: the rest of the
     * archive stays usable. */
-   if (     entry
-         && !entry->is_dir
-         && entry->supported
-         && entry->size <= (uint64_t)0xFFFFFFFFu)
+   if (entry && !entry->is_dir && entry->supported)
    {
-      uint32_t size = (uint32_t)entry->size;
-
       strlcpy(userdata->current_file_path, entry->name,
             sizeof(userdata->current_file_path));
       userdata->crc  = entry->crc;
-      userdata->size = size;
+      userdata->size = entry->size;
+
+      /* A RAR 5 member may have a BLAKE2 hash in place of its CRC */
+      if (userdata->crc_wanted && !entry->has_crc)
+      {
+         userdata->crc = 0;
+         if (rrar_archive_extract_sink(ctx->archive, ctx->parse_index,
+                  rar_crc_write, &userdata->crc) != RRAR_OK)
+            return -1;
+      }
 
       /* The entry index travels in cdata; the packed size is reported
        * only for progress. */
       if (file_cb && !file_cb(userdata->current_file_path, valid_exts,
                (const uint8_t*)(size_t)ctx->parse_index, 0,
-               entry->packed_size > (uint64_t)0xFFFFFFFFu
-               ? 0xFFFFFFFFu : (uint32_t)entry->packed_size,
-               size, entry->crc, userdata))
+               entry->packed_size, entry->size, userdata->crc, userdata))
          return 0;
    }
 

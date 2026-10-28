@@ -14,6 +14,11 @@
  * a few hundred times over: whatever the reader makes of that, it must
  * not read or write where it should not (the test is built with ASan and
  * UBSan), and what it does hand out still has the archive's CRC-32.
+ *
+ * Then RAR 5 archives rar5_write.h makes: members of 10 and 40 MB in
+ * dictionaries of 4 and 32 MiB, with matches reaching back across the
+ * dictionary and filters' blocks across where the ring the member
+ * streams round comes round to its start, whole and streamed.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +26,8 @@
 
 #include <rar/rrar_archive.h>
 #include <encodings/crc32.h>
+
+#include "rar5_write.h"
 
 static int failures;
 
@@ -149,6 +156,52 @@ static void check_watched(rrar_archive_t *a, uint32_t i, const uint8_t *want,
    free(dst);
 }
 
+/* What a member streamed out is held to: the octets of the whole
+ * decode, in order, and how many came */
+typedef struct
+{
+   const uint8_t *want;
+   size_t         len;
+   size_t         at;
+   int            wrong;
+   int            stop_at;       /* calls before it says stop, or -1 */
+} sunk_t;
+
+static int sunk_take(void *ud, const uint8_t *data, size_t len)
+{
+   sunk_t *k = (sunk_t *)ud;
+   if (k->stop_at >= 0 && k->stop_at-- == 0)
+      return 1;
+   if (len > k->len - k->at || memcmp(data, k->want + k->at, len))
+      k->wrong = 1;
+   else
+      k->at += len;
+   return 0;
+}
+
+/* The member streamed out, through a buffer smaller than it where it is
+ * big (this test builds the reader to stream every member, a piece at
+ * a time): the same octets as whole; and stopped by the sink, stopped */
+static void check_sunk(rrar_archive_t *a, uint32_t index,
+      const uint8_t *want, size_t len, const char *name)
+{
+   sunk_t k;
+   k.want    = want;
+   k.len     = len;
+   k.at      = 0;
+   k.wrong   = 0;
+   k.stop_at = -1;
+   CHECK(rrar_archive_extract_sink(a, index, sunk_take, &k) == RRAR_OK
+         && !k.wrong && k.at == len, name);
+   if (len)
+   {
+      k.at      = 0;
+      k.stop_at = 0;
+      CHECK(rrar_archive_extract_sink(a, index, sunk_take, &k)
+            == RRAR_ERROR_CANCELLED, name);
+   }
+}
+
 static void check_mode(const char *dir, const char *file,
       const struct expect *want, unsigned num_want, int through_reads)
 {
@@ -190,7 +243,13 @@ static void check_mode(const char *dir, const char *file,
          if (out && e->has_crc)
             CHECK(encoding_crc32(0, out, out_len) == e->crc, e->name);
          if (out)
+         {
             check_watched(a, i, out, out_len, e->name);
+            check_sunk(a, i, out, out_len, e->name);
+            /* the octet to spare after it, which a sanitizer sees
+             * written */
+            out[out_len] = '\0';
+         }
          free(out);
       }
       for (w = 0; w < num_want; w++)
@@ -347,6 +406,51 @@ static void mangle(const char *dir, const char *file)
    free(data);
 }
 
+/* A member of @n octets in a dictionary of 128 KiB << @dict, written:
+ * whole and streamed out, every way it is read, what was written */
+static void written(const char *what, unsigned dict, size_t n,
+      const r5_filter_t *f, unsigned nf)
+{
+   r5_bits_t       b;
+   uint8_t        *d = (uint8_t*)malloc(n);
+   uint8_t        *arc, *out = NULL;
+   size_t          len, out_len = 0;
+   rrar_archive_t *a = NULL;
+   file_t          file;
+   int             mode;
+
+   memset(&b, 0, sizeof(b));
+   r5_rng = 1;
+   r5_member(&b, d, n, ((uint32_t)0x20000 << dict) - 1, f, nf);
+   r5_expect(d, f, nf);
+   arc = r5_archive(&b, "written.bin", n, encoding_crc32(0, d, n), dict,
+         &len);
+   free(b.d);
+   file.data = arc;
+   file.len  = len;
+   for (mode = 0; mode < 2; mode++)
+   {
+      a = NULL;
+      if (mode)
+         CHECK(rrar_archive_open_read(&a, len, read_cb, &file) == RRAR_OK, what);
+      else
+         CHECK(rrar_archive_open(&a, arc, len) == RRAR_OK, what);
+      if (!a)
+         continue;
+      CHECK(rrar_archive_num_entries(a) == 1
+            && rrar_archive_entry(a, 0)->size == n
+            && rrar_archive_entry(a, 0)->supported, what);
+      CHECK(rrar_archive_extract(a, 0, &out, &out_len) == RRAR_OK
+            && out_len == n && !memcmp(out, d, n), what);
+      free(out);
+      out = NULL;
+      check_sunk(a, 0, d, n, what);
+      rrar_archive_close(a);
+   }
+   free(arc);
+   free(d);
+}
+
 int main(int argc, char **argv)
 {
    static const struct expect lowdist[] = {
@@ -434,6 +538,21 @@ int main(int argc, char **argv)
       CHECK(rrar_archive_open(&a, rar6, sizeof(rar6)) == RRAR_ERROR_UNSUPPORTED && !a, "a later container");
       CHECK(rrar_archive_open(&a, rar5, sizeof(rar5)) == RRAR_ERROR_DATA && !a, "rar5 with no headers");
       CHECK(rrar_archive_open(&a, rar5, 3) == RRAR_ERROR_PARAM && !a, "short");
+   }
+
+   {
+      /* delta over three channels and E8, each across where the ring
+       * of a 4 MiB dictionary comes round */
+      static const r5_filter_t four[] = {
+         { 3500000, 1000000, 0, 3 },
+         { 7600000, 1000000, 1, 0 },
+      };
+      /* the same round a 32 MiB one */
+      static const r5_filter_t big[] = {
+         { 33500000, 1200000, 1, 0 },
+      };
+      written("written, 4 MiB dictionary", 5, 10000000, four, 2);
+      written("written, 32 MiB dictionary", 8, 40000000, big, 1);
    }
 
    if (failures)

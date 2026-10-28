@@ -39,8 +39,8 @@ static int file_archive_get_file_list_cb(
       const char *valid_exts,
       const uint8_t *cdata,
       unsigned cmode,
-      uint32_t csize,
-      uint32_t size,
+      uint64_t csize,
+      uint64_t size,
       uint32_t checksum,
       struct archive_extract_userdata *userdata)
 {
@@ -93,7 +93,7 @@ static int file_archive_get_file_list_cb(
 
 static int file_archive_extract_cb(const char *name, const char *valid_exts,
       const uint8_t *cdata,
-      unsigned cmode, uint32_t csize, uint32_t size,
+      unsigned cmode, uint64_t csize, uint64_t size,
       uint32_t checksum, struct archive_extract_userdata *userdata)
 {
    const char *ext                   = path_get_extension(name);
@@ -143,6 +143,39 @@ static int file_archive_extract_cb(const char *name, const char *valid_exts,
 /* The largest archive a 32-bit host maps whole. */
 #define ARCHIVE_MAP_CEILING_32 (256 * 1024 * 1024)
 
+/* Ask the VFS to map the archive. A 64-bit host maps it whatever its
+ * size, since pages are only faulted in as they are touched; a 32-bit
+ * one keeps the mapping to ARCHIVE_MAP_CEILING_32 so a huge archive
+ * cannot take the address space the core needs, and reads it through
+ * the stream instead. A URL scheme or a failed map just leaves no
+ * mapping, which every backend reads through the stream as well. */
+unsigned file_archive_open_hints(int64_t size)
+{
+   return (size > 0 && (sizeof(size_t) >= 8
+            || size <= ARCHIVE_MAP_CEILING_32))
+      ? RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS
+      : RETRO_VFS_FILE_ACCESS_HINT_NONE;
+}
+
+const uint8_t *file_archive_whole(RFILE *file, int64_t size, void **owned)
+{
+   const uint8_t *src = NULL;
+   *owned = NULL;
+   filestream_seek(file, 0, RETRO_VFS_SEEK_POSITION_START);
+   if (filestream_view(file, size, &src) == size)
+      return src;
+   if (!(*owned = malloc((size_t)size)))
+      return NULL;
+   filestream_seek(file, 0, RETRO_VFS_SEEK_POSITION_START);
+   if (filestream_read(file, *owned, size) != size)
+   {
+      free(*owned);
+      *owned = NULL;
+      return NULL;
+   }
+   return (const uint8_t*)*owned;
+}
+
 static int file_archive_parse_file_init(file_archive_transfer_t *state,
       const char *file)
 {
@@ -157,25 +190,11 @@ static int file_archive_parse_file_init(file_archive_transfer_t *state,
    if (!(state->backend = file_archive_get_file_backend(path)))
       return -1;
 
-   /* Ask the VFS to map the archive. A 64-bit host maps it whatever
-    * its size, since pages are only faulted in as they are touched;
-    * a 32-bit one keeps the mapping to ARCHIVE_MAP_CEILING_32 so a
-    * huge archive cannot take the address space the core needs, and
-    * reads it through the stream instead. A URL scheme or a failed
-    * map just leaves no mapping, which every backend reads through
-    * the stream as well. */
-   {
-      int64_t  sz    = path_get_size(path);
-      unsigned hints = (sz > 0 && (sizeof(size_t) >= 8
-               || sz <= ARCHIVE_MAP_CEILING_32))
-            ? RETRO_VFS_FILE_ACCESS_HINT_FREQUENT_ACCESS
-            : RETRO_VFS_FILE_ACCESS_HINT_NONE;
-
-      /* Failed to open archive. */
-      if (!(state->archive_file = filestream_open(path,
-            RETRO_VFS_FILE_ACCESS_READ, hints)))
-         return -1;
-   }
+   /* Failed to open archive. */
+   if (!(state->archive_file = filestream_open(path,
+         RETRO_VFS_FILE_ACCESS_READ,
+         file_archive_open_hints(path_get_size(path)))))
+      return -1;
 
    state->archive_size = filestream_get_size(state->archive_file);
 
@@ -463,6 +482,7 @@ bool file_archive_extract_file(
    userdata.list                            = NULL;
    userdata.found_file                      = false;
    userdata.list_only                       = false;
+   userdata.crc_wanted                      = false;
    userdata.crc                             = 0;
    userdata.transfer                        = NULL;
    userdata.dec                             = NULL;
@@ -517,6 +537,7 @@ bool file_archive_get_file_list_noalloc(struct string_list *list,
    userdata.list                            = list;
    userdata.found_file                      = false;
    userdata.list_only                       = true;
+   userdata.crc_wanted                      = false;
    userdata.crc                             = 0;
    userdata.transfer                        = NULL;
    userdata.dec                             = NULL;
@@ -551,6 +572,7 @@ struct string_list *file_archive_get_file_list(const char *path,
    userdata.list                            = string_list_new();
    userdata.found_file                      = false;
    userdata.list_only                       = true;
+   userdata.crc_wanted                      = false;
    userdata.crc                             = 0;
    userdata.transfer                        = NULL;
    userdata.dec                             = NULL;
@@ -713,7 +735,7 @@ int file_archive_perform_mode_step(file_archive_transfer_t *state)
  * Returns 1 if it finished immediately, 0 if it parked and wants to be
  * resumed through file_archive_perform_mode_step(), -1 on failure. */
 int file_archive_perform_mode_start(const char *path, const char *valid_exts,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size,
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata)
 {
    file_archive_transfer_t *state;
@@ -751,7 +773,7 @@ int file_archive_perform_mode_start(const char *path, const char *valid_exts,
 }
 
 bool file_archive_perform_mode(const char *path, const char *valid_exts,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size,
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata)
 {
    /* The blocking form, for callers that need the whole member before
@@ -924,7 +946,7 @@ const struct file_archive_file_backend *file_archive_get_rar_file_backend(void)
 
 const struct file_archive_file_backend* file_archive_get_file_backend(const char *path)
 {
-#if defined(HAVE_7ZIP) || defined(HAVE_ZLIB) || defined(HAVE_RZSTD) || defined(HAVE_RRAR) || defined(HAVE_COMPRESSION)
+#if defined(HAVE_7ZIP) || defined(HAVE_ZLIB) || defined(HAVE_RZSTD) || defined(HAVE_RRAR) || defined(HAVE_RBZIP2) || defined(HAVE_COMPRESSION)
    char newpath[PATH_MAX_LENGTH];
    const char *file_ext          = NULL;
    char *last                    = NULL;
@@ -953,6 +975,11 @@ const struct file_archive_file_backend* file_archive_get_file_backend(const char
 #ifdef HAVE_RZSTD
    if (string_is_equal_noncase(file_ext, "zst"))
       return &zstd_backend;
+#endif
+
+#ifdef HAVE_RBZIP2
+   if (string_is_equal_noncase(file_ext, "bz2"))
+      return &bz2_backend;
 #endif
 
 #ifdef HAVE_RRAR
@@ -1010,6 +1037,7 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
    memset(&state, 0, sizeof(state));
 
    state.type              = ARCHIVE_TRANSFER_INIT;
+   userdata.crc_wanted     = true;
 
    /* Initialize and open archive first.
       Sets next state type to ITERATE. */

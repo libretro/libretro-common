@@ -51,12 +51,73 @@
 struct sevenzip_context_t
 {
    r7z_archive_t *archive;
-   /* Cache of the last extracted member, owned here so the handle
-    * handed to the caller stays valid until the next call. */
-   uint8_t       *output;
+   file_archive_transfer_t *state;
+   uint8_t       *member;     /* a member gathered out of a stream */
+   size_t         gathered;
    uint32_t       parse_index;
    uint32_t       decompress_index;
+   bool           streaming;  /* the member goes to the sink in pieces */
+   bool           gathering;  /* or into member */
 };
+
+/* A member bound for a file, bigger than this, is streamed to it */
+#define SEVENZIP_STREAM_OVER (256 * 1024)
+
+/* A folder of other members, bigger than this, is never held whole: a
+ * member wanted out of it is streamed, and the next one in the folder
+ * goes on from there */
+#ifndef SEVENZIP_FOLDER_KEEP
+#define SEVENZIP_FOLDER_KEEP (32 * 1024 * 1024)
+#endif
+
+static bool sevenzip_stream_whole(r7z_archive_t *a, uint32_t index)
+{
+   const r7z_entry_t *e = r7z_archive_entry(a, index);
+   uint64_t           folder;
+   if (!e || e->is_dir || !e->size)
+      return false;
+   folder = r7z_archive_folder_size(a, e->folder);
+   return folder > SEVENZIP_FOLDER_KEEP
+      && !(e->offset_in_folder == 0 && e->size == folder);
+}
+
+/* Member @index streamed into *@out (a NUL after it), in one go; false
+ * where its folder cannot be streamed or it does not come out */
+static bool sevenzip_stream_into(r7z_archive_t *a, uint32_t index,
+      uint8_t **out, size_t *len)
+{
+   const r7z_entry_t *e = r7z_archive_entry(a, index);
+   const uint8_t     *d;
+   size_t             n, at = 0;
+   uint8_t           *m;
+   int                res;
+   if (     !e || e->size >= (uint64_t)((size_t)-1)
+         || r7z_archive_stream_begin(a, index) != R7Z_OK)
+      return false;
+   if (!(m = (uint8_t*)malloc((size_t)e->size + 1)))
+   {
+      r7z_archive_stream_end(a);
+      return false;
+   }
+   while ((res = r7z_archive_stream_step(a, &d, &n)) == R7Z_PENDING)
+   {
+      if (n > e->size - at)
+         break;
+      if (n)
+         memcpy(m + at, d, n);
+      at += n;
+   }
+   if (res != R7Z_OK || at != e->size)
+   {
+      r7z_archive_stream_end(a);
+      free(m);
+      return false;
+   }
+   m[at] = '\0';
+   *out  = m;
+   *len  = at;
+   return true;
+}
 
 static int sevenzip_open_archive(struct sevenzip_context_t *ctx,
       file_archive_transfer_t *state)
@@ -87,10 +148,10 @@ static void sevenzip_parse_file_free(void *context)
    if (!sevenzip_context)
       return;
 
-   free(sevenzip_context->output);
    /* The mapping and the stream belong to archive_file.c, which
     * releases them after this. */
    r7z_archive_close(sevenzip_context->archive);
+   free(sevenzip_context->member);
    free(sevenzip_context);
 }
 
@@ -104,13 +165,36 @@ typedef struct
    bool    found;
 } sevenzip_decomp_state_t;
 
+/* One slice of decoding member @index's folder: R7Z_PENDING while
+ * there is more, and on R7Z_OK the member where it is held in the
+ * archive's folder cache - decoded there, or, for a stored folder of a
+ * mapped archive, the archive itself - valid until another folder is
+ * decoded. Nothing is copied. */
+static int sevenzip_member_step(r7z_archive_t *a, uint32_t index,
+      const uint8_t **data, size_t *len)
+{
+   const r7z_entry_t *e = r7z_archive_entry(a, index);
+   int                res;
+   if (!e || e->is_dir)
+      return R7Z_ERROR_PARAM;
+   if (!e->size)
+   {
+      *data = (const uint8_t*)"";
+      *len  = 0;
+      return R7Z_OK;
+   }
+   if ((res = r7z_archive_decode_step(a, index)) != R7Z_OK)
+      return res;
+   return r7z_archive_entry_borrow(a, index, data, len);
+}
+
 /* Called once per entry while the driver walks the archive. Starts the
  * decode of the wanted member and stops the scan; the iterate loop
  * finishes the decode across later calls. */
 static int sevenzip_file_decompressed(
       const char *name, const char *valid_exts,
       const uint8_t *cdata, unsigned cmode,
-      uint32_t csize, uint32_t size,
+      uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata)
 {
    sevenzip_decomp_state_t *st =
@@ -137,35 +221,45 @@ static int sevenzip_file_decompressed(
    {
       struct sevenzip_context_t *ctx =
          (struct sevenzip_context_t*)userdata->transfer->context;
-      uint8_t *member     = NULL;
-      size_t   member_len = 0;
-      int      res;
+      const r7z_entry_t *e;
+      uint8_t           *member     = NULL;
+      size_t             member_len = 0;
+      uint32_t           index      = (uint32_t)(size_t)cdata;
+      int                res        = R7Z_OK;
 
-      if (!ctx || !ctx->archive)
+      if (     !ctx || !ctx->archive
+            || !(e = r7z_archive_entry(ctx->archive, index)) || e->is_dir)
          return 1;
+
+      /* out of a big folder of others, streamed to it */
+      if (     sevenzip_stream_whole(ctx->archive, index)
+            && sevenzip_stream_into(ctx->archive, index, &member,
+               &member_len))
+      {
+         *st->buf  = member;
+         st->size  = member_len;
+         st->found = true;
+         return 0;
+      }
 
       /* Sliced, but driven to completion here: the caller of
        * compressed_file_read wants the bytes on return and has nowhere
        * to yield to. */
-      do
-      {
-         res = r7z_archive_extract_slice(ctx->archive,
-               (uint32_t)(size_t)cdata, &member, &member_len);
-      } while (res == R7Z_PENDING);
+      if (e->size)
+         while ((res = r7z_archive_decode_step(ctx->archive, index))
+               == R7Z_PENDING) { }
 
-      if (res != R7Z_OK)
+      /* the caller's to keep, with a NUL after the data: a member that
+       * is its folder is that folder's buffer, handed over, and any
+       * other is copied out of it */
+      if (     res != R7Z_OK
+            || r7z_archive_extract_detach(ctx->archive, index, &member,
+               &member_len) != R7Z_OK)
          return 1;
-
-      /* RetroArch expects a NUL after the data. */
-      if ((*st->buf = malloc(member_len + 1)))
-      {
-         ((char*)(*st->buf))[member_len] = '\0';
-         if (member_len)
-            memcpy(*st->buf, member, member_len);
-         st->size  = member_len;
-         st->found = true;
-      }
-      free(member);
+      member[member_len] = '\0';
+      *st->buf  = member;
+      st->size  = member_len;
+      st->found = true;
    }
 
    return 0;
@@ -241,7 +335,7 @@ static int64_t sevenzip_file_read(
 
 static bool sevenzip_stream_decompress_data_to_file_init(
       void *context, file_archive_file_handle_t *handle,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size)
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size)
 {
    struct sevenzip_context_t *sevenzip_context =
       (struct sevenzip_context_t*)context;
@@ -249,13 +343,44 @@ static bool sevenzip_stream_decompress_data_to_file_init(
    (void)handle;
    (void)cmode;
    (void)csize;
-   (void)size;
 
    if (!sevenzip_context)
       return false;
 
    /* The parse step hands the entry index through cdata. */
    sevenzip_context->decompress_index = (uint32_t)(size_t)cdata;
+   sevenzip_context->streaming        = false;
+   sevenzip_context->gathering        = false;
+   free(sevenzip_context->member);
+   sevenzip_context->member           = NULL;
+   sevenzip_context->gathered         = 0;
+
+   /* A big member bound for a file goes to it through a window, and
+    * one out of a big folder of others into a buffer of its own, where
+    * its folder's coders allow; anything else is decoded whole */
+   {
+      bool sink  =  sevenzip_context->state->pending_sink
+                 && size > SEVENZIP_STREAM_OVER;
+      bool apart = !sink && sevenzip_stream_whole(sevenzip_context->archive,
+            sevenzip_context->decompress_index);
+      if (sink || apart)
+      {
+         int res = r7z_archive_stream_begin(sevenzip_context->archive,
+               sevenzip_context->decompress_index);
+         if (res == R7Z_OK)
+         {
+            if (     apart
+                  && (size >= (uint64_t)((size_t)-1)
+                  || !(sevenzip_context->member = (uint8_t*)malloc(
+                        (size_t)size + 1))))
+               return false;
+            sevenzip_context->streaming = sink;
+            sevenzip_context->gathering = apart;
+         }
+         else if (res != R7Z_ERROR_UNSUPPORTED)
+            return false;
+      }
+   }
 
    return true;
 }
@@ -265,9 +390,9 @@ static int sevenzip_stream_decompress_data_to_file_iterate(
 {
    struct sevenzip_context_t *sevenzip_context =
       (struct sevenzip_context_t*)context;
-   uint8_t *member     = NULL;
-   size_t   member_len = 0;
-   int      res;
+   const uint8_t *member     = NULL;
+   size_t         member_len = 0;
+   int            res;
 
    /* The callers loop while this returns 0, so 0 means "not finished,
     * call again" and never "failed". Returning it on error spins them
@@ -276,26 +401,63 @@ static int sevenzip_stream_decompress_data_to_file_iterate(
    if (!sevenzip_context || !sevenzip_context->archive)
       return -1;
 
+   if (sevenzip_context->gathering)
+   {
+      const r7z_entry_t *e = r7z_archive_entry(sevenzip_context->archive,
+            sevenzip_context->decompress_index);
+      res = r7z_archive_stream_step(sevenzip_context->archive,
+            &member, &member_len);
+      if (res == R7Z_PENDING)
+      {
+         if (member_len > e->size - sevenzip_context->gathered)
+            return -1;
+         if (member_len)
+            memcpy(sevenzip_context->member + sevenzip_context->gathered,
+                  member, member_len);
+         sevenzip_context->gathered += member_len;
+         return 0;
+      }
+      sevenzip_context->gathering = false;
+      if (res != R7Z_OK || sevenzip_context->gathered != e->size)
+         return -1;
+      if (handle)
+         handle->data = sevenzip_context->member;
+      return 1;
+   }
+
+   if (sevenzip_context->streaming)
+   {
+      res = r7z_archive_stream_step(sevenzip_context->archive,
+            &member, &member_len);
+      if (res == R7Z_PENDING)
+         return (!member_len || filestream_write(
+                  sevenzip_context->state->pending_sink, member,
+                  (int64_t)member_len) == (int64_t)member_len) ? 0 : -1;
+      sevenzip_context->streaming = false;
+      if (res != R7Z_OK)
+         return -1;
+      /* in the sink, whole */
+      if (handle)
+         handle->data = NULL;
+      return 1;
+   }
+
    /* Sliced rather than whole: a solid folder is tens of milliseconds
     * decoded in one go, and this is the return value the archive layer
     * turns into a yield. Callers that cannot yield still get the whole
     * member, they just get it through several calls. */
-   res = r7z_archive_extract_slice(sevenzip_context->archive,
-         sevenzip_context->decompress_index,
-         &member, &member_len);
+   res = sevenzip_member_step(sevenzip_context->archive,
+         sevenzip_context->decompress_index, &member, &member_len);
 
    if (res == R7Z_PENDING)
       return 0;
    if (res != R7Z_OK)
       return -1;
 
-   /* The caller reads through handle->data until it calls back in, so
-    * the previous member cannot be released any earlier than this. */
-   free(sevenzip_context->output);
-   sevenzip_context->output = member;
-
+   /* The caller only reads the member, and is done with it before it
+    * calls back in for another: lent where it is held */
    if (handle)
-      handle->data = sevenzip_context->output;
+      handle->data = (uint8_t*)member;
 
    return 1;
 }
@@ -324,6 +486,7 @@ static int sevenzip_parse_file_init(file_archive_transfer_t *state,
       goto error;
 
    state->context = sevenzip_context;
+   sevenzip_context->state = state;
 
    if (!sevenzip_open_archive(sevenzip_context, state))
       goto error;
@@ -344,8 +507,8 @@ static int sevenzip_parse_file_iterate_step_internal(
       char *s,
       const uint8_t **cdata,
       unsigned *cmode,
-      uint32_t *size,
-      uint32_t *csize,
+      uint64_t *size,
+      uint64_t *csize,
       uint32_t *checksum,
       unsigned *payback,
       struct archive_extract_userdata *userdata)
@@ -370,28 +533,13 @@ static int sevenzip_parse_file_iterate_step_internal(
       if (!sevenzip_name_to_char(entry->name, s, PATH_MAX_LENGTH))
          return -1;
 
-      /* The vtable reports sizes as uint32_t, but 7z stores them as
-       * 64-bit. A member of 4 GiB or more cannot be described here, and
-       * truncating would hand the caller a wrapped length to write from
-       * a full-length buffer. Skip such an entry instead: the scan
-       * carries on and everything else in the archive stays usable. */
-      if (entry->size > (uint64_t)0xFFFFFFFFu)
-      {
-         /* Blank the name too: the caller passes whatever is in it to
-          * file_cb, and a named entry reporting zero bytes is worse
-          * than no entry at all. */
-         s[0]     = '\0';
-         *payback = 1;
-         return 1;
-      }
-
       *cmode    = 0; /* unused for 7zip */
       *checksum = entry->crc;
-      *size     = (uint32_t)entry->size;
+      *size     = entry->size;
       /* The packed size of an individual member is not meaningful for
        * 7z: members share a solid folder's compressed stream. Callers
        * use this only for progress reporting. */
-      *csize    = (uint32_t)entry->size;
+      *csize    = entry->size;
 
       *cdata    = (uint8_t *)(size_t)sevenzip_context->parse_index;
    }
@@ -408,8 +556,8 @@ static int sevenzip_parse_file_iterate_step(void *context,
 {
    const uint8_t *cdata = NULL;
    uint32_t checksum    = 0;
-   uint32_t size        = 0;
-   uint32_t csize       = 0;
+   uint64_t size        = 0;
+   uint64_t csize       = 0;
    unsigned cmode       = 0;
    unsigned payload     = 0;
    struct sevenzip_context_t *sevenzip_context =

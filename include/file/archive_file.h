@@ -93,6 +93,7 @@ typedef struct file_archive_transfer
     * pending_active is what makes this visible to the iterate loop;
     * everything else is the state that call needs to resume. */
    file_archive_file_handle_t pending_handle;
+   uint64_t pending_size;
    /* The member's output, opened beside pending_path and renamed over
     * it when the member completes (filestream_open_atomic()).  A
     * backend that can produce output a piece at a time writes it here
@@ -100,7 +101,6 @@ typedef struct file_archive_transfer
     * pending_handle.data, which is written here at the end. */
    struct RFILE *pending_sink;
    char     pending_path[PATH_MAX_LENGTH];
-   uint32_t pending_size;
    bool     pending_active;
    /* The scan asked to stop while a member was still parked. The stop
     * is honoured once the pending decode has drained, not before, or
@@ -147,11 +147,14 @@ struct archive_extract_userdata
    char current_file_path[PATH_MAX_LENGTH];
    bool found_file;
    bool list_only;
+   /* The member's CRC is wanted: a backend whose archive does not
+    * record one decodes the member to have it */
+   bool crc_wanted;
 };
 
 /* Returns true when parsing should continue. False to stop. */
 typedef int (*file_archive_file_cb)(const char *name, const char *valid_exts,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size,
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata);
 
 struct file_archive_file_backend
@@ -169,7 +172,7 @@ struct file_archive_file_backend
 
    bool     (*stream_decompress_data_to_file_init)(
       void *context, file_archive_file_handle_t *handle,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size);
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size);
    int      (*stream_decompress_data_to_file_iterate)(
       void *context,
       file_archive_file_handle_t *handle);
@@ -251,7 +254,7 @@ int64_t file_archive_read_at(void *ud, uint64_t off, void *dst, size_t len);
  * failure.
  */
 int file_archive_perform_mode_start(const char *name, const char *valid_exts,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size,
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata);
 
 /**
@@ -265,7 +268,7 @@ int file_archive_perform_mode_start(const char *name, const char *valid_exts,
 int file_archive_perform_mode_step(file_archive_transfer_t *state);
 
 bool file_archive_perform_mode(const char *name, const char *valid_exts,
-      const uint8_t *cdata, unsigned cmode, uint32_t csize, uint32_t size,
+      const uint8_t *cdata, unsigned cmode, uint64_t csize, uint64_t size,
       uint32_t crc32, struct archive_extract_userdata *userdata);
 
 int file_archive_compressed_read(
@@ -278,6 +281,28 @@ const struct file_archive_file_backend* file_archive_get_zstd_file_backend(void)
 const struct file_archive_file_backend* file_archive_get_rar_file_backend(void);
 
 const struct file_archive_file_backend* file_archive_get_file_backend(const char *path);
+
+/**
+ * file_archive_open_hints:
+ * @size                         : size of the archive, or <= 0 if unknown
+ *
+ * Returns: the hints an archive of @size is opened with, asking for a
+ * mapping where the host can afford one.
+ **/
+unsigned file_archive_open_hints(int64_t size);
+
+/**
+ * file_archive_whole:
+ * @size                         : octets in @file
+ * @owned                        : receives a buffer for the caller to
+ *                                 free, or NULL
+ *
+ * Returns: all of @file, where the stream lends it whole (a mapping, a
+ * read-ahead window) or else read into *@owned; NULL on failure. What
+ * is lent holds until the next call on @file.
+ **/
+const uint8_t *file_archive_whole(struct RFILE *file, int64_t size,
+      void **owned);
 
 /**
  * file_archive_get_file_crc32:
@@ -303,6 +328,7 @@ uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size);
 extern const struct file_archive_file_backend zlib_backend;
 extern const struct file_archive_file_backend sevenzip_backend;
 extern const struct file_archive_file_backend zstd_backend;
+extern const struct file_archive_file_backend bz2_backend;
 extern const struct file_archive_file_backend rar_backend;
 
 /* ---- incremental archive entry source ----
@@ -317,9 +343,13 @@ extern const struct file_archive_file_backend rar_backend;
  *
  * Contract: dst regions across successive read() calls must be
  * sequential and contiguous (the data_transfer source fill satisfies
- * this naturally); the built-in inflate binds its output window once
- * and the source verifies the cursor.  Returns bytes produced, 0 at
- * end of entry, -1 on error.  Only backends whose entries are
+ * this naturally), and dst has room to the entry's end: n paces the
+ * decode, and a read may produce more - the built-in inflate a whole
+ * input slice, a Zstandard or bzip2 member, which does not stop part
+ * way, all of itself straight into dst at the first read.  The
+ * built-in inflate binds its output window once and the source
+ * verifies the cursor.  Returns bytes produced, 0 at end of entry, -1
+ * on error.  Only backends whose entries are
  * independently decodable provide sources (ZIP; 7z solid blocks
  * cannot), so a NULL open is a normal "use the classic whole-entry
  * path" signal, not an error. */

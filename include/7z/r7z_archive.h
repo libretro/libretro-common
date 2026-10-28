@@ -221,7 +221,8 @@ int r7z_archive_extract(r7z_archive_t *a, uint32_t index,
  * folder's entire output - every member of a non-solid archive - is
  * handed over as the decoded folder buffer itself, with nothing copied
  * and nothing left in the folder cache. Any other entry extracts
- * exactly as r7z_archive_extract() does.
+ * exactly as r7z_archive_extract() does. Either way the buffer has one
+ * octet more than @out_len, the caller's to write, as for a NUL.
  */
 int r7z_archive_extract_detach(r7z_archive_t *a, uint32_t index,
       uint8_t **out, size_t *out_len);
@@ -277,13 +278,13 @@ int r7z_archive_decode_step(r7z_archive_t *a, uint32_t index);
  * @avail      : receives how many of them are there to be read
  *
  * How much of entry @index has been decoded. A folder whose last coder
- * decodes in order - LZMA or LZMA2, which is to say nearly all of them -
- * fills the buffer it will be held in from the front, and what is in it
- * is final: @data points into it, at the same place from the first call
- * to the last and for as long as the folder is held, and @avail grows
- * to the entry's size. A folder that ends in a filter gives nothing
- * until it is done, and then everything. The bytes are not checked
- * against a CRC until the folder is.
+ * decodes in order - LZMA, LZMA2, PPMd, Deflate or BZip2, which is to
+ * say nearly all of them - fills the buffer it will be held in from the
+ * front, and what is in it is final: @data points into it, at the same
+ * place from the first call to the last and for as long as the folder
+ * is held, and @avail grows to the entry's size. A folder that ends in
+ * a filter gives nothing until it is done, and then everything. The
+ * bytes are not checked against a CRC until the folder is.
  *
  * Any thread.
  *
@@ -291,6 +292,45 @@ int r7z_archive_decode_step(r7z_archive_t *a, uint32_t index);
  */
 int r7z_archive_decode_peek(const r7z_archive_t *a, uint32_t index,
       const uint8_t **data, size_t *avail);
+
+/**
+ * r7z_archive_stream_begin:
+ * @a          : opened archive
+ * @index      : the entry to stream out
+ *
+ * Starts entry @index out of its folder a piece at a time, for one that
+ * is too big to have whole in memory, or in a folder that is. A folder
+ * of LZMA, LZMA2, PPMd, Deflate, Deflate64, BZip2 or Copy, with up to
+ * three branch converters or Delta after it, decodes in pieces - LZMA
+ * through a window of its dictionary's size - and a BCJ2 folder its
+ * main input so, the other three whole. One entry is streamed at a
+ * time, beside whatever else the archive is doing; after one is all
+ * out, an entry later in the same folder goes on from where it ended,
+ * so a folder's entries streamed in order decode it once.
+ *
+ * Returns: R7Z_OK, R7Z_ERROR_UNSUPPORTED for a folder of another shape,
+ * which the entry is decoded whole from instead, or another negative
+ * R7Z_ERROR_* code.
+ */
+int r7z_archive_stream_begin(r7z_archive_t *a, uint32_t index);
+
+/**
+ * r7z_archive_stream_step:
+ * @data       : receives where the next of the entry's octets are, until
+ *               the next call
+ * @len        : receives how many, which may be none
+ *
+ * Decodes the next piece of the folder, up to 256 KiB.
+ *
+ * Returns: R7Z_PENDING with a piece, R7Z_OK once the entry is all out
+ * and checked against its CRC, or a negative R7Z_ERROR_* code, which
+ * ends the stream.
+ */
+int r7z_archive_stream_step(r7z_archive_t *a, const uint8_t **data,
+      size_t *len);
+
+/* Ends a stream, freeing its window. */
+void r7z_archive_stream_end(r7z_archive_t *a);
 
 RETRO_END_DECLS
 

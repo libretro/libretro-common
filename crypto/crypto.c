@@ -69,6 +69,11 @@
 #endif
 #endif
 
+/* A statement for each of eight, four or one interleaved chains */
+#define AES_CBC_EACH8(S) S(0) S(1) S(2) S(3) S(4) S(5) S(6) S(7)
+#define AES_CBC_EACH4(S) S(0) S(1) S(2) S(3)
+#define AES_CBC_EACH1(S) S(0)
+
 int crypto_memeq_ct(const void *a, const void *b, size_t len)
 {
    const volatile uint8_t *pa = (const volatile uint8_t*)a;
@@ -421,9 +426,8 @@ static void aes_x86_encrypt_block(const struct aes_ctx *ctx,
 }
 
 /* Inverse cipher on the encryption schedule: aesdec wants the round
- * keys through InvMixColumns, applied here per block, as decryption
- * only serves the short Kerberos messages and keeps the context and
- * every other caller unchanged. */
+ * keys through InvMixColumns, applied here per block; a run of blocks
+ * goes through aes_x86_cbc_decrypt(), which makes them once. */
 AES_TARGET_X86
 static void aes_x86_decrypt_block(const struct aes_ctx *ctx,
       const uint8_t *in, uint8_t *out)
@@ -436,6 +440,138 @@ static void aes_x86_decrypt_block(const struct aes_ctx *ctx,
                aes_x86_bswap32(_mm_loadu_si128((const __m128i*)(ctx->rk + 4 * r)))));
    b = _mm_aesdeclast_si128(b, aes_x86_bswap32(_mm_loadu_si128((const __m128i*)ctx->rk)));
    _mm_storeu_si128((__m128i*)out, b);
+}
+
+/* CBC chains interleaved so the AES unit's latency on each is hidden
+ * behind the others, the round keys loaded and byte-swapped once per
+ * call. Eight chains, four or one, each in a register of its own, so
+ * no round waits on a store and a load besides the cipher. */
+
+#define AES_X86_CBC(name, EACH) \
+AES_TARGET_X86 \
+static void name(const __m128i *k, unsigned rounds, uint8_t *const *iv, \
+      const uint8_t *const *in, uint8_t *const *out, size_t len) \
+{ \
+   __m128i  x0, x1, x2, x3, x4, x5, x6, x7; \
+   size_t   off; \
+   unsigned r; \
+   EACH(AES_X86_CBC_LOAD) \
+   for (off = 0; off < len; off += 16) \
+   { \
+      EACH(AES_X86_CBC_IN) \
+      for (r = 1; r < rounds; r++) \
+      { \
+         const __m128i kr = k[r]; \
+         EACH(AES_X86_CBC_ROUND) \
+      } \
+      { \
+         const __m128i kr = k[rounds]; \
+         EACH(AES_X86_CBC_LAST) \
+      } \
+   } \
+   EACH(AES_X86_CBC_STORE) \
+   (void)x0; (void)x1; (void)x2; (void)x3; \
+   (void)x4; (void)x5; (void)x6; (void)x7; \
+}
+#define AES_X86_CBC_LOAD(l)  x##l = _mm_loadu_si128((const __m128i*)iv[l]);
+#define AES_X86_CBC_IN(l)    x##l = _mm_xor_si128(_mm_xor_si128(x##l, \
+      _mm_loadu_si128((const __m128i*)(in[l] + off))), k[0]);
+#define AES_X86_CBC_ROUND(l) x##l = _mm_aesenc_si128(x##l, kr);
+#define AES_X86_CBC_LAST(l)  x##l = _mm_aesenclast_si128(x##l, kr); \
+      _mm_storeu_si128((__m128i*)(out[l] + off), x##l);
+#define AES_X86_CBC_STORE(l) _mm_storeu_si128((__m128i*)iv[l], x##l);
+
+AES_X86_CBC(aes_x86_cbc8, AES_CBC_EACH8)
+AES_X86_CBC(aes_x86_cbc4, AES_CBC_EACH4)
+AES_X86_CBC(aes_x86_cbc1, AES_CBC_EACH1)
+
+AES_TARGET_X86
+static void aes_x86_cbc_lanes(const struct aes_ctx *ctx, unsigned n,
+      uint8_t *const *iv, const uint8_t *const *in, uint8_t *const *out,
+      size_t len)
+{
+   __m128i  k[15];
+   unsigned r, rounds = ctx->rounds;
+
+   for (r = 0; r <= rounds; r++)
+      k[r] = aes_x86_bswap32(_mm_loadu_si128((const __m128i*)(ctx->rk + 4 * r)));
+   for (; n >= 8; n -= 8, iv += 8, in += 8, out += 8)
+      aes_x86_cbc8(k, rounds, iv, in, out, len);
+   for (; n >= 4; n -= 4, iv += 4, in += 4, out += 4)
+      aes_x86_cbc4(k, rounds, iv, in, out, len);
+   for (; n; n--, iv++, in++, out++)
+      aes_x86_cbc1(k, rounds, iv, in, out, len);
+}
+
+/* CBC decryption has no chain to wait on: eight blocks go through the
+ * inverse cipher at once, each XORed with the ciphertext before it.
+ * The InvMixColumns round keys are made once per call. Every block's
+ * ciphertext is held in a register before its plaintext is stored, so
+ * @in and @out may alias. */
+AES_TARGET_X86
+static void aes_x86_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   __m128i  k[15];
+   __m128i  prev = _mm_loadu_si128((const __m128i*)iv);
+   unsigned r, nr = ctx->rounds;
+
+   k[0]  = aes_x86_bswap32(_mm_loadu_si128((const __m128i*)ctx->rk));
+   k[nr] = aes_x86_bswap32(_mm_loadu_si128((const __m128i*)(ctx->rk + 4 * nr)));
+   for (r = 1; r < nr; r++)
+      k[r] = _mm_aesimc_si128(aes_x86_bswap32(
+               _mm_loadu_si128((const __m128i*)(ctx->rk + 4 * r))));
+
+   while (len >= 128)
+   {
+      __m128i c0 = _mm_loadu_si128((const __m128i*)(in));
+      __m128i c1 = _mm_loadu_si128((const __m128i*)(in +  16));
+      __m128i c2 = _mm_loadu_si128((const __m128i*)(in +  32));
+      __m128i c3 = _mm_loadu_si128((const __m128i*)(in +  48));
+      __m128i c4 = _mm_loadu_si128((const __m128i*)(in +  64));
+      __m128i c5 = _mm_loadu_si128((const __m128i*)(in +  80));
+      __m128i c6 = _mm_loadu_si128((const __m128i*)(in +  96));
+      __m128i c7 = _mm_loadu_si128((const __m128i*)(in + 112));
+      __m128i b0 = _mm_xor_si128(c0, k[nr]);
+      __m128i b1 = _mm_xor_si128(c1, k[nr]);
+      __m128i b2 = _mm_xor_si128(c2, k[nr]);
+      __m128i b3 = _mm_xor_si128(c3, k[nr]);
+      __m128i b4 = _mm_xor_si128(c4, k[nr]);
+      __m128i b5 = _mm_xor_si128(c5, k[nr]);
+      __m128i b6 = _mm_xor_si128(c6, k[nr]);
+      __m128i b7 = _mm_xor_si128(c7, k[nr]);
+      for (r = nr - 1; r > 0; r--)
+      {
+         __m128i kr = k[r];
+         b0 = _mm_aesdec_si128(b0, kr); b1 = _mm_aesdec_si128(b1, kr);
+         b2 = _mm_aesdec_si128(b2, kr); b3 = _mm_aesdec_si128(b3, kr);
+         b4 = _mm_aesdec_si128(b4, kr); b5 = _mm_aesdec_si128(b5, kr);
+         b6 = _mm_aesdec_si128(b6, kr); b7 = _mm_aesdec_si128(b7, kr);
+      }
+      _mm_storeu_si128((__m128i*)(out),       _mm_xor_si128(_mm_aesdeclast_si128(b0, k[0]), prev));
+      _mm_storeu_si128((__m128i*)(out +  16), _mm_xor_si128(_mm_aesdeclast_si128(b1, k[0]), c0));
+      _mm_storeu_si128((__m128i*)(out +  32), _mm_xor_si128(_mm_aesdeclast_si128(b2, k[0]), c1));
+      _mm_storeu_si128((__m128i*)(out +  48), _mm_xor_si128(_mm_aesdeclast_si128(b3, k[0]), c2));
+      _mm_storeu_si128((__m128i*)(out +  64), _mm_xor_si128(_mm_aesdeclast_si128(b4, k[0]), c3));
+      _mm_storeu_si128((__m128i*)(out +  80), _mm_xor_si128(_mm_aesdeclast_si128(b5, k[0]), c4));
+      _mm_storeu_si128((__m128i*)(out +  96), _mm_xor_si128(_mm_aesdeclast_si128(b6, k[0]), c5));
+      _mm_storeu_si128((__m128i*)(out + 112), _mm_xor_si128(_mm_aesdeclast_si128(b7, k[0]), c6));
+      prev = c7;
+      in  += 128;
+      out += 128;
+      len -= 128;
+   }
+   for (; len >= 16; in += 16, out += 16, len -= 16)
+   {
+      __m128i c = _mm_loadu_si128((const __m128i*)in);
+      __m128i b = _mm_xor_si128(c, k[nr]);
+      for (r = nr - 1; r > 0; r--)
+         b = _mm_aesdec_si128(b, k[r]);
+      _mm_storeu_si128((__m128i*)out,
+            _mm_xor_si128(_mm_aesdeclast_si128(b, k[0]), prev));
+      prev = c;
+   }
+   _mm_storeu_si128((__m128i*)iv, prev);
 }
 
 /* CTR with eight blocks in flight so the AES unit's latency is hidden,
@@ -705,6 +841,130 @@ static void aes_arm_decrypt_block(const struct aes_ctx *ctx,
    for (r--; r > 0; r--)
       b = vaesdq_u8(vaesimcq_u8(b), vaesimcq_u8(aes_arm_rk(ctx, r)));
    vst1q_u8(out, veorq_u8(b, aes_arm_rk(ctx, 0)));
+}
+
+/* CBC chains interleaved, each in a register of its own, as the x86
+ * form above; the round keys loaded once. */
+#define AES_ARM_CBC(name, EACH) \
+AES_TARGET_ARM \
+static void name(const uint8x16_t *k, unsigned rounds, uint8_t *const *iv, \
+      const uint8_t *const *in, uint8_t *const *out, size_t len) \
+{ \
+   uint8x16_t x0, x1, x2, x3, x4, x5, x6, x7; \
+   size_t     off; \
+   unsigned   r; \
+   EACH(AES_ARM_CBC_LOAD) \
+   for (off = 0; off < len; off += 16) \
+   { \
+      EACH(AES_ARM_CBC_IN) \
+      for (r = 0; r + 1 < rounds; r++) \
+      { \
+         const uint8x16_t kr = k[r]; \
+         EACH(AES_ARM_CBC_ROUND) \
+      } \
+      { \
+         const uint8x16_t kr = k[r], kl = k[r + 1]; \
+         EACH(AES_ARM_CBC_LAST) \
+      } \
+   } \
+   EACH(AES_ARM_CBC_STORE) \
+   (void)x0; (void)x1; (void)x2; (void)x3; \
+   (void)x4; (void)x5; (void)x6; (void)x7; \
+}
+#define AES_ARM_CBC_LOAD(l)  x##l = vld1q_u8(iv[l]);
+#define AES_ARM_CBC_IN(l)    x##l = veorq_u8(x##l, vld1q_u8(in[l] + off));
+#define AES_ARM_CBC_ROUND(l) x##l = vaesmcq_u8(vaeseq_u8(x##l, kr));
+#define AES_ARM_CBC_LAST(l)  x##l = veorq_u8(vaeseq_u8(x##l, kr), kl); \
+      vst1q_u8(out[l] + off, x##l);
+#define AES_ARM_CBC_STORE(l) vst1q_u8(iv[l], x##l);
+
+AES_ARM_CBC(aes_arm_cbc8, AES_CBC_EACH8)
+AES_ARM_CBC(aes_arm_cbc4, AES_CBC_EACH4)
+AES_ARM_CBC(aes_arm_cbc1, AES_CBC_EACH1)
+
+AES_TARGET_ARM
+static void aes_arm_cbc_lanes(const struct aes_ctx *ctx, unsigned n,
+      uint8_t *const *iv, const uint8_t *const *in, uint8_t *const *out,
+      size_t len)
+{
+   uint8x16_t k[15];
+   unsigned   r, rounds = ctx->rounds;
+
+   for (r = 0; r <= rounds; r++)
+      k[r] = aes_arm_rk(ctx, r);
+   for (; n >= 8; n -= 8, iv += 8, in += 8, out += 8)
+      aes_arm_cbc8(k, rounds, iv, in, out, len);
+   for (; n >= 4; n -= 4, iv += 4, in += 4, out += 4)
+      aes_arm_cbc4(k, rounds, iv, in, out, len);
+   for (; n; n--, iv++, in++, out++)
+      aes_arm_cbc1(k, rounds, iv, in, out, len);
+}
+
+/* CBC decryption, eight blocks at once as the x86 form above. AESD
+ * takes the round key before the inverse substitution, so a round is
+ * AESIMC on the state, then AESD with the round key through AESIMC. */
+AES_TARGET_ARM
+static void aes_arm_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   uint8x16_t k[15];
+   uint8x16_t prev = vld1q_u8(iv);
+   unsigned   r, nr = ctx->rounds;
+
+   k[0]  = aes_arm_rk(ctx, 0);
+   k[nr] = aes_arm_rk(ctx, nr);
+   for (r = 1; r < nr; r++)
+      k[r] = vaesimcq_u8(aes_arm_rk(ctx, r));
+
+   while (len >= 128)
+   {
+      uint8x16_t c0 = vld1q_u8(in);
+      uint8x16_t c1 = vld1q_u8(in +  16);
+      uint8x16_t c2 = vld1q_u8(in +  32);
+      uint8x16_t c3 = vld1q_u8(in +  48);
+      uint8x16_t c4 = vld1q_u8(in +  64);
+      uint8x16_t c5 = vld1q_u8(in +  80);
+      uint8x16_t c6 = vld1q_u8(in +  96);
+      uint8x16_t c7 = vld1q_u8(in + 112);
+      uint8x16_t b0 = vaesdq_u8(c0, k[nr]);
+      uint8x16_t b1 = vaesdq_u8(c1, k[nr]);
+      uint8x16_t b2 = vaesdq_u8(c2, k[nr]);
+      uint8x16_t b3 = vaesdq_u8(c3, k[nr]);
+      uint8x16_t b4 = vaesdq_u8(c4, k[nr]);
+      uint8x16_t b5 = vaesdq_u8(c5, k[nr]);
+      uint8x16_t b6 = vaesdq_u8(c6, k[nr]);
+      uint8x16_t b7 = vaesdq_u8(c7, k[nr]);
+      for (r = nr - 1; r > 0; r--)
+      {
+         const uint8x16_t kr = k[r];
+         b0 = vaesdq_u8(vaesimcq_u8(b0), kr); b1 = vaesdq_u8(vaesimcq_u8(b1), kr);
+         b2 = vaesdq_u8(vaesimcq_u8(b2), kr); b3 = vaesdq_u8(vaesimcq_u8(b3), kr);
+         b4 = vaesdq_u8(vaesimcq_u8(b4), kr); b5 = vaesdq_u8(vaesimcq_u8(b5), kr);
+         b6 = vaesdq_u8(vaesimcq_u8(b6), kr); b7 = vaesdq_u8(vaesimcq_u8(b7), kr);
+      }
+      vst1q_u8(out,       veorq_u8(veorq_u8(b0, k[0]), prev));
+      vst1q_u8(out +  16, veorq_u8(veorq_u8(b1, k[0]), c0));
+      vst1q_u8(out +  32, veorq_u8(veorq_u8(b2, k[0]), c1));
+      vst1q_u8(out +  48, veorq_u8(veorq_u8(b3, k[0]), c2));
+      vst1q_u8(out +  64, veorq_u8(veorq_u8(b4, k[0]), c3));
+      vst1q_u8(out +  80, veorq_u8(veorq_u8(b5, k[0]), c4));
+      vst1q_u8(out +  96, veorq_u8(veorq_u8(b6, k[0]), c5));
+      vst1q_u8(out + 112, veorq_u8(veorq_u8(b7, k[0]), c6));
+      prev = c7;
+      in  += 128;
+      out += 128;
+      len -= 128;
+   }
+   for (; len >= 16; in += 16, out += 16, len -= 16)
+   {
+      uint8x16_t c = vld1q_u8(in);
+      uint8x16_t b = vaesdq_u8(c, k[nr]);
+      for (r = nr - 1; r > 0; r--)
+         b = vaesdq_u8(vaesimcq_u8(b), k[r]);
+      vst1q_u8(out, veorq_u8(veorq_u8(b, k[0]), prev));
+      prev = c;
+   }
+   vst1q_u8(iv, prev);
 }
 
 /* CTR with eight blocks in flight, the round keys loaded once per
@@ -1181,6 +1441,80 @@ void aes_ctr_crypt(const struct aes_ctx *ctx, uint8_t *counter,
    crypto_memzero(ks, sizeof(ks));
 }
 
+void aes_cbc_encrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   aes_cbc_encrypt_lanes(ctx, 1, &iv, &in, &out, len);
+}
+
+void aes_cbc_encrypt_lanes(const struct aes_ctx *ctx, unsigned n,
+      uint8_t *const *iv, const uint8_t *const *in, uint8_t *const *out,
+      size_t len)
+{
+   unsigned l;
+
+#if defined(AES_HAVE_X86_PATH)
+   if (aes_x86_available())
+   {
+      aes_x86_cbc_lanes(ctx, n, iv, in, out, len);
+      return;
+   }
+#elif defined(AES_HAVE_ARM_PATH)
+   if (aes_arm_available())
+   {
+      aes_arm_cbc_lanes(ctx, n, iv, in, out, len);
+      return;
+   }
+#endif
+   for (l = 0; l < n; l++)
+   {
+      size_t   off;
+      unsigned i;
+      uint8_t  x[16];
+      memcpy(x, iv[l], 16);
+      for (off = 0; off < len; off += 16)
+      {
+         for (i = 0; i < 16; i++)
+            x[i] ^= in[l][off + i];
+         aes_encrypt_block(ctx, x, x);
+         memcpy(out[l] + off, x, 16);
+      }
+      memcpy(iv[l], x, 16);
+   }
+}
+
+void aes_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   uint8_t prev[16], c[16];
+   size_t  off;
+   unsigned i;
+
+#if defined(AES_HAVE_X86_PATH)
+   if (aes_x86_available())
+   {
+      aes_x86_cbc_decrypt(ctx, iv, in, out, len);
+      return;
+   }
+#elif defined(AES_HAVE_ARM_PATH)
+   if (aes_arm_available())
+   {
+      aes_arm_cbc_decrypt(ctx, iv, in, out, len);
+      return;
+   }
+#endif
+   memcpy(prev, iv, 16);
+   for (off = 0; off + 16 <= len; off += 16)
+   {
+      memcpy(c, in + off, 16);
+      aes_decrypt_block_c(ctx, c, out + off);
+      for (i = 0; i < 16; i++)
+         out[off + i] ^= prev[i];
+      memcpy(prev, c, 16);
+   }
+   memcpy(iv, prev, 16);
+}
+
 /* Double in GF(2^128) with the CMAC polynomial. */
 static void aes_cmac_dbl(uint8_t *b)
 {
@@ -1195,6 +1529,78 @@ static void aes_cmac_dbl(uint8_t *b)
       carry = next;
    }
    b[15] ^= (uint8_t)(0x87 & (0 - msb));
+}
+
+void aes_cmac_init(struct aes_cmac_ctx *s, const struct aes_ctx *aes)
+{
+   s->aes = aes;
+   s->n   = 0;
+   memset(s->x, 0, 16);
+}
+
+/* The last block takes a subkey, so a full block is held back until
+ * more of the message shows it was not the last. */
+void aes_cmac_update(struct aes_cmac_ctx *s, const uint8_t *msg, size_t len)
+{
+   unsigned i;
+   /* the chain in a local for the call: through @s, every octet of it
+    * may alias @msg and the block XOR is not vectorised */
+   uint8_t  x[16];
+
+   if (!len)
+      return;
+   memcpy(x, s->x, 16);
+   if (s->n)
+   {
+      size_t take = 16 - s->n;
+      if (take > len)
+         take = len;
+      memcpy(s->buf + s->n, msg, take);
+      s->n += take;
+      msg  += take;
+      len  -= take;
+      if (!len)
+         return;
+      for (i = 0; i < 16; i++)
+         x[i] ^= s->buf[i];
+      aes_encrypt_block(s->aes, x, x);
+      s->n = 0;
+   }
+   while (len > 16)
+   {
+      for (i = 0; i < 16; i++)
+         x[i] ^= msg[i];
+      aes_encrypt_block(s->aes, x, x);
+      msg += 16;
+      len -= 16;
+   }
+   memcpy(s->buf, msg, len);
+   s->n = len;
+   memcpy(s->x, x, 16);
+   crypto_memzero(x, sizeof(x));
+}
+
+void aes_cmac_final(struct aes_cmac_ctx *s, uint8_t *mac)
+{
+   unsigned i;
+   uint8_t  k[16];
+
+   memset(k, 0, 16);
+   aes_encrypt_block(s->aes, k, k);
+   aes_cmac_dbl(k);
+   if (s->n != 16)
+   {
+      /* Partial or empty last block: pad 10* and use K2 = dbl(K1). */
+      aes_cmac_dbl(k);
+      memset(s->buf + s->n, 0, 16 - s->n);
+      s->buf[s->n] = 0x80;
+   }
+   for (i = 0; i < 16; i++)
+      s->x[i] ^= s->buf[i] ^ k[i];
+   aes_encrypt_block(s->aes, s->x, mac);
+
+   crypto_memzero(k, sizeof(k));
+   crypto_memzero(s, sizeof(*s));
 }
 
 void aes_cmac(const struct aes_ctx *ctx,
@@ -1246,6 +1652,187 @@ void aes_cmac(const struct aes_ctx *ctx,
 }
 
 /* ---- CCM (RFC 3610) ---------------------------------------------- */
+
+/* CBC-MAC over B_0 || AAD (length-prefixed, padded) || payload
+ * (padded), then CTR with A_i counters; the tag is the MAC under
+ * counter zero. */
+int aes_ccm_stream_init(struct aes_ccm_stream *s, const struct aes_ctx *ctx,
+      const uint8_t *nonce, size_t nonce_len,
+      const uint8_t *aad, size_t aad_len,
+      size_t msg_len, size_t tag_len)
+{
+   size_t   L, i, off;
+   size_t   remaining;
+   uint8_t *x = s->x;
+
+   if (nonce_len < 7 || nonce_len > 13 || tag_len < 4 || tag_len > 16 || (tag_len & 1))
+      return -1;
+   L = 15 - nonce_len;
+   /* the length must fit L octets; shifted as 64 bits, since a 32-bit
+    * size_t shifted by 32 (L = 4, the 11-octet nonce SMB uses) is
+    * undefined and comes back unshifted on MIPS */
+   if (L < 8 && ((uint64_t)msg_len >> (8 * L)) != 0)
+      return -1;
+   s->aes     = ctx;
+   s->len     = msg_len;
+   s->off     = 0;
+   s->L       = L;
+   s->tag_len = tag_len;
+
+   /* B_0: flags | nonce | length of the message */
+   x[0] = (uint8_t)((aad_len ? 0x40 : 0) | (((tag_len - 2) / 2) << 3) | (L - 1));
+   memcpy(x + 1, nonce, nonce_len);
+   remaining = msg_len;
+   for (i = 0; i < L; i++)
+   {
+      x[15 - i]  = (uint8_t)remaining;
+      remaining >>= 8;
+   }
+   aes_encrypt_block(ctx, x, x);
+
+   /* AAD, length-prefixed (2 or 6 octets here; > 2^32 is not needed) */
+   if (aad_len)
+   {
+      uint8_t blk[16];
+      size_t  n;
+      memset(blk, 0, 16);
+      if (aad_len < 0xff00)
+      {
+         blk[0] = (uint8_t)(aad_len >> 8);
+         blk[1] = (uint8_t)aad_len;
+         off    = 2;
+      }
+      else
+      {
+         blk[0] = 0xff; blk[1] = 0xfe;
+         crypto_store32_be(blk + 2, (uint32_t)aad_len);
+         off = 6;
+      }
+      n = 16 - off;
+      if (n > aad_len)
+         n = aad_len;
+      memcpy(blk + off, aad, n);
+      for (i = 0; i < 16; i++)
+         x[i] ^= blk[i];
+      aes_encrypt_block(ctx, x, x);
+      aad += n;
+      aad_len -= n;
+      while (aad_len)
+      {
+         n = aad_len < 16 ? aad_len : 16;
+         for (i = 0; i < n; i++)
+            x[i] ^= aad[i];
+         aes_encrypt_block(ctx, x, x);
+         aad += n;
+         aad_len -= n;
+      }
+   }
+
+   /* Counter blocks: flags = L - 1, nonce, counter */
+   memset(s->ctr, 0, 16);
+   s->ctr[0] = (uint8_t)(L - 1);
+   memcpy(s->ctr + 1, nonce, nonce_len);
+   aes_encrypt_block(ctx, s->ctr, s->s0);     /* S_0, for the tag */
+   return 0;
+}
+
+/* A piece that starts or ends inside a block carries its keystream
+ * and the MAC chain across in @s; the chain is run when the block
+ * fills or the message ends. The chain, counter and keystream are
+ * locals for the call - through @s every octet may alias the data and
+ * the block loops are not vectorised. */
+static void aes_ccm_stream_run(struct aes_ccm_stream *s, int encrypt,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   uint8_t x[16], ctr[16], ks[16];
+   size_t  i, L = s->L, off = s->off;
+
+   if (len > s->len - off)
+      len = s->len - off;
+   if (!len)
+      return;
+   memcpy(x,   s->x,   16);
+   memcpy(ctr, s->ctr, 16);
+   memcpy(ks,  s->ks,  16);
+   while (len)
+   {
+      size_t pos = off & 15;
+      size_t n   = 16 - pos;
+      if (n > len)
+         n = len;
+      if (!pos)
+      {
+         size_t c = off / 16 + 1;
+         for (i = 0; i < L; i++)
+         {
+            ctr[15 - i] = (uint8_t)c;
+            c >>= 8;
+         }
+         aes_encrypt_block(s->aes, ctr, ks);
+      }
+      if (n == 16)
+      {
+         if (encrypt)
+         {
+            for (i = 0; i < 16; i++)
+               x[i] ^= in[i];
+            for (i = 0; i < 16; i++)
+               out[i] = in[i] ^ ks[i];
+         }
+         else
+            for (i = 0; i < 16; i++)
+            {
+               uint8_t p = (uint8_t)(in[i] ^ ks[i]);
+               out[i]    = p;
+               x[i]     ^= p;
+            }
+      }
+      else if (encrypt)
+         for (i = 0; i < n; i++)
+         {
+            x[pos + i] ^= in[i];
+            out[i]      = in[i] ^ ks[pos + i];
+         }
+      else
+         for (i = 0; i < n; i++)
+         {
+            out[i]      = in[i] ^ ks[pos + i];
+            x[pos + i] ^= out[i];
+         }
+      off += n;
+      if (!(off & 15) || off == s->len)
+         aes_encrypt_block(s->aes, x, x);
+      in  += n;
+      out += n;
+      len -= n;
+   }
+   s->off = off;
+   memcpy(s->x,   x,   16);
+   memcpy(s->ctr, ctr, 16);
+   memcpy(s->ks,  ks,  16);
+   crypto_memzero(x,  sizeof(x));
+   crypto_memzero(ks, sizeof(ks));
+}
+
+void aes_ccm_stream_encrypt(struct aes_ccm_stream *s,
+      const uint8_t *pt, uint8_t *ct, size_t len)
+{
+   aes_ccm_stream_run(s, 1, pt, ct, len);
+}
+
+void aes_ccm_stream_decrypt(struct aes_ccm_stream *s,
+      const uint8_t *ct, uint8_t *pt, size_t len)
+{
+   aes_ccm_stream_run(s, 0, ct, pt, len);
+}
+
+void aes_ccm_stream_tag(struct aes_ccm_stream *s, uint8_t *tag)
+{
+   size_t i;
+   for (i = 0; i < s->tag_len; i++)
+      tag[i] = s->x[i] ^ s->s0[i];
+   crypto_memzero(s, sizeof(*s));
+}
 
 /* CBC-MAC over B_0 || AAD (length-prefixed, padded) || payload
  * (padded), then CTR with A_i counters; the tag is the MAC under
@@ -1603,6 +2190,118 @@ int aes_gcm_decrypt(const struct aes_gcm_ctx *ctx,
    aes_ctr_inc32(ctr);
    aes_ctr_crypt(&ctx->aes, ctr, ct, pt, ct_len);
    return 0;
+}
+
+void aes_gcm_stream_init(struct aes_gcm_stream *s,
+      const struct aes_gcm_ctx *ctx, const uint8_t *nonce, size_t nonce_len)
+{
+   s->g        = ctx;
+   s->y_hi     = 0;
+   s->y_lo     = 0;
+   s->aad_len  = 0;
+   s->ct_len   = 0;
+   s->part_len = 0;
+   aes_gcm_j0(ctx, nonce, nonce_len, s->j0);
+}
+
+/* GHASH takes whole blocks; a piece's tail waits in part for the
+ * next piece of the same input, and is padded where that input ends. */
+static void aes_gcm_stream_feed(struct aes_gcm_stream *s,
+      const uint8_t *data, size_t len)
+{
+   size_t bulk;
+
+   if (s->part_len)
+   {
+      size_t take = 16 - s->part_len;
+      if (take > len)
+         take = len;
+      memcpy(s->part + s->part_len, data, take);
+      s->part_len += take;
+      data        += take;
+      len         -= take;
+      if (s->part_len < 16)
+         return;
+      aes_gcm_ghash_update(s->g, &s->y_hi, &s->y_lo, s->part, 16);
+      s->part_len = 0;
+   }
+   bulk = len & ~(size_t)15;
+   if (bulk)
+      aes_gcm_ghash_update(s->g, &s->y_hi, &s->y_lo, data, bulk);
+   memcpy(s->part, data + bulk, len - bulk);
+   s->part_len = len - bulk;
+}
+
+static void aes_gcm_stream_pad(struct aes_gcm_stream *s)
+{
+   if (s->part_len)
+   {
+      aes_gcm_ghash_update(s->g, &s->y_hi, &s->y_lo, s->part, s->part_len);
+      s->part_len = 0;
+   }
+}
+
+void aes_gcm_stream_aad(struct aes_gcm_stream *s,
+      const uint8_t *aad, size_t len)
+{
+   aes_gcm_stream_feed(s, aad, len);
+   s->aad_len += len;
+}
+
+void aes_gcm_stream_hash_ct(struct aes_gcm_stream *s,
+      const uint8_t *ct, size_t len)
+{
+   if (!s->ct_len)
+      aes_gcm_stream_pad(s);           /* the AAD ends here */
+   aes_gcm_stream_feed(s, ct, len);
+   s->ct_len += len;
+}
+
+void aes_gcm_stream_tag(struct aes_gcm_stream *s, uint8_t *tag)
+{
+   unsigned i;
+   uint8_t  ek[16];
+
+   aes_gcm_stream_pad(s);
+   s->y_hi ^= s->aad_len * 8;
+   s->y_lo ^= s->ct_len  * 8;
+   aes_gcm_mul(s->g, &s->y_hi, &s->y_lo);
+   aes_encrypt_block(&s->g->aes, s->j0, ek);
+   crypto_store64_be(tag,     s->y_hi);
+   crypto_store64_be(tag + 8, s->y_lo);
+   for (i = 0; i < 16; i++)
+      tag[i] ^= ek[i];
+   crypto_memzero(ek, sizeof(ek));
+}
+
+void aes_gcm_stream_crypt(const struct aes_gcm_stream *s, uint64_t off,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   uint8_t  ctr[16];
+   size_t   pos = (size_t)(off & 15);
+
+   /* the ciphertext's block b runs under counter J0 + 1 + b */
+   memcpy(ctr, s->j0, 16);
+   crypto_store32_be(ctr + 12, crypto_load32_be(s->j0 + 12)
+         + 1 + (uint32_t)(off >> 4));
+   if (pos)
+   {
+      uint8_t ks[16];
+      size_t  i, n = 16 - pos;
+      if (n > len)
+         n = len;
+      aes_encrypt_block(&s->g->aes, ctr, ks);
+      aes_ctr_inc32(ctr);
+      for (i = 0; i < n; i++)
+         out[i] = in[i] ^ ks[pos + i];
+      crypto_memzero(ks, sizeof(ks));
+      in  += n;
+      out += n;
+      len -= n;
+   }
+   if (len)
+      aes_ctr_crypt(&s->g->aes, ctr, in, out, len);
+   crypto_memzero(ctr, sizeof(ctr));
 }
 
 #define QR(a, b, c, d)                                  \

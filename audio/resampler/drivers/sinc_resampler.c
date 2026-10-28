@@ -47,8 +47,58 @@
 #include <xmmintrin.h>
 #endif
 
-#if defined(__AVX__)
+/* The AVX and AVX-512 kernels are built whenever the compiler can emit
+ * them for a single function, whatever the build's baseline, and are
+ * only selected when cpu_features_get() reports the CPU and OS support
+ * them. A build for a baseline CPU therefore still carries them, and a
+ * compiler too old for per-function targets simply leaves them out.
+ * MSVC allows any intrinsic in any function and needs no attribute. */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(_MSC_VER) && !defined(__clang__)
+#if _MSC_VER >= 1600
+#define SINC_HAVE_AVX 1
+#define SINC_TARGET_AVX
+#endif
+#if _MSC_VER >= 1911
+#define SINC_HAVE_AVX512 1
+#define SINC_TARGET_AVX512
+#endif
+#elif defined(__clang__) && (defined(__SCE__) || defined(_MSC_VER))
+/* Clang's immintrin.h for PlayStation and clang-cl only declares the
+ * intrinsics of ISAs enabled for the whole build, so per-function
+ * targets cannot reach them; build a tier only when the baseline has it. */
+#ifdef __AVX__
+#define SINC_HAVE_AVX 1
+#define SINC_TARGET_AVX
+#endif
+#ifdef __AVX512F__
+#define SINC_HAVE_AVX512 1
+#define SINC_TARGET_AVX512
+#endif
+#elif (defined(__clang__) && __clang_major__ >= 4) \
+   || (defined(__GNUC__) && !defined(__clang__) \
+      && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 9)))
+#define SINC_HAVE_AVX 1
+#define SINC_HAVE_AVX512 1
+#define SINC_TARGET_AVX    __attribute__((target("avx")))
+#define SINC_TARGET_AVX512 __attribute__((target("avx512f")))
+#elif defined(__AVX__)
+#define SINC_HAVE_AVX 1
+#define SINC_TARGET_AVX
+#endif
+#endif
+
+#if defined(SINC_HAVE_AVX) || defined(SINC_HAVE_AVX512)
 #include <immintrin.h>
+#endif
+
+/* MSVC leaves the upper YMM/ZMM halves dirty on return; clear them so
+ * the SSE code that follows pays no transition penalty. GCC and Clang
+ * insert this themselves for target functions. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define SINC_ZEROUPPER() _mm256_zeroupper()
+#else
+#define SINC_ZEROUPPER()
 #endif
 
 /* Rough SNR values for upsampling:
@@ -306,7 +356,8 @@ static void resampler_sinc_process_neon(void *re_, struct resampler_data *data)
 }
 #endif
 
-#if defined(__AVX__)
+#ifdef SINC_HAVE_AVX
+SINC_TARGET_AVX
 static void resampler_sinc_process_avx_kaiser(void *re_, struct resampler_data *data)
 {
    rarch_sinc_resampler_t *resamp = (rarch_sinc_resampler_t*)re_;
@@ -373,8 +424,10 @@ static void resampler_sinc_process_avx_kaiser(void *re_, struct resampler_data *
    }
 
    data->output_frames = out_frames;
+   SINC_ZEROUPPER();
 }
 
+SINC_TARGET_AVX
 static void resampler_sinc_process_avx(void *re_, struct resampler_data *data)
 {
    rarch_sinc_resampler_t *resamp = (rarch_sinc_resampler_t*)re_;
@@ -435,6 +488,159 @@ static void resampler_sinc_process_avx(void *re_, struct resampler_data *data)
    }
 
    data->output_frames = out_frames;
+   SINC_ZEROUPPER();
+}
+#endif
+
+#ifdef SINC_HAVE_AVX512
+/* Sixteen taps per step with a fused multiply-add. taps is a multiple
+ * of 8, so a tail of 8 may be left over; a masked load covers it with
+ * zeroes in the upper lanes instead of a second loop, and cannot fault
+ * past the end because masked-off lanes are never read. */
+#define SINC_AVX512_SUM(sum) \
+   _mm256_add_ps(_mm512_castps512_ps256(sum), \
+      _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(sum), 1)))
+
+/* Both channels' 8 partial sums down to [l, r] in one register, stored
+ * as the output frame with a single 64-bit store. */
+#define SINC_AVX512_STORE(out, res_l, res_r) \
+   do { \
+      __m128 l4_ = _mm_add_ps(_mm256_castps256_ps128(res_l), \
+            _mm256_extractf128_ps(res_l, 1)); \
+      __m128 r4_ = _mm_add_ps(_mm256_castps256_ps128(res_r), \
+            _mm256_extractf128_ps(res_r, 1)); \
+      __m128 lr_ = _mm_hadd_ps(l4_, r4_); \
+      lr_        = _mm_hadd_ps(lr_, lr_); \
+      _mm_storel_epi64((__m128i*)(out), _mm_castps_si128(lr_)); \
+   } while (0)
+
+SINC_TARGET_AVX512
+static void resampler_sinc_process_avx512_kaiser(void *re_, struct resampler_data *data)
+{
+   rarch_sinc_resampler_t *resamp = (rarch_sinc_resampler_t*)re_;
+   unsigned phases                = 1 << (resamp->phase_bits + resamp->subphase_bits);
+   uint32_t ratio                 = phases / data->ratio;
+   const float *input             = data->data_in;
+   float *output                  = data->data_out;
+   size_t frames                  = data->input_frames;
+   size_t out_frames              = 0;
+   unsigned taps                  = resamp->taps;
+   unsigned taps2                 = taps * 2;
+   unsigned full                  = taps & ~15u;
+   __mmask16 tail                 = (taps & 8) ? 0x00FF : 0;
+
+   while (frames)
+   {
+      SINC_PUSH_INPUT_SAMPLES(resamp, input, taps, phases, frames);
+
+      {
+         const float *buffer_l    = resamp->buffer_l + resamp->ptr;
+         const float *buffer_r    = resamp->buffer_r + resamp->ptr;
+         while (resamp->time < phases)
+         {
+            /* C89: all declarations at top of block */
+            unsigned i;
+            __m256 res_l, res_r;
+            unsigned phase           = resamp->time >> resamp->subphase_bits;
+            const float *phase_table = resamp->phase_table + phase * taps2;
+            const float *delta_table = phase_table + taps;
+            __m512 delta             = _mm512_set1_ps((float)
+                  (resamp->time & resamp->subphase_mask) * resamp->subphase_mod);
+            __m512 sum_l             = _mm512_setzero_ps();
+            __m512 sum_r             = _mm512_setzero_ps();
+
+            for (i = 0; i < full; i += 16)
+            {
+               __m512 sinc_v = _mm512_fmadd_ps(_mm512_loadu_ps(delta_table + i),
+                     delta, _mm512_loadu_ps(phase_table + i));
+               sum_l = _mm512_fmadd_ps(_mm512_loadu_ps(buffer_l + i), sinc_v, sum_l);
+               sum_r = _mm512_fmadd_ps(_mm512_loadu_ps(buffer_r + i), sinc_v, sum_r);
+            }
+            if (tail)
+            {
+               __m512 sinc_v = _mm512_fmadd_ps(
+                     _mm512_maskz_loadu_ps(tail, delta_table + i), delta,
+                     _mm512_maskz_loadu_ps(tail, phase_table + i));
+               sum_l = _mm512_fmadd_ps(
+                     _mm512_maskz_loadu_ps(tail, buffer_l + i), sinc_v, sum_l);
+               sum_r = _mm512_fmadd_ps(
+                     _mm512_maskz_loadu_ps(tail, buffer_r + i), sinc_v, sum_r);
+            }
+
+            res_l     = SINC_AVX512_SUM(sum_l);
+            res_r     = SINC_AVX512_SUM(sum_r);
+            SINC_AVX512_STORE(output, res_l, res_r);
+
+            output += 2;
+            out_frames++;
+            resamp->time += ratio;
+         }
+      }
+   }
+
+   data->output_frames = out_frames;
+   SINC_ZEROUPPER();
+}
+
+SINC_TARGET_AVX512
+static void resampler_sinc_process_avx512(void *re_, struct resampler_data *data)
+{
+   rarch_sinc_resampler_t *resamp = (rarch_sinc_resampler_t*)re_;
+   unsigned phases                = 1 << (resamp->phase_bits + resamp->subphase_bits);
+   uint32_t ratio                 = phases / data->ratio;
+   const float *input             = data->data_in;
+   float *output                  = data->data_out;
+   size_t frames                  = data->input_frames;
+   size_t out_frames              = 0;
+   unsigned taps                  = resamp->taps;
+   unsigned full                  = taps & ~15u;
+   __mmask16 tail                 = (taps & 8) ? 0x00FF : 0;
+
+   while (frames)
+   {
+      SINC_PUSH_INPUT_SAMPLES(resamp, input, taps, phases, frames);
+
+      {
+         const float *buffer_l    = resamp->buffer_l + resamp->ptr;
+         const float *buffer_r    = resamp->buffer_r + resamp->ptr;
+         while (resamp->time < phases)
+         {
+            /* C89: all declarations at top of block */
+            unsigned i;
+            __m256 res_l, res_r;
+            unsigned phase           = resamp->time >> resamp->subphase_bits;
+            const float *phase_table = resamp->phase_table + phase * taps;
+            __m512 sum_l             = _mm512_setzero_ps();
+            __m512 sum_r             = _mm512_setzero_ps();
+
+            for (i = 0; i < full; i += 16)
+            {
+               __m512 sinc_v = _mm512_loadu_ps(phase_table + i);
+               sum_l = _mm512_fmadd_ps(_mm512_loadu_ps(buffer_l + i), sinc_v, sum_l);
+               sum_r = _mm512_fmadd_ps(_mm512_loadu_ps(buffer_r + i), sinc_v, sum_r);
+            }
+            if (tail)
+            {
+               __m512 sinc_v = _mm512_maskz_loadu_ps(tail, phase_table + i);
+               sum_l = _mm512_fmadd_ps(
+                     _mm512_maskz_loadu_ps(tail, buffer_l + i), sinc_v, sum_l);
+               sum_r = _mm512_fmadd_ps(
+                     _mm512_maskz_loadu_ps(tail, buffer_r + i), sinc_v, sum_r);
+            }
+
+            res_l     = SINC_AVX512_SUM(sum_l);
+            res_r     = SINC_AVX512_SUM(sum_r);
+            SINC_AVX512_STORE(output, res_l, res_r);
+
+            output += 2;
+            out_frames++;
+            resamp->time += ratio;
+         }
+      }
+   }
+
+   data->output_frames = out_frames;
+   SINC_ZEROUPPER();
 }
 #endif
 
@@ -587,6 +793,323 @@ static void resampler_sinc_process_sse(void *re_, struct resampler_data *data)
    }
 
    data->output_frames = out_frames;
+}
+#endif
+
+/* Largest tap count each tier reads directly; see below. */
+#define SINC_IL_TAPS_SSE    16
+#define SINC_IL_TAPS_AVX    128
+#define SINC_IL_TAPS_AVX512 192
+
+/* Up to a tap count (SINC_IL_TAPS_*), the x86 vector kernels read the
+ * input where it lies.
+ *
+ * C and NEON keep the planar rings: every input frame is split into
+ * buffer_l / buffer_r, each sample stored twice so a window is always
+ * contiguous. The kernels below skip that. A window that falls inside
+ * the batch is read straight out of data_in, interleaved as the core
+ * gave it; only the windows that reach back past the start of the batch
+ * read from a seam, the last 'taps' frames of history followed by the
+ * first 'taps - 1' frames of the batch. That is 4 * taps - 2 floats, so
+ * the seam lives in the 4 * taps floats the rings occupy for C and NEON,
+ * and everything that copies, clears or restarts the rings carries on
+ * unchanged. Per batch the seam costs two copies of under 'taps' frames,
+ * against four scalar stores per input frame for the rings.
+ *
+ * The window is read oldest frame first, the reverse of the ring, so the
+ * phase tables are reversed for these kernels at init, and arranged in
+ * blocks so one unpack against itself yields the coefficients doubled
+ * up for L/R pairs in exactly the order the frames are in (see
+ * sinc_il_layout). */
+#define SINC_IL_SEAM_BEGIN(seam, input, taps, n_in) \
+   do { \
+      size_t head_ = ((n_in) < (size_t)(taps) - 1) \
+         ? (n_in) : (size_t)(taps) - 1; \
+      memcpy((seam) + 2 * (taps), (input), head_ * 2 * sizeof(float)); \
+   } while (0)
+
+/* History for the next batch: the last 'taps' frames of history + batch. */
+#define SINC_IL_SEAM_END(seam, input, taps, n_in) \
+   do { \
+      if ((n_in) >= (size_t)(taps)) \
+         memcpy((seam), (input) + 2 * ((n_in) - (taps)), \
+               2 * (size_t)(taps) * sizeof(float)); \
+      else if (n_in) \
+         memmove((seam), (seam) + 2 * (n_in), \
+               2 * (size_t)(taps) * sizeof(float)); \
+   } while (0)
+
+/* The control flow of SINC_PUSH_INPUT_SAMPLES without the copying:
+ * 'pushed' counts frames taken from the batch, and the newest window
+ * ends at frame pushed - 1. KERNEL(w) renders one output frame from the
+ * window starting at w. */
+#define SINC_IL_RUN(resamp, data, KERNEL) \
+   rarch_sinc_resampler_t *resamp = (rarch_sinc_resampler_t*)re_; \
+   unsigned phases       = 1 << (resamp->phase_bits + resamp->subphase_bits); \
+   uint32_t ratio        = phases / data->ratio; \
+   const float *input    = data->data_in; \
+   float *output         = data->data_out; \
+   size_t n_in           = data->input_frames; \
+   size_t frames         = n_in; \
+   size_t out_frames     = 0; \
+   size_t pushed         = 0; \
+   unsigned taps         = resamp->taps; \
+   float *seam           = resamp->buffer_l; \
+   if (n_in) \
+      SINC_IL_SEAM_BEGIN(seam, input, taps, n_in); \
+   while (frames) \
+   { \
+      const float *w; \
+      while (frames && resamp->time >= phases) \
+      { \
+         pushed++; \
+         resamp->time -= phases; \
+         frames--; \
+      } \
+      w = (pushed >= taps) ? input + 2 * (pushed - taps) \
+                           : seam + 2 * pushed; \
+      while (resamp->time < phases) \
+      { \
+         KERNEL(w); \
+         output       += 2; \
+         out_frames++; \
+         resamp->time += ratio; \
+      } \
+   } \
+   SINC_IL_SEAM_END(seam, input, taps, n_in); \
+   data->output_frames = out_frames
+
+#ifdef SINC_HAVE_AVX
+/* Eight taps a step: the table block is laid out so unpacklo/unpackhi
+ * give frames 0-3 and 4-7 their doubled coefficients. */
+#define SINC_IL_AVX_STEP(acc0, acc1, w, i, c) \
+   do { \
+      acc0 = _mm256_add_ps(acc0, _mm256_mul_ps( \
+               _mm256_loadu_ps((w) + 2 * (i)), _mm256_unpacklo_ps(c, c))); \
+      acc1 = _mm256_add_ps(acc1, _mm256_mul_ps( \
+               _mm256_loadu_ps((w) + 2 * (i) + 8), _mm256_unpackhi_ps(c, c))); \
+   } while (0)
+
+/* [L R L R | L R L R] down to one stored frame. */
+#define SINC_IL_AVX_STORE(out, acc) \
+   do { \
+      __m128 x_ = _mm_add_ps(_mm256_castps256_ps128(acc), \
+            _mm256_extractf128_ps(acc, 1)); \
+      x_        = _mm_add_ps(x_, _mm_movehl_ps(x_, x_)); \
+      _mm_store_ss((out), x_); \
+      _mm_store_ss((out) + 1, _mm_shuffle_ps(x_, x_, 1)); \
+   } while (0)
+
+#define SINC_IL_AVX_KAISER(w) \
+   do { \
+      unsigned i_; \
+      unsigned phase_      = resamp->time >> resamp->subphase_bits; \
+      const float *ph_     = resamp->phase_table + phase_ * taps * 2; \
+      const float *dt_     = ph_ + taps; \
+      __m256 d_            = _mm256_set1_ps((float) \
+            (resamp->time & resamp->subphase_mask) * resamp->subphase_mod); \
+      __m256 a0_           = _mm256_setzero_ps(); \
+      __m256 a1_           = _mm256_setzero_ps(); \
+      for (i_ = 0; i_ < taps; i_ += 8) \
+      { \
+         __m256 c_ = _mm256_add_ps(_mm256_load_ps(ph_ + i_), \
+               _mm256_mul_ps(_mm256_load_ps(dt_ + i_), d_)); \
+         SINC_IL_AVX_STEP(a0_, a1_, w, i_, c_); \
+      } \
+      a0_ = _mm256_add_ps(a0_, a1_); \
+      SINC_IL_AVX_STORE(output, a0_); \
+   } while (0)
+
+#define SINC_IL_AVX_PLAIN(w) \
+   do { \
+      unsigned i_; \
+      unsigned phase_      = resamp->time >> resamp->subphase_bits; \
+      const float *ph_     = resamp->phase_table + phase_ * taps; \
+      __m256 a0_           = _mm256_setzero_ps(); \
+      __m256 a1_           = _mm256_setzero_ps(); \
+      for (i_ = 0; i_ < taps; i_ += 8) \
+      { \
+         __m256 c_ = _mm256_load_ps(ph_ + i_); \
+         SINC_IL_AVX_STEP(a0_, a1_, w, i_, c_); \
+      } \
+      a0_ = _mm256_add_ps(a0_, a1_); \
+      SINC_IL_AVX_STORE(output, a0_); \
+   } while (0)
+
+SINC_TARGET_AVX
+static void resampler_sinc_process_avx_il_kaiser(void *re_, struct resampler_data *data)
+{
+   SINC_IL_RUN(resamp, data, SINC_IL_AVX_KAISER);
+   SINC_ZEROUPPER();
+}
+
+SINC_TARGET_AVX
+static void resampler_sinc_process_avx_il(void *re_, struct resampler_data *data)
+{
+   SINC_IL_RUN(resamp, data, SINC_IL_AVX_PLAIN);
+   SINC_ZEROUPPER();
+}
+#endif
+
+#ifdef SINC_HAVE_AVX512
+/* Sixteen taps a step with fused multiply-add, through the same unpack
+ * trick on 16-float table blocks. taps is a multiple of 8, so a block of
+ * 8 may be left; that block is kept in plain order and doubled with one
+ * permute, its loads masked to the 8 taps that exist. */
+#define SINC_IL_512_STEP(acc0, acc1, w, i, c) \
+   do { \
+      acc0 = _mm512_fmadd_ps(_mm512_loadu_ps((w) + 2 * (i)), \
+            _mm512_unpacklo_ps(c, c), acc0); \
+      acc1 = _mm512_fmadd_ps(_mm512_loadu_ps((w) + 2 * (i) + 16), \
+            _mm512_unpackhi_ps(c, c), acc1); \
+   } while (0)
+
+#define SINC_IL_512_STORE(out, acc) \
+   do { \
+      __m256 y_ = _mm256_add_ps(_mm512_castps512_ps256(acc), \
+            _mm256_castpd_ps(_mm512_extractf64x4_pd( \
+                  _mm512_castps_pd(acc), 1))); \
+      __m128 x_ = _mm_add_ps(_mm256_castps256_ps128(y_), \
+            _mm256_extractf128_ps(y_, 1)); \
+      x_        = _mm_add_ps(x_, _mm_movehl_ps(x_, x_)); \
+      _mm_store_ss((out), x_); \
+      _mm_store_ss((out) + 1, _mm_shuffle_ps(x_, x_, 1)); \
+   } while (0)
+
+#define SINC_IL_512_KAISER(w) \
+   do { \
+      unsigned i_; \
+      unsigned phase_      = resamp->time >> resamp->subphase_bits; \
+      const float *ph_     = resamp->phase_table + phase_ * taps * 2; \
+      const float *dt_     = ph_ + taps; \
+      __m512 d_            = _mm512_set1_ps((float) \
+            (resamp->time & resamp->subphase_mask) * resamp->subphase_mod); \
+      __m512 a0_           = _mm512_setzero_ps(); \
+      __m512 a1_           = _mm512_setzero_ps(); \
+      for (i_ = 0; i_ < full; i_ += 16) \
+      { \
+         __m512 c_ = _mm512_fmadd_ps(_mm512_loadu_ps(dt_ + i_), d_, \
+               _mm512_loadu_ps(ph_ + i_)); \
+         SINC_IL_512_STEP(a0_, a1_, w, i_, c_); \
+      } \
+      if (full != taps) \
+      { \
+         __m512 c_ = _mm512_permutexvar_ps(dup8, _mm512_fmadd_ps( \
+                  _mm512_maskz_loadu_ps(0x00FF, dt_ + i_), d_, \
+                  _mm512_maskz_loadu_ps(0x00FF, ph_ + i_))); \
+         a1_ = _mm512_fmadd_ps(_mm512_loadu_ps((w) + 2 * i_), c_, a1_); \
+      } \
+      a0_ = _mm512_add_ps(a0_, a1_); \
+      SINC_IL_512_STORE(output, a0_); \
+   } while (0)
+
+#define SINC_IL_512_PLAIN(w) \
+   do { \
+      unsigned i_; \
+      unsigned phase_      = resamp->time >> resamp->subphase_bits; \
+      const float *ph_     = resamp->phase_table + phase_ * taps; \
+      __m512 a0_           = _mm512_setzero_ps(); \
+      __m512 a1_           = _mm512_setzero_ps(); \
+      for (i_ = 0; i_ < full; i_ += 16) \
+      { \
+         __m512 c_ = _mm512_loadu_ps(ph_ + i_); \
+         SINC_IL_512_STEP(a0_, a1_, w, i_, c_); \
+      } \
+      if (full != taps) \
+      { \
+         __m512 c_ = _mm512_permutexvar_ps(dup8, \
+               _mm512_maskz_loadu_ps(0x00FF, ph_ + i_)); \
+         a1_ = _mm512_fmadd_ps(_mm512_loadu_ps((w) + 2 * i_), c_, a1_); \
+      } \
+      a0_ = _mm512_add_ps(a0_, a1_); \
+      SINC_IL_512_STORE(output, a0_); \
+   } while (0)
+
+/* Lane k of the tail takes coefficient k / 2. */
+#define SINC_IL_512_DUP8 \
+   _mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0)
+
+SINC_TARGET_AVX512
+static void resampler_sinc_process_avx512_il_kaiser(void *re_, struct resampler_data *data)
+{
+   const __m512i dup8 = SINC_IL_512_DUP8;
+   unsigned full      = ((rarch_sinc_resampler_t*)re_)->taps & ~15u;
+   SINC_IL_RUN(resamp, data, SINC_IL_512_KAISER);
+   SINC_ZEROUPPER();
+}
+
+SINC_TARGET_AVX512
+static void resampler_sinc_process_avx512_il(void *re_, struct resampler_data *data)
+{
+   const __m512i dup8 = SINC_IL_512_DUP8;
+   unsigned full      = ((rarch_sinc_resampler_t*)re_)->taps & ~15u;
+   SINC_IL_RUN(resamp, data, SINC_IL_512_PLAIN);
+   SINC_ZEROUPPER();
+}
+#endif
+
+#if defined(__SSE__)
+/* Four taps a step; the table needs no rearranging at this width, only
+ * reversing. */
+#define SINC_IL_SSE_STEP(acc0, acc1, w, i, c) \
+   do { \
+      acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_loadu_ps((w) + 2 * (i)), \
+               _mm_unpacklo_ps(c, c))); \
+      acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_loadu_ps((w) + 2 * (i) + 4), \
+               _mm_unpackhi_ps(c, c))); \
+   } while (0)
+
+#define SINC_IL_SSE_STORE(out, acc) \
+   do { \
+      __m128 x_ = _mm_add_ps(acc, _mm_movehl_ps(acc, acc)); \
+      _mm_store_ss((out), x_); \
+      _mm_store_ss((out) + 1, _mm_shuffle_ps(x_, x_, 1)); \
+   } while (0)
+
+#define SINC_IL_SSE_KAISER(w) \
+   do { \
+      unsigned i_; \
+      unsigned phase_      = resamp->time >> resamp->subphase_bits; \
+      const float *ph_     = resamp->phase_table + phase_ * taps * 2; \
+      const float *dt_     = ph_ + taps; \
+      __m128 d_            = _mm_set1_ps((float) \
+            (resamp->time & resamp->subphase_mask) * resamp->subphase_mod); \
+      __m128 a0_           = _mm_setzero_ps(); \
+      __m128 a1_           = _mm_setzero_ps(); \
+      for (i_ = 0; i_ < taps; i_ += 4) \
+      { \
+         __m128 c_ = _mm_add_ps(_mm_load_ps(ph_ + i_), \
+               _mm_mul_ps(_mm_load_ps(dt_ + i_), d_)); \
+         SINC_IL_SSE_STEP(a0_, a1_, w, i_, c_); \
+      } \
+      a0_ = _mm_add_ps(a0_, a1_); \
+      SINC_IL_SSE_STORE(output, a0_); \
+   } while (0)
+
+#define SINC_IL_SSE_PLAIN(w) \
+   do { \
+      unsigned i_; \
+      unsigned phase_      = resamp->time >> resamp->subphase_bits; \
+      const float *ph_     = resamp->phase_table + phase_ * taps; \
+      __m128 a0_           = _mm_setzero_ps(); \
+      __m128 a1_           = _mm_setzero_ps(); \
+      for (i_ = 0; i_ < taps; i_ += 4) \
+      { \
+         __m128 c_ = _mm_load_ps(ph_ + i_); \
+         SINC_IL_SSE_STEP(a0_, a1_, w, i_, c_); \
+      } \
+      a0_ = _mm_add_ps(a0_, a1_); \
+      SINC_IL_SSE_STORE(output, a0_); \
+   } while (0)
+
+static void resampler_sinc_process_sse_il_kaiser(void *re_, struct resampler_data *data)
+{
+   SINC_IL_RUN(resamp, data, SINC_IL_SSE_KAISER);
+}
+
+static void resampler_sinc_process_sse_il(void *re_, struct resampler_data *data)
+{
+   SINC_IL_RUN(resamp, data, SINC_IL_SSE_PLAIN);
 }
 #endif
 
@@ -1113,30 +1636,124 @@ static void sinc_init_table_lanczos(
    }
 }
 
-/* Widest kernel both compiled in and allowed by the mask. */
+/* Widest kernel both compiled in and allowed by the mask; on x86, the
+ * direct-read form of it up to that tier's crossover tap count. */
 static sinc_process_t sinc_select_process(int kaiser,
-      resampler_simd_mask_t mask, unsigned enable_avx)
+      resampler_simd_mask_t mask, unsigned enable_avx, unsigned taps)
 {
    sinc_process_t process = kaiser
       ? resampler_sinc_process_c_kaiser : resampler_sinc_process_c;
 #if defined(__SSE__)
    if (mask & RESAMPLER_SIMD_SSE)
-      process = kaiser
-         ? resampler_sinc_process_sse_kaiser : resampler_sinc_process_sse;
+   {
+      if (taps <= SINC_IL_TAPS_SSE)
+         process = kaiser
+            ? resampler_sinc_process_sse_il_kaiser
+            : resampler_sinc_process_sse_il;
+      else
+         process = kaiser
+            ? resampler_sinc_process_sse_kaiser : resampler_sinc_process_sse;
+   }
 #endif
-#if defined(__AVX__)
+#ifdef SINC_HAVE_AVX
    if ((mask & RESAMPLER_SIMD_AVX) && enable_avx)
-      process = kaiser
-         ? resampler_sinc_process_avx_kaiser : resampler_sinc_process_avx;
-#else
-   (void)enable_avx;
+   {
+      if (taps <= SINC_IL_TAPS_AVX)
+         process = kaiser
+            ? resampler_sinc_process_avx_il_kaiser
+            : resampler_sinc_process_avx_il;
+      else
+         process = kaiser
+            ? resampler_sinc_process_avx_kaiser : resampler_sinc_process_avx;
+   }
 #endif
+#ifdef SINC_HAVE_AVX512
+   if ((mask & RESAMPLER_SIMD_AVX512) && enable_avx)
+   {
+      if (taps <= SINC_IL_TAPS_AVX512)
+         process = kaiser
+            ? resampler_sinc_process_avx512_il_kaiser
+            : resampler_sinc_process_avx512_il;
+      else
+         process = kaiser
+            ? resampler_sinc_process_avx512_kaiser
+            : resampler_sinc_process_avx512;
+   }
+#endif
+   (void)enable_avx;
+   (void)taps;
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(HAVE_NEON))
    if (mask & RESAMPLER_SIMD_NEON)
       process = kaiser
          ? resampler_sinc_process_neon_kaiser : resampler_sinc_process_neon;
 #endif
    return process;
+}
+
+/* Table block width the kernel reads with, or 0 for the kernels that
+ * keep the planar rings (C, NEON) and take the table as built. */
+static unsigned sinc_il_width(sinc_process_t process)
+{
+#if defined(__SSE__)
+   if (     process == resampler_sinc_process_sse_il
+         || process == resampler_sinc_process_sse_il_kaiser)
+      return 4;
+#endif
+#ifdef SINC_HAVE_AVX
+   if (     process == resampler_sinc_process_avx_il
+         || process == resampler_sinc_process_avx_il_kaiser)
+      return 8;
+#endif
+#ifdef SINC_HAVE_AVX512
+   if (     process == resampler_sinc_process_avx512_il
+         || process == resampler_sinc_process_avx512_il_kaiser)
+      return 16;
+#endif
+   (void)process;
+   return 0;
+}
+
+/* Rearranges 'rows' rows of 'taps' coefficients for an interleaved kernel
+ * of the given width: each row reversed, so the first coefficient meets
+ * the oldest frame of the window, then each block of 'width' so that an
+ * unpacklo/unpackhi of the block with itself gives the first and second
+ * halves of its coefficients doubled up (c0 c0 c1 c1 ...) lane by lane.
+ * Within a block, 128-bit lane k holds c[2k], c[2k+1], c[w/2+2k],
+ * c[w/2+2k+1]. A trailing block of 8 at width 16 stays in plain order;
+ * the AVX-512 kernels double it with a permute. Kaiser coefficient and
+ * delta rows go through alike, so the per-element interpolation still
+ * pairs them. Returns false only when the scratch row cannot be had. */
+static bool sinc_il_layout(float *table, unsigned rows, unsigned taps,
+      unsigned width)
+{
+   unsigned r, m, b, k;
+   float *rev;
+   if (!width)
+      return true;
+   if (!(rev = (float*)malloc(taps * sizeof(float))))
+      return false;
+   for (r = 0; r < rows; r++)
+   {
+      float *row = table + (size_t)r * taps;
+      for (m = 0; m < taps; m++)
+         rev[m] = row[taps - 1 - m];
+      memcpy(row, rev, taps * sizeof(float));
+      if (width == 4)
+         continue;
+      for (b = 0; b + width <= taps; b += width)
+      {
+         unsigned half = width / 2;
+         for (k = 0; k < width / 4; k++)
+         {
+            row[b + 4 * k + 0] = rev[b + 2 * k];
+            row[b + 4 * k + 1] = rev[b + 2 * k + 1];
+            row[b + 4 * k + 2] = rev[b + half + 2 * k];
+            row[b + 4 * k + 3] = rev[b + half + 2 * k + 1];
+         }
+      }
+   }
+   free(rev);
+   return true;
 }
 
 void *sinc_resampler_init_hq(double bandwidth_mod,
@@ -1287,7 +1904,8 @@ void *sinc_resampler_init_hq(double bandwidth_mod,
       stage->subphase_mask = 1;
       stage->subphase_mod  = 0.5f;
       stage->kaiser_beta   = dec_beta;
-      stage->process       = sinc_select_process(0, mask, enable_avx);
+      stage->process       = sinc_select_process(0, mask, enable_avx,
+            dec_taps);
    }
    sinc_init_table_kaiser(&re->dec[0], 0.5 * SINC_DEC_ENGAGE * dec_cutoff,
          re->dec[0].phase_table, 1, dec_taps, 0);
@@ -1307,7 +1925,14 @@ void *sinc_resampler_init_hq(double bandwidth_mod,
    }
 
    re->process = sinc_select_process(window_type == SINC_WINDOW_KAISER,
-         mask, enable_avx);
+         mask, enable_avx, re->taps);
+   if (     !sinc_il_layout(re->phase_table,
+               (window_type == SINC_WINDOW_KAISER ? 2u : 1u)
+                  << re->phase_bits,
+               re->taps, sinc_il_width(re->process))
+         || !sinc_il_layout(re->dec[0].phase_table, 1, dec_taps,
+               sinc_il_width(re->dec[0].process)))
+      goto error;
    sinc_bind_state(re);
 
    return re;

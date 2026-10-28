@@ -54,7 +54,7 @@
  *                             compressed size before it allocates.
  *                             This is the only caller that compresses,
  *                             and the reason the encoder exists at all.
- *   cheevos/cheevos_rvz.c     decompresses one-shot, and reads a
+ *   formats/rvz/rvz.c         decompresses one-shot, and reads a
  *                             frame's declared content size to size
  *                             its buffer.
  *   file/archive_file_zstd.c  decompresses an archive member, and
@@ -177,15 +177,80 @@ int rzstd_encode(uint8_t *dst, size_t dst_len,
  * implementation's default. */
 #define RZSTD_WINDOW_LOG_MAX 27
 
-/* No streaming interface is offered.
+/* -------- a frame a block at a time -------- */
+
+typedef struct rzstd_blocks rzstd_blocks_t;
+
+/* the most rzstd_blocks_want() asks for: a block of 128 KiB, and the
+ * next block's header or the frame's checksum */
+#define RZSTD_WANT_MAX (128 * 1024 + 4)
+
+/**
+ * rzstd_blocks_begin:
+ * @src        : one complete frame, which stays where it is until the
+ *               stream is freed
+ * @src_len    : its exact length
  *
- * One was declared here, both directions, for a caller that cannot hold
- * a whole frame. No caller in this tree is one: both CHD readers hold a
- * hunk entire, and every other user above starts from a complete frame.
- * Eleven entry points were declared and none was ever implemented:
- * nothing would have noticed them breaking, because nothing called
- * them. Absent is honest where declared was not.
+ * A frame decoded a block at a time, for one too big to have whole in
+ * memory: through a ring of its window and two blocks more, at least a
+ * megabyte, which the matches reach back into. Each block comes out
+ * whole where it was decoded.
+ *
+ * Returns: the stream, or NULL when @src is not a frame or its window
+ * cannot be had.
  */
+rzstd_blocks_t *rzstd_blocks_begin(const uint8_t *src, size_t src_len);
+
+/**
+ * rzstd_blocks_step:
+ * @data       : receives where the block's octets are, until the next
+ *               call
+ * @len        : receives how many
+ *
+ * Returns: RZSTD_PROCESS_NEXT with a block, RZSTD_PROCESS_END once the
+ * frame is all out and its size and end are as they should be, or
+ * RZSTD_PROCESS_ERROR.
+ */
+int rzstd_blocks_step(rzstd_blocks_t *z, const uint8_t **data, size_t *len);
+
+/**
+ * rzstd_blocks_open:
+ *
+ * A frame decoded a block at a time, as for rzstd_blocks_begin(), from
+ * input handed over a piece at a time: what rzstd_blocks_want() asks
+ * for each time, which is the next block and the next block's header.
+ * Each piece is decoded where it is, so it can be read straight into a
+ * buffer of RZSTD_WANT_MAX octets that is used over again.
+ *
+ * Returns: the stream, or NULL when there is no memory.
+ */
+rzstd_blocks_t *rzstd_blocks_open(void);
+
+/**
+ * rzstd_blocks_want:
+ *
+ * Returns: how many octets of the frame rzstd_blocks_give() is to be
+ * handed next, or 0 once the frame is all out.
+ */
+size_t rzstd_blocks_want(const rzstd_blocks_t *z);
+
+/**
+ * rzstd_blocks_give:
+ * @src        : the next rzstd_blocks_want() octets of the frame, which
+ *               need not stay where they are after the call
+ * @len        : how many
+ * @data       : receives where the octets it decoded are, until the next
+ *               call; there may be none
+ * @dlen       : receives how many
+ *
+ * Returns: RZSTD_PROCESS_NEXT, or RZSTD_PROCESS_ERROR. Once
+ * rzstd_blocks_want() is 0 the frame is all out, its size and checksum
+ * as they should be.
+ */
+int rzstd_blocks_give(rzstd_blocks_t *z, const uint8_t *src, size_t len,
+      const uint8_t **data, size_t *dlen);
+
+void rzstd_blocks_free(rzstd_blocks_t *z);
 
 /**
  * rzstd_error_name:

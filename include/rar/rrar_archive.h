@@ -189,9 +189,8 @@ const rrar_entry_t *rrar_archive_entry(const rrar_archive_t *a,
  * @out_len    : receives the entry's size
  *
  * Unpacks one entry and checks it against the archive's CRC-32, if the
- * archive has one for it. The
- * caller frees *@out. An empty entry yields a valid one-byte buffer and
- * a length of zero.
+ * archive has one for it. The caller frees *@out, which has one octet
+ * more than *@out_len, the caller's to write, as for a NUL.
  *
  * Returns: RRAR_OK, or a negative RRAR_ERROR_* code, in which case
  * *@out is NULL.
@@ -232,6 +231,26 @@ typedef struct rrar_watch
  */
 int rrar_archive_extract_to(rrar_archive_t *a, uint32_t index,
       uint8_t *dst, size_t dst_size, const rrar_watch_t *watch);
+
+/**
+ * rrar_archive_extract_sink:
+ * @a          : opened archive
+ * @index      : entry index
+ * @sink       : handed the entry's octets in order, as they are final;
+ *               returns nonzero to have the decode stop
+ * @ud         : for @sink
+ *
+ * The same as rrar_archive_extract(), for a member too big to have
+ * whole in memory: one bigger than its window or 5 MiB, whichever is
+ * more, and a little over 2 MiB more is unpacked round a ring of that
+ * size. The CRC is checked once all of it has been handed over: on an
+ * error what @sink was given is not to be kept.
+ *
+ * Returns: RRAR_OK, RRAR_ERROR_CANCELLED if @sink stopped it, or
+ * another negative RRAR_ERROR_* code.
+ */
+int rrar_archive_extract_sink(rrar_archive_t *a, uint32_t index,
+      int (*sink)(void *ud, const uint8_t *data, size_t len), void *ud);
 
 RETRO_END_DECLS
 
