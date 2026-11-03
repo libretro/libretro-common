@@ -136,6 +136,7 @@ extern long syscall(long number, ...);
 #ifdef __MACH__
 #include <sys/time.h>
 #include <AvailabilityMacros.h>
+#include <mach/mach_time.h>
 
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 0
@@ -214,6 +215,8 @@ retro_perf_tick_t cpu_features_get_perf_counter(void)
    time_ticks = gettime();
 #elif !defined(__MACH__) && !defined(__FreeBSD__) && (defined(_XBOX360) || defined(__powerpc__) || defined(__ppc__) || defined(__POWERPC__) || defined(__PSL1GHT__) || defined(__PPC64__) || defined(__powerpc64__))
    time_ticks = __mftb();
+#elif defined(__MACH__)
+   time_ticks = mach_absolute_time();
 #elif (defined(_POSIX_MONOTONIC_CLOCK) && _POSIX_MONOTONIC_CLOCK > 0) || defined(__QNX__) || defined(ANDROID)
    {
       struct timespec tv;
