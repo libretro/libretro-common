@@ -85,6 +85,7 @@ struct x509_cert
 };
 
 #define X509_KU_DIGITAL_SIGNATURE 0x80
+#define X509_KU_KEY_ENCIPHERMENT  0x20
 #define X509_KU_KEY_CERT_SIGN     0x04
 
 /**
@@ -95,6 +96,18 @@ struct x509_cert
  * walked past it and reported.
  **/
 int x509_parse(struct x509_cert *c, const uint8_t *der, size_t len);
+
+struct rsa_private_key;
+
+/**
+ * x509_rsa_private_key_parse:
+ * An RSAPrivateKey (PKCS#1) or a PrivateKeyInfo with one (PKCS#8),
+ * unencrypted DER. @key points into @der afterwards.
+ *
+ * Returns: 0 on success, -1 on anything else.
+ **/
+int x509_rsa_private_key_parse(struct rsa_private_key *key,
+      const uint8_t *der, size_t len);
 
 /**
  * x509_verify_signature:
@@ -196,6 +209,21 @@ void x509_trust_free(void);
  **/
 int x509_verify_chain(const uint8_t **ders, const size_t *lens, unsigned n,
       const char *host, time_t now, char *info, size_t info_len);
+
+/* The leaf's key encrypts a premaster secret (a TLS RSA key exchange)
+ * rather than signing: its keyUsage must allow keyEncipherment. */
+#define X509_VERIFY_KEY_ENCIPHERMENT 1
+
+/**
+ * x509_verify_chain_ex:
+ * As x509_verify_chain(), against @trust_count DER certificates in
+ * place of the trust store when @trust is not NULL, and with
+ * X509_VERIFY_* @flags.
+ **/
+int x509_verify_chain_ex(const uint8_t **ders, const size_t *lens, unsigned n,
+      const char *host, time_t now,
+      const uint8_t *const *trust, const size_t *trust_lens, unsigned trust_count,
+      unsigned flags, char *info, size_t info_len);
 
 RETRO_END_DECLS
 

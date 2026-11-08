@@ -36,7 +36,23 @@
  * retro_common_api only.  The compiler never opens a file, never takes
  * a lock, never touches process-global mutable state, and is re-entrant:
  * any number of rslc_compile calls may run on different threads at once
- * with their own opts and result. */
+ * with their own opts and result.
+ *
+ * A build with RSLC_EXTENDED defined also takes what an emulator's own
+ * shaders need and the frontend's never do: sampler2DArray,
+ * sampler2DMSArray and samplerBuffer (each with its i and u forms),
+ * sized arrays of samplers, gl_SampleID, more than one uniform block
+ * (each at its own set and binding; the reflection tables still
+ * describe only the first and the push block), dual-source fragment
+ * outputs (layout index), layout(early_fragment_tests), and a vertex
+ * stage's gl_ClipDistance / gl_CullDistance (sized by the highest
+ * constant element written; HLSL and MSL refuse them yet), in / out
+ * interface blocks, RSLC_STAGE_GEOMETRY (SPIR-V and GLSL only), and
+ * storage buffers with the atomic builtins (SPIR-V and GLSL only).
+ * Without it
+ * none of that is accepted, nothing is compiled in for it, and every
+ * destination is word for word what it was.  MSL has no form of the
+ * extended samplers or of a third block yet and refuses them. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -48,7 +64,9 @@ RETRO_BEGIN_DECLS
 enum rslc_stage
 {
    RSLC_STAGE_VERTEX = 0,
-   RSLC_STAGE_FRAGMENT
+   RSLC_STAGE_FRAGMENT,
+   RSLC_STAGE_GEOMETRY,  /* RSLC_EXTENDED; SPIR-V and GLSL only */
+   RSLC_STAGE_COMPUTE    /* RSLC_EXTENDED; SPIR-V and GLSL only */
 };
 
 enum rslc_dst
@@ -61,7 +79,10 @@ enum rslc_dst
    RSLC_DST_GLSL_CAFE,   /* GLSL for the Wii U's offline CafeGLSL: version
                             150, the push block as a second uniform block,
                             a location on every in and out */
-   RSLC_DST_REFLECT      /* tables only */
+   RSLC_DST_REFLECT,     /* tables only */
+   RSLC_DST_DXBC         /* RSLC_EXTENDED: a Direct3D bytecode container of
+                            shader model opts.version = 40 / 41 / 50, in
+                            the result's spirv / spirv_len words */
 };
 
 /* Scalar base of a reflected member or I/O slot. */

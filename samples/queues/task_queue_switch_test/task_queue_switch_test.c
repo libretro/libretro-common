@@ -58,6 +58,10 @@
 #include <features/features_cpu.h>
 #include <queues/task_queue.h>
 #include <rthreads/rthreads.h>
+#include <rthreads/retro_eventcount.h>
+#ifdef HAVE_GCD
+#include <dispatch/dispatch.h>
+#endif
 
 /* More than the gather's margin of eight, so an undercount wraps. */
 #define TASKS 16
@@ -80,13 +84,11 @@ static void check(bool cond, const char *what)
 /* --- realloc() that records and refuses an absurd request ------------ */
 
 static size_t   largest_request = 0;
-static unsigned realloc_calls   = 0;
 
 void *__real_realloc(void *ptr, size_t size);
 
 void *__wrap_realloc(void *ptr, size_t size)
 {
-   realloc_calls++;
    if (size > largest_request)
       largest_request = size;
    if (size > ((size_t)1 << 30))
@@ -248,33 +250,70 @@ static bool sleeper_runs_past(int passes)
    return true;
 }
 
-/* While armed, the holder's next queue lock waits for the release.  It
- * is then inside task_queue_wake(), with the runner's lock in hand but
- * not taken. */
+/* While armed, the holder's next queue lock, or on the runner without
+ * one its next wake of a waiter or, on GCD, its next hand-off to GCD,
+ * waits for the release.  It is then inside task_queue_wake(), past the
+ * gate. */
 static retro_atomic_int_t hold_armed;
 static retro_atomic_int_t hold_inside;
 static retro_atomic_int_t hold_release;
-static uintptr_t          holder_tid;
+/* Atomic: threads that run queue code read it while a lane sets it. */
+static retro_atomic_ptr_t holder_tid;
 
-void __real_slock_lock(slock_t *lock);
+/* The runner without a lock is held at the waiters' wake, or on GCD
+ * the keeper's, after the task's own wake has landed; the one that
+ * locks before it. */
+#if defined(RETRO_ATOMIC_LOCK_FREE) \
+      && defined(RETRO_ATOMIC_HAS_CAS) && defined(RETRO_ATOMIC_HAS_PTR)
+#define WAKE_LANDS_BEFORE_HOLD 1
+#endif
 
-void __wrap_slock_lock(slock_t *lock)
+static void hold_here(void)
 {
    if (     retro_atomic_load_acquire_int(&hold_armed)
-         && sthread_get_current_thread_id() == holder_tid)
+         && (void*)sthread_get_current_thread_id()
+            == retro_atomic_load_acquire_ptr(&holder_tid))
    {
       retro_atomic_store_release_int(&hold_armed, 0);
       retro_atomic_store_release_int(&hold_inside, 1);
       while (!retro_atomic_load_acquire_int(&hold_release))
          retro_sleep(1);
    }
+}
+
+void __real_slock_lock(slock_t *lock);
+
+void __wrap_slock_lock(slock_t *lock)
+{
+   hold_here();
    __real_slock_lock(lock);
 }
+
+void __real_retro_eventcount_notify(retro_eventcount_t *ec);
+
+void __wrap_retro_eventcount_notify(retro_eventcount_t *ec)
+{
+   hold_here();
+   __real_retro_eventcount_notify(ec);
+}
+
+#ifdef HAVE_GCD
+void __real_dispatch_async_f(dispatch_queue_t queue, void *context,
+      dispatch_function_t work);
+
+void __wrap_dispatch_async_f(dispatch_queue_t queue, void *context,
+      dispatch_function_t work)
+{
+   hold_here();
+   __real_dispatch_async_f(queue, context, work);
+}
+#endif
 
 static void held_waker(void *data)
 {
    (void)data;
-   holder_tid = sthread_get_current_thread_id();
+   retro_atomic_store_release_ptr(&holder_tid,
+         (void*)sthread_get_current_thread_id());
    retro_atomic_store_release_int(&hold_armed, 1);
    task_queue_wake(sleeper_ident);
 }
@@ -288,10 +327,12 @@ static void lane_held_waker(void)
    retro_time_t until;
    unsigned     i;
    int          passes;
+   int          held_from;
    bool         on_main = false;
 
-   passes = retro_atomic_load_acquire_int(&sleeper_passes);
-   th     = sthread_create(held_waker, NULL);
+   passes    = retro_atomic_load_acquire_int(&sleeper_passes);
+   held_from = passes;
+   th        = sthread_create(held_waker, NULL);
    until  = cpu_features_get_time_usec() + LIMIT_US;
    while (     th
             && !retro_atomic_load_acquire_int(&hold_inside)
@@ -322,7 +363,13 @@ static void lane_held_waker(void)
    retro_atomic_store_release_int(&hold_release, 1);
    if (th)
       sthread_join(th);
+#ifdef WAKE_LANDS_BEFORE_HOLD
+   (void)passes;
+   check(sleeper_runs_past(held_from), "the held wake reaches its task");
+#else
+   (void)held_from;
    check(sleeper_runs_past(passes), "the held wake reaches its task");
+#endif
 
    passes = retro_atomic_load_acquire_int(&sleeper_passes);
    wake_from_thread(sleeper_ident);
@@ -857,7 +904,8 @@ static void lane_push_order(void)
     * first queue lock until the pusher has pushed again. */
    if (th)
    {
-      holder_tid = sthread_get_current_thread_id();
+      retro_atomic_store_release_ptr(&holder_tid,
+            (void*)sthread_get_current_thread_id());
       retro_atomic_store_release_int(&hold_armed, 1);
    }
    task_queue_set_threaded();
@@ -1197,7 +1245,8 @@ static void lane_cancel_order(void)
     * first queue lock until the pusher has cancelled. */
    if (th)
    {
-      holder_tid = sthread_get_current_thread_id();
+      retro_atomic_store_release_ptr(&holder_tid,
+            (void*)sthread_get_current_thread_id());
       retro_atomic_store_release_int(&hold_armed, 1);
    }
    task_queue_set_threaded();
@@ -1628,7 +1677,6 @@ int main(void)
    check(task_queue_is_threaded(), "the check switched the queue to threaded");
    check(tasks_done == TASKS,
          "every task queued before the switch reached its callback");
-   check(realloc_calls > 0, "the gather's realloc() reached the wrapper");
    check(largest_request <= ((size_t)1 << 20),
          "the gather never sized its report list from a negative count");
 

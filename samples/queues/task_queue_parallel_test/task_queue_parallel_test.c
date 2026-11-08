@@ -24,8 +24,9 @@
  *  - a task left behind is cleaned up once, by its worker, after its
  *    handler returns; one not left behind, at its retirement;
  *  - a cleanup that begins while deinit still waits for another worker
- *    keeps property_lock, and a worker left behind stops counting as
- *    one of the queue's.
+ *    can still set and read the task's title after deinit has returned
+ *    (and, on the locked runner, keeps property_lock), and a worker
+ *    left behind stops counting as one of the queue's.
  * On the unthreaded runner the flag changes nothing.
  */
 
@@ -283,19 +284,29 @@ static void late_handler(retro_task_t *task)
    task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
 }
 
-/* Takes property_lock as the accessors do, and holds on to it until
- * deinit has returned. */
+/* Uses the accessors from before deinit returns until after. */
 static void late_cleanup(retro_task_t *task)
 {
+#ifndef TASK_QUEUE_LF
    slock_t *lock = property_lock;
+#endif
+   char    *title;
 
    task_free_title(task);
    retro_atomic_store_release_int(&late_clean_in, 1);
    set_within(&late_deinit_done);
+#ifdef TASK_QUEUE_LF
+   late_lock_kept = true;
+#else
    late_lock_kept = property_lock == lock;
    /* what an accessor that loaded the lock before deinit let go reads */
    (void)*(volatile const char*)lock;
-   (void)task_get_title(task);
+#endif
+   task_set_title(task, strdup("late"));
+   title = task_get_title(task);
+   if (!title || strcmp(title, "late"))
+      late_lock_kept = false;
+   task_free_title(task);
    retro_atomic_store_release_int(&late_clean_done, 1);
 }
 
@@ -354,6 +365,39 @@ static void push_stuck(retro_task_handler_t handler, struct stuck *s,
    task->cleanup   = stuck_cleanup;
    task->state     = malloc(64);
    task->user_data = s;
+   task->flags    |= flags | RETRO_TASK_FLG_MUTE;
+   task_queue_push(task);
+}
+
+/* ---- a flood past what the run rings hold ---- */
+#define FLOOD 3000
+static unsigned           flood_next;     /* the plain ones' turn */
+static retro_atomic_int_t flood_misorder;
+static retro_atomic_int_t flood_ran;
+static retro_atomic_int_t flood_hold;     /* the extras wait while set */
+
+static void flood_plain_handler(retro_task_t *task)
+{
+   if ((unsigned)(uintptr_t)task->user_data != flood_next++)
+      retro_atomic_fetch_add_int(&flood_misorder, 1);
+   retro_atomic_fetch_add_int(&flood_ran, 1);
+   task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+static void flood_parallel_handler(retro_task_t *task)
+{
+   while (retro_atomic_load_acquire_int(&flood_hold))
+      retro_sleep(1);
+   retro_atomic_fetch_add_int(&flood_ran, 1);
+   task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+static void flood_push(retro_task_handler_t handler, unsigned seq, int flags)
+{
+   retro_task_t *task = task_init();
+   task->handler   = handler;
+   task->callback  = count_retired;
+   task->user_data = (void*)(uintptr_t)seq;
    task->flags    |= flags | RETRO_TASK_FLG_MUTE;
    task_queue_push(task);
 }
@@ -438,6 +482,34 @@ int main(void)
    CHECK(retro_atomic_load_acquire_int(&off_worker0) == 0,
          "plain tasks never leave the one worker (%d did)",
          retro_atomic_load_acquire_int(&off_worker0));
+
+   /* more of each than a ring holds, pushed with every worker held so
+    * that both overflow: every one runs, and the plain ones in the order
+    * they were pushed */
+   reset_counts();
+   flood_next = 0;
+   retro_atomic_store_release_int(&flood_misorder, 0);
+   retro_atomic_store_release_int(&flood_ran, 0);
+   retro_atomic_store_release_int(&flood_hold, 1);
+   hog_start();
+   for (i = 0; i < FLOOD; i++)
+   {
+      flood_push(flood_plain_handler, i, 0);
+      flood_push(flood_parallel_handler, i, RETRO_TASK_FLG_PARALLEL);
+   }
+   retro_atomic_store_release_int(&flood_hold, 0);
+   hog_stop();
+   {
+      int n = 2 * FLOOD;
+      task_queue_wait_timeout(not_all_retired, &n, 20000000);
+      task_queue_check();
+   }
+   CHECK(retro_atomic_load_acquire_int(&flood_ran) == 2 * FLOOD,
+         "a flood of %d tasks all ran (%d did)", 2 * FLOOD,
+         retro_atomic_load_acquire_int(&flood_ran));
+   CHECK(!retro_atomic_load_acquire_int(&flood_misorder),
+         "the plain ones ran in the order pushed (%d out of turn)",
+         retro_atomic_load_acquire_int(&flood_misorder));
 
    /* one parallel task called eight times, with others to tempt the
     * idle workers: never in two handlers at once */
@@ -601,7 +673,9 @@ int main(void)
    /* an extra left behind returns and begins its cleanup while deinit
     * still waits for the one worker, in a plain handler: the lock its
     * accessors take outlives the cleanup */
+#ifndef TASK_QUEUE_LF
    CHECK(!property_lock_pinned, "nothing has pinned property_lock yet");
+#endif
    task_queue_set_parallel_workers(1);
    task_queue_init(true, NULL);
    reset_counts();
@@ -615,6 +689,7 @@ int main(void)
       retro_task_t *task = task_init();
       task->handler      = late_handler;
       task->cleanup      = late_cleanup;
+      task->title        = strdup("stuck");
       task->user_data    = &late_st;
       task->flags       |= RETRO_TASK_FLG_PARALLEL
          | RETRO_TASK_FLG_DETACHABLE | RETRO_TASK_FLG_MUTE;
@@ -632,7 +707,7 @@ int main(void)
    CHECK(retro_atomic_load_acquire_int(&late_clean_in),
          "its cleanup begins before deinit returns");
    CHECK(set_within(&late_clean_done) && late_lock_kept,
-         "property_lock outlives a cleanup that began while deinit waited");
+         "a cleanup that began while deinit waited keeps its accessors");
    task_queue_set_parallel_workers(0);
 
    /* a detachable parallel task stuck on an extra worker: deinit leaves

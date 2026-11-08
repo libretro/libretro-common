@@ -83,12 +83,13 @@ enum audio_type_enum
                      * from a caller that filled the format in before
                      * starting - raw samples say nothing about
                      * themselves                                      */
-   AUDIO_TYPE_AC3   /* AC-3 or E-AC-3 (rac3); a buffer of syncframes
+   AUDIO_TYPE_AC3,  /* AC-3 or E-AC-3 (rac3); a buffer of syncframes
                     * (.ac3, .eac3, .ec3). Up
                     * to 5.1, handed over in the WAV shape for its
                     * channel count (the mixer folds by count): a
                     * lone surround becomes a phantom pair, and the
                     * LFE is kept only in 5.1                           */
+   AUDIO_TYPE_WMA   /* Native WMA1/WMA2/Pro in ASF or RIFF/XWMA. */
 };
 
 /* The linear-PCM format an AUDIO_TYPE_LPCM handle will use, for a
@@ -227,6 +228,13 @@ void  audio_transfer_free(void *data, enum audio_type_enum type);
 
 /* Stream format, valid after a successful start. Any out pointer may be
  * NULL. total_frames is 0 when the stream length is unknown. */
+/* WAVE speaker-mask downmix for native WMA/XMA. False for other arms. */
+bool audio_transfer_stereo_matrix(void *data, enum audio_type_enum type,
+      int32_t matrix[8][2]);
+/* Float mixing keeps sqrt(1/2) coefficients without Q15 rounding. */
+bool audio_transfer_stereo_matrix_f32(void *data, enum audio_type_enum type,
+      float matrix[8][2]);
+
 bool  audio_transfer_info(void *data, enum audio_type_enum type,
       unsigned *channels, unsigned *rate, uint64_t *total_frames);
 

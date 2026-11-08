@@ -20,6 +20,7 @@
  */
 
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,16 +45,40 @@ static bool upscale_image(
    if (!image_src->pixels || (image_src->width < 1) || (image_src->height < 1))
       return false;
 
+   if (image_src->width > UINT_MAX / scale_factor
+         || image_src->height > UINT_MAX / scale_factor)
+      return false;
+
    /* Get output dimensions */
    image_dst->width  = image_src->width  * scale_factor;
    image_dst->height = image_src->height * scale_factor;
 
-   total_pixels = (size_t)image_dst->width * (size_t)image_dst->height;
-   if (total_pixels == 0 || total_pixels > UPSCALE_MAX_PIXELS)
+   if (image_dst->width > UPSCALE_MAX_PIXELS / image_dst->height)
       return false;
+   total_pixels = (size_t)image_dst->width * (size_t)image_dst->height;
 
    if (!(image_dst->pixels = (uint32_t*)malloc(total_pixels * sizeof(uint32_t))))
       return false;
+
+   /* These factors are exact in the point scaler's 16.16 mapping. */
+   if ((scale_factor & (scale_factor - 1)) == 0)
+   {
+      unsigned x, y, i;
+      size_t row_bytes = (size_t)image_dst->width * sizeof(uint32_t);
+      for (y = 0; y < image_src->height; y++)
+      {
+         const uint32_t *src = image_src->pixels + (size_t)y * image_src->width;
+         uint32_t *row = image_dst->pixels
+            + (size_t)y * scale_factor * image_dst->width;
+         uint32_t *dst = row;
+         for (x = 0; x < image_src->width; x++)
+            for (i = 0; i < scale_factor; i++)
+               *dst++ = src[x];
+         for (i = 1; i < scale_factor; i++)
+            memmove(row + (size_t)i * image_dst->width, row, row_bytes);
+      }
+      return true;
+   }
 
    /* Duplicate rather than interpolate.
     *
@@ -107,68 +132,137 @@ static bool upscale_image(
    return true;
 }
 
-static uint32_t *downscale_box(const uint32_t *src,
+static uint32_t box_average_wide(const uint32_t *src,
+      unsigned stride, unsigned f, bool pix10)
+{
+   unsigned x, y;
+   uint64_t a = 0, r = 0, g = 0, b = 0;
+   uint64_t n = (uint64_t)f * f;
+   for (y = 0; y < f; y++)
+   {
+      const uint32_t *row = src + (size_t)y * stride;
+      if (pix10)
+      {
+         for (x = 0; x < f; x++)
+         {
+            uint32_t p = row[x];
+            r += (p >> 20) & 0x3ff;
+            g += (p >> 10) & 0x3ff;
+            b += p & 0x3ff;
+         }
+      }
+      else
+      {
+         for (x = 0; x < f; x++)
+         {
+            uint32_t p = row[x];
+            a += (p >> 24) & 0xff;
+            r += (p >> 16) & 0xff;
+            g += (p >> 8) & 0xff;
+            b += p & 0xff;
+         }
+      }
+   }
+   if (pix10)
+      return 0xc0000000u | ((uint32_t)(r / n) << 20)
+         | ((uint32_t)(g / n) << 10) | (uint32_t)(b / n);
+   return ((uint32_t)(a / n) << 24) | ((uint32_t)(r / n) << 16)
+      | ((uint32_t)(g / n) << 8) | (uint32_t)(b / n);
+}
+
+/* Box-average by f (2 or more) in place: each block is read whole
+ * before its average is stored, and the store, at y*dw + x, lies below
+ * every source pixel a later block reads - the next block in the row
+ * starts at y*f*sw + (x+1)*f, and y*dw <= y*f*sw, x < (x+1)*f - so the
+ * image is reduced in its own buffer, with no second one and no copy. */
+static bool downscale_box(uint32_t *d,
       unsigned sw, unsigned sh, unsigned f, bool pix10,
       unsigned *out_w, unsigned *out_h)
 {
-   unsigned x, y, i, j;
+   unsigned x, y, i, j, shift;
    unsigned n  = f * f;
    unsigned dw = sw / f;
    unsigned dh = sh / f;
-   uint32_t *d;
+   const uint32_t *src = d;
 
-   if ((dw < 1) || (dh < 1))
-      return NULL;
+   if ((dw < 1) || (dh < 1) || f < 2 || (f & (f - 1)))
+      return false;
 
-   if (!(d = (uint32_t*)malloc((size_t)dw * dh * sizeof(uint32_t))))
-      return NULL;
+   /* Keep 32-bit sums for safe power-of-two box sizes. */
+   if (f > (pix10 ? 2048u : 4096u))
+   {
+      for (y = 0; y < dh; y++)
+         for (x = 0; x < dw; x++)
+            d[(size_t)y * dw + x] = box_average_wide(
+                  src + (size_t)y * f * sw + x * f, sw, f, pix10);
+      *out_w = dw;
+      *out_h = dh;
+      return true;
+   }
 
+   /* f is a power of two (downscale_image doubles it), so the block
+    * holds 2^sh pixels and the averages are shifts.  A row's outputs
+    * are made a run at a time in a small local array and then copied
+    * out: built straight into d, which the compiler must assume can
+    * alias the source it is still reading, the loop could not be
+    * vectorised or have its loads hoisted, as it could when the output
+    * was a buffer of its own. */
+   for (shift = 0; (1u << shift) < n; shift++) ;
    for (y = 0; y < dh; y++)
    {
-      for (x = 0; x < dw; x++)
+      uint32_t *drow = d + (size_t)y * dw;
+      unsigned  x0;
+      for (x0 = 0; x0 < dw; x0 += 64)
       {
-         unsigned a = 0, r = 0, g = 0, b = 0;
-
-         for (j = 0; j < f; j++)
+         uint32_t tmp[64];
+         unsigned xn = dw - x0 < 64 ? dw - x0 : 64;
+         for (x = 0; x < xn; x++)
          {
-            const uint32_t *row = src + (size_t)(y * f + j) * sw + x * f;
+            unsigned a = 0, r = 0, g = 0, b = 0;
+
+            for (j = 0; j < f; j++)
+            {
+               const uint32_t *row = src + (size_t)(y * f + j) * sw
+                  + (size_t)(x0 + x) * f;
+
+               if (pix10)
+               {
+                  for (i = 0; i < f; i++)
+                  {
+                     uint32_t p  = row[i];
+                     r          += (p >> 20) & 0x3ff;
+                     g          += (p >> 10) & 0x3ff;
+                     b          +=  p        & 0x3ff;
+                  }
+               }
+               else
+               {
+                  for (i = 0; i < f; i++)
+                  {
+                     uint32_t p  = row[i];
+                     a          += (p >> 24) & 0xff;
+                     r          += (p >> 16) & 0xff;
+                     g          += (p >>  8) & 0xff;
+                     b          +=  p        & 0xff;
+                  }
+               }
+            }
 
             if (pix10)
-            {
-               for (i = 0; i < f; i++)
-               {
-                  uint32_t p  = row[i];
-                  r          += (p >> 20) & 0x3ff;
-                  g          += (p >> 10) & 0x3ff;
-                  b          +=  p        & 0x3ff;
-               }
-            }
+               tmp[x] = 0xc0000000u | ((r >> shift) << 20)
+                     | ((g >> shift) << 10) | (b >> shift);
             else
-            {
-               for (i = 0; i < f; i++)
-               {
-                  uint32_t p  = row[i];
-                  a          += (p >> 24) & 0xff;
-                  r          += (p >> 16) & 0xff;
-                  g          += (p >>  8) & 0xff;
-                  b          +=  p        & 0xff;
-               }
-            }
+               tmp[x] = ((a >> shift) << 24) | ((r >> shift) << 16)
+                     | ((g >> shift) <<  8) |  (b >> shift);
          }
-
-         if (pix10)
-            d[(size_t)y * dw + x] = 0xc0000000u
-                  | ((r / n) << 20) | ((g / n) << 10) | (b / n);
-         else
-            d[(size_t)y * dw + x] =
-                  ((a / n) << 24) | ((r / n) << 16)
-                | ((g / n) <<  8) |  (b / n);
+         /* Below every source pixel still to be read: see above. */
+         memcpy(drow + x0, tmp, xn * sizeof(uint32_t));
       }
    }
 
    *out_w = dw;
    *out_h = dh;
-   return d;
+   return true;
 }
 
 /* Cap a decoded image to 'cap' pixels on its longest side, preserving
@@ -188,9 +282,8 @@ static bool downscale_image(unsigned cap, struct texture_image *img)
 {
    struct scaler_ctx ctx;
    unsigned sw, sh, dw, dh, f;
-   uint32_t *mid = NULL;
    uint32_t *out = NULL;
-   const uint32_t *src;
+   bool boxed    = false;
    double ratio;
 
    if (!cap || !img || !img->pixels)
@@ -210,7 +303,6 @@ static bool downscale_image(unsigned cap, struct texture_image *img)
    if ((dw < 1) || (dh < 1))
       return false;
 
-   src   = img->pixels;
    sw    = img->width;
    sh    = img->height;
 
@@ -222,23 +314,42 @@ static bool downscale_image(unsigned cap, struct texture_image *img)
     * tap. */
    for (f = 1; (sw / (f * 2)) >= dw; f *= 2) ;
 
-   if (f > 1)
+   /* The box stage runs in place, so nothing that can fail may follow
+    * it: the sinc stage's buffer and filter are made first, sized for
+    * what the box will leave, and if either fails the image is left as
+    * it was - as when the box had a buffer of its own. */
+   if (f > 1 && (sw / f) && (sh / f))
    {
-      unsigned bw, bh;
-      if ((mid = downscale_box(src, sw, sh, f, img->pix10, &bw, &bh)))
+      sw    /= f;
+      sh    /= f;
+      boxed  = true;
+   }
+   else
+      f      = 1;
+
+   if (boxed && sw == dw && sh == dh)
+   {
+      downscale_box(img->pixels, img->width, img->height, f, img->pix10,
+            &sw, &sh);
+#if !defined(GEKKO)
+      /* Hand back the tail the reduction left unused.  Not on GEKKO,
+       * whose decoders memalign their output: realloc there need not
+       * keep the alignment. */
       {
-         src = mid;
-         sw  = bw;
-         sh  = bh;
+         uint32_t *shrunk = (uint32_t*)realloc(img->pixels,
+               (size_t)dw * dh * sizeof(uint32_t));
+         if (shrunk)
+            img->pixels = shrunk;
       }
+#endif
+      img->width  = dw;
+      img->height = dh;
+      return true;
    }
 
    /* Stage 2: sinc to the exact target. */
    if (!(out = (uint32_t*)malloc((size_t)dw * dh * sizeof(uint32_t))))
-   {
-      free(mid);
       return false;
-   }
 
    memset(&ctx, 0, sizeof(ctx));
    ctx.in_width    = sw;
@@ -255,14 +366,16 @@ static bool downscale_image(unsigned cap, struct texture_image *img)
    if (!scaler_ctx_gen_filter(&ctx))
    {
       free(out);
-      free(mid);
       return false;
    }
 
-   scaler_ctx_scale(&ctx, out, src);
+   if (boxed)
+      downscale_box(img->pixels, img->width, img->height, f, img->pix10,
+            &sw, &sh);
+
+   scaler_ctx_scale(&ctx, out, img->pixels);
    scaler_ctx_gen_reset(&ctx);
 
-   free(mid);
    free(img->pixels);
 
    img->pixels = out;

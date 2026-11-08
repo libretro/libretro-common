@@ -156,7 +156,8 @@ enum retro_task_flags
     * the task is taken off the queue and the worker is left to
     * finish the handler on its own.  When the handler returns, that
     * worker runs \c cleanup and frees the task; \c callback never
-    * runs.  The GCD runner waits for the handler.  Meant for handlers
+    * runs.  The GCD runner does the same with the GCD thread the
+    * handler is on.  Meant for handlers
     * that can block in an OS call for arbitrarily long, such as a
     * device enumeration.
     */
@@ -183,11 +184,11 @@ enum retro_task_flags
     * own - a shader stage's compile, a decode into its own buffer.  One
     * task is never in two handlers at once either way, but its calls
     * may each be on a different worker.  Ignored with
-    * \c RETRO_TASK_FLG_MAIN_THREAD and by the unthreaded runner.  The
-    * GCD runner (Apple) already hands
-    * every task to the system's concurrent queue, one run of it at a
-    * time, a run on any thread; there the flag changes nothing.  Not
-    * changed after the push.
+    * \c RETRO_TASK_FLG_MAIN_THREAD and by the unthreaded runner.  On
+    * the GCD runner (Apple) a task without it runs on a serial queue,
+    * one at a time with every other such task, and one with it on a
+    * concurrent queue, on as many of the system's threads as it gives.
+    * Not changed after the push.
     */
    RETRO_TASK_FLG_PARALLEL         = (1 << 6)
 };
@@ -332,14 +333,40 @@ struct retro_task
    void *frontend_userdata;
 
    /**
+    * What the frontend last showed of the task, kept by whoever owns
+    * \c frontend_userdata so an unchanged task costs it nothing: the
+    * key it showed it under, task_get_text_gen() at the time, a
+    * generation of its own, and progress and flags packed into one
+    * word.  The task system only zeroes them.
+    */
+   uintptr_t frontend_shown_key;
+   unsigned frontend_shown_text_gen;
+   unsigned frontend_shown_epoch;
+   unsigned frontend_shown_state;
+
+   /**
     * @private Pointer to the next task in the queue.
     * Do not touch this; it is managed by the task system.
     */
    retro_task_t *next;
 
-   /** The GCD backend's record of how this task runs.  Owned by the
-    * task queue. */
-   void *sched;
+   /** @private The threaded runner's list of every task from its push
+    * until it is retired, which find() walks from any thread; and the
+    * title and error as other threads are to read them, published by
+    * the setters while the handler owns the fields themselves. */
+#ifdef RETRO_ATOMIC_HAS_PTR
+   retro_atomic_ptr_t live_next;
+   retro_atomic_ptr_t title_shown;
+   retro_atomic_ptr_t error_shown;
+#else
+   void *live_next;
+   void *title_shown;
+   void *error_shown;
+#endif
+
+   /** @private Bumped after each publication of title_shown or
+    * error_shown; see task_get_text_gen(). */
+   retro_atomic_int_t text_gen;
 
    /**
     * Indicates the current progress of the task.
@@ -372,6 +399,13 @@ struct retro_task
     * task_set_flags / task_get_flags.
     */
    retro_atomic_int_t flags;
+
+   /** @private Owned by the threaded runner: whether the task is done
+    * and waits to be retired, a wake it has yet to act on, and on GCD
+    * whether its handler runs and deinit has let go of it. */
+   retro_atomic_int_t qstate;
+   retro_atomic_int_t wake;
+   retro_atomic_int_t run;
 
    /**
     * With \c RETRO_TASK_FLG_PARALLEL: how many extra workers the task
@@ -599,6 +633,15 @@ typedef struct task_progress_snapshot
  * flags and progress remain valid. */
 bool task_get_progress_snapshot(const retro_task_t *task,
       task_progress_snapshot_t *snapshot);
+
+/* A value that differs from the last one read whenever the task's
+ * title or error may have changed since, so a frontend can skip
+ * copying text it already has.  Read it before the snapshot: a change
+ * that lands in between is then seen again on the next read, at worst
+ * copying the same text twice.  Where the strings are not published
+ * through the setters (the runner without lock-free atomics) every
+ * read differs, and every snapshot copies as before. */
+unsigned task_get_text_gen(const retro_task_t *task);
 
 void task_set_flags(retro_task_t *task, uint8_t flags, bool set);
 

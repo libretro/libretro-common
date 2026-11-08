@@ -197,14 +197,14 @@ static void rvp9_iadst8(const rvp9_tran *input, rvp9_tran *output)
    x3 = rvp9_round_shift(s3);
    x6 = rvp9_round_shift(s6);
    x7 = rvp9_round_shift(s7);
-   output[0] = x0;
-   output[1] = -x4;
-   output[2] = x6;
-   output[3] = -x2;
-   output[4] = x3;
-   output[5] = -x7;
-   output[6] = x5;
-   output[7] = -x1;
+   output[0] = (rvp9_tran)(x0);
+   output[1] = (rvp9_tran)(-x4);
+   output[2] = (rvp9_tran)(x6);
+   output[3] = (rvp9_tran)(-x2);
+   output[4] = (rvp9_tran)(x3);
+   output[5] = (rvp9_tran)(-x7);
+   output[6] = (rvp9_tran)(x5);
+   output[7] = (rvp9_tran)(-x1);
 }
 
 static void rvp9_idct16(const rvp9_tran *input, rvp9_tran *output) {
@@ -522,22 +522,22 @@ static void rvp9_iadst16(const rvp9_tran *input, rvp9_tran *output) {
   x14 = RVP9_WRAP(rvp9_round_shift(s14));
   x15 = RVP9_WRAP(rvp9_round_shift(s15));
 
-  output[0] = RVP9_WRAP(x0);
-  output[1] = RVP9_WRAP(-x8);
-  output[2] = RVP9_WRAP(x12);
-  output[3] = RVP9_WRAP(-x4);
-  output[4] = RVP9_WRAP(x6);
-  output[5] = RVP9_WRAP(x14);
-  output[6] = RVP9_WRAP(x10);
-  output[7] = RVP9_WRAP(x2);
-  output[8] = RVP9_WRAP(x3);
-  output[9] = RVP9_WRAP(x11);
-  output[10] = RVP9_WRAP(x15);
-  output[11] = RVP9_WRAP(x7);
-  output[12] = RVP9_WRAP(x5);
-  output[13] = RVP9_WRAP(-x13);
-  output[14] = RVP9_WRAP(x9);
-  output[15] = RVP9_WRAP(-x1);
+  output[0] = (rvp9_tran)(x0);
+  output[1] = (rvp9_tran)(-x8);
+  output[2] = (rvp9_tran)(x12);
+  output[3] = (rvp9_tran)(-x4);
+  output[4] = (rvp9_tran)(x6);
+  output[5] = (rvp9_tran)(x14);
+  output[6] = (rvp9_tran)(x10);
+  output[7] = (rvp9_tran)(x2);
+  output[8] = (rvp9_tran)(x3);
+  output[9] = (rvp9_tran)(x11);
+  output[10] = (rvp9_tran)(x15);
+  output[11] = (rvp9_tran)(x7);
+  output[12] = (rvp9_tran)(x5);
+  output[13] = (rvp9_tran)(-x13);
+  output[14] = (rvp9_tran)(x9);
+  output[15] = (rvp9_tran)(-x1);
 }
 
 static void rvp9_idct32(const rvp9_tran *input, rvp9_tran *output) {
@@ -1743,7 +1743,7 @@ static int rvp9_get_mode_context(const rvp9_dec *d, const int8_t (*search)[2],
 }
 
 /* assign_mv */
-static int rvp9_assign_mv(rvp9_dec *d, rvp9_br *r, int mode, rvp9_mv mv[2],
+static int rvp9_assign_mv(rvp9_dec *d, rvp9_br *r, int mode, rvp9_mv *mv,
       rvp9_mv ref_mv[2], rvp9_mv near_nearest[2], int is_compound,
       int allow_hp)
 {
@@ -2191,10 +2191,26 @@ static void rvp9_decode_block(rvp9_dec *d, int mi_row, int mi_col,
       rvp9_kf_uv_mode_prob + mi->mode * 9);
 
 modes_done:
-   /* replicate mi into the covered grid (context for later blocks) */
-   for (j = 0; j < y_mis; j++)
-      for (i = 0; i < x_mis; i++)
-         if (i || j) mi[j * d->mi_cols + i] = *mi;
+   /* Replicate mi into the covered grid (context for later blocks),
+    * and store the block's references and MVs for the next frame's
+    * prediction in the same pass: they are final here, and every cell
+    * of the frame is covered by exactly one block, so the grid needs no
+    * clearing each frame and no second pass over it at the end. */
+   {
+      rvp9_mv_ref  mr;
+      rvp9_mv_ref *cm = d->cur_mvs + mi_row * d->mi_cols + mi_col;
+      mr.ref_frame[0] = mi->ref_frame[0];
+      mr.ref_frame[1] = mi->ref_frame[1];
+      mr.mv[0]        = mi->mv[0];
+      mr.mv[1]        = mi->mv[1];
+      for (j = 0; j < y_mis; j++)
+         for (i = 0; i < x_mis; i++)
+         {
+            if (i || j)
+               mi[j * d->mi_cols + i] = *mi;
+            cm[j * d->mi_cols + i] = mr;
+         }
+   }
 
    /* --- inter blocks: motion compensation over whole block first --- */
    if (rvp9_is_inter(mi))
@@ -2763,7 +2779,9 @@ static int rvp9_decode_frame_impl(rvp9_dec *d, const uint8_t *data,
    memset(d->above_seg, 0, d->mi_cols + 8);
    for (i = 0; i < 3; i++)
       memset(d->above_ctx[i], 0, d->mi_cols * 2 + 16);
-   memset(d->mi, 0, (size_t)d->mi_cols * d->mi_rows * sizeof(rvp9_mi));
+   /* d->mi is not cleared: every block writes its whole footprint
+    * before anything later reads it (rvp9_decode_block), and the
+    * neighbours a block reads were decoded earlier in this frame. */
 
    {
       const uint8_t *tp   = data + tile_off;
@@ -2859,17 +2877,10 @@ static int rvp9_decode_frame_impl(rvp9_dec *d, const uint8_t *data,
 
    rvp9_loop_filter_frame(d);
 
-   /* store this frame's MVs for the next frame's prediction */
+   /* this frame's MVs, stored block by block as they were decoded,
+    * become the next frame's prediction */
    {
       rvp9_mv_ref *tmp = d->prev_mvs;
-      int n = d->mi_cols * d->mi_rows;
-      for (i = 0; i < n; i++)
-      {
-         d->cur_mvs[i].ref_frame[0] = d->mi[i].ref_frame[0];
-         d->cur_mvs[i].ref_frame[1] = d->mi[i].ref_frame[1];
-         d->cur_mvs[i].mv[0] = d->mi[i].mv[0];
-         d->cur_mvs[i].mv[1] = d->mi[i].mv[1];
-      }
       d->prev_mvs = d->cur_mvs;
       d->cur_mvs = tmp;
    }

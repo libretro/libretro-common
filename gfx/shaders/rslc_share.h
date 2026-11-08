@@ -211,6 +211,27 @@ enum rslc_kw
    RSLC_KW_MAT3X2, RSLC_KW_MAT3X3, RSLC_KW_MAT3X4,
    RSLC_KW_MAT4X2, RSLC_KW_MAT4X3, RSLC_KW_MAT4X4,
    RSLC_KW_SAMPLER2D, RSLC_KW_ISAMPLER2D, RSLC_KW_USAMPLER2D,
+   /* RSLC_EXTENDED only: seeded in that build alone, so elsewhere no
+    * name ever carries them */
+   RSLC_KW_SAMPLER2DARRAY, RSLC_KW_ISAMPLER2DARRAY, RSLC_KW_USAMPLER2DARRAY,
+   RSLC_KW_SAMPLER2DMSARRAY, RSLC_KW_ISAMPLER2DMSARRAY, RSLC_KW_USAMPLER2DMSARRAY,
+   RSLC_KW_SAMPLERBUFFER, RSLC_KW_ISAMPLERBUFFER, RSLC_KW_USAMPLERBUFFER,
+   /* RSLC_EXTENDED: the other shapes, float, int, uint of each */
+   RSLC_KW_SAMPLER1D, RSLC_KW_ISAMPLER1D, RSLC_KW_USAMPLER1D,
+   RSLC_KW_SAMPLER3D, RSLC_KW_ISAMPLER3D, RSLC_KW_USAMPLER3D,
+   RSLC_KW_SAMPLERCUBE, RSLC_KW_ISAMPLERCUBE, RSLC_KW_USAMPLERCUBE,
+   RSLC_KW_SAMPLERCUBEARRAY, RSLC_KW_ISAMPLERCUBEARRAY, RSLC_KW_USAMPLERCUBEARRAY,
+   /* RSLC_EXTENDED: the depth comparing ones */
+   RSLC_KW_SAMPLER1DSHADOW, RSLC_KW_SAMPLER2DSHADOW, RSLC_KW_SAMPLER2DARRAYSHADOW,
+   RSLC_KW_SAMPLERCUBESHADOW, RSLC_KW_SAMPLERCUBEARRAYSHADOW,
+   /* RSLC_EXTENDED image types: float, int, uint of each */
+   RSLC_KW_IMAGE2D, RSLC_KW_IIMAGE2D, RSLC_KW_UIMAGE2D,
+   RSLC_KW_IMAGE2DARRAY, RSLC_KW_IIMAGE2DARRAY, RSLC_KW_UIMAGE2DARRAY,
+   /* RSLC_EXTENDED: a fragment stage's input attachment */
+   RSLC_KW_SUBPASSINPUT,
+   /* RSLC_EXTENDED qualifiers */
+   RSLC_KW_BUFFER, RSLC_KW_READONLY, RSLC_KW_WRITEONLY, RSLC_KW_COHERENT,
+   RSLC_KW_RESTRICT, RSLC_KW_VOLATILE, RSLC_KW_SHARED,
    RSLC_KW_COUNT
 };
 
@@ -231,8 +252,56 @@ enum rslc_tkind
    RSLC_TY_MAT,
    RSLC_TY_SAMPLER2D,
    RSLC_TY_ARRAY,
-   RSLC_TY_STRUCT
+   RSLC_TY_STRUCT,
+   /* RSLC_EXTENDED only */
+   RSLC_TY_SAMPLER2DARRAY,
+   RSLC_TY_SAMPLER2DMSARRAY,
+   RSLC_TY_SAMPLERBUFFER,
+   /* RSLC_EXTENDED storage images; cols is the RSLC_IMGFMT_* */
+   RSLC_TY_IMAGE2D,
+   RSLC_TY_IMAGE2DARRAY,
+   /* RSLC_EXTENDED: a float input attachment */
+   RSLC_TY_SUBPASSINPUT,
+   /* RSLC_EXTENDED: any other sampler; rows is its RSLC_SDIM_*, cols its
+    * RSLC_SX_* */
+   RSLC_TY_SAMPLERX
 };
+
+#define RSLC_SDIM_1D   1
+#define RSLC_SDIM_2D   2
+#define RSLC_SDIM_3D   3
+#define RSLC_SDIM_CUBE 4
+#define RSLC_SX_ARRAY  1u
+#define RSLC_SX_SHADOW 2u
+
+#define RSLC_TY_IS_IMAGE(k) ((k) == RSLC_TY_IMAGE2D || (k) == RSLC_TY_IMAGE2DARRAY)
+/* A storage image type's rows: its access. */
+#define RSLC_IMG_READWRITE 1
+#define RSLC_IMG_WRITEONLY 2
+#define RSLC_IMG_READONLY  3
+
+/* RSLC_EXTENDED: a storage image's format, as its layout names it; the
+ * values are SPIR-V's ImageFormat. */
+#define RSLC_IMGFMT_RGBA32F  1
+#define RSLC_IMGFMT_RGBA16F  2
+#define RSLC_IMGFMT_R32F     3
+#define RSLC_IMGFMT_RGBA8    4
+#define RSLC_IMGFMT_RGBA32I  21
+#define RSLC_IMGFMT_RGBA16I  22
+#define RSLC_IMGFMT_RGBA8I   23
+#define RSLC_IMGFMT_R32I     24
+#define RSLC_IMGFMT_RGBA32UI 30
+#define RSLC_IMGFMT_RGBA16UI 31
+#define RSLC_IMGFMT_RGBA8UI  32
+#define RSLC_IMGFMT_R32UI    33
+
+/* The last keyword that names a type. */
+#define RSLC_KW_LAST_TYPE RSLC_KW_SUBPASSINPUT
+
+/* Every sampler kind: sampler2D, and the RSLC_EXTENDED ones. */
+#define RSLC_TY_IS_SAMPLER(k) ((k) == RSLC_TY_SAMPLER2D \
+      || ((k) >= RSLC_TY_SAMPLER2DARRAY && (k) <= RSLC_TY_SAMPLERBUFFER) \
+      || (k) == RSLC_TY_SAMPLERX)
 
 struct rslc_type;
 
@@ -242,7 +311,9 @@ struct rslc_field
    struct rslc_sym        *name;
    uint32_t                line;
    uint8_t                 precision;   /* RSLC_PREC_* */
-   uint8_t                 pad[3];
+   uint8_t                 interp;      /* RSLC_EXTENDED: an in / out block member's */
+   uint8_t                 quals;       /* RSLC_VQ_* of that member */
+   uint8_t                 pad;
 };
 
 struct rslc_type
@@ -276,7 +347,11 @@ enum rslc_storage
    RSLC_ST_SAMPLER,     /* uniform sampler2D */
    RSLC_ST_BLOCK,       /* the instance of a named uniform / push block */
    RSLC_ST_MEMBER,      /* a member of an unnamed block, visible bare */
-   RSLC_ST_BUILTIN      /* gl_Position and friends */
+   RSLC_ST_BUILTIN,     /* gl_Position and friends */
+   RSLC_ST_SHARED,      /* RSLC_EXTENDED: compute workgroup memory */
+   RSLC_ST_IMAGE,       /* RSLC_EXTENDED: uniform image2D and the like */
+   RSLC_ST_SUBPASS      /* RSLC_EXTENDED: uniform subpassInput; member is
+                         * its input_attachment_index */
 };
 
 #define RSLC_DIR_IN    0
@@ -292,6 +367,14 @@ enum rslc_storage
 #define RSLC_VQ_SAMPLE    2u
 #define RSLC_VQ_INVARIANT 4u
 #define RSLC_VQ_PRECISE   8u
+#define RSLC_VQ_IOBLOCK  16u   /* RSLC_EXTENDED: the instance of an in / out block */
+#define RSLC_VQ_READONLY 32u   /* RSLC_EXTENDED: an image only read */
+#define RSLC_VQ_WRITEONLY 64u  /* RSLC_EXTENDED: an image only written */
+#define RSLC_VQ_PERVERTEX 128u /* RSLC_EXTENDED: a geometry stage's gl_in */
+
+/* RSLC_EXTENDED: the struct of an in / out interface block, which the
+ * printers write as a block and SPIR-V decorates Block. */
+#define RSLC_TY_IS_IOBLOCK(t) ((t)->kind == RSLC_TY_STRUCT && (t)->rows == 1)
 
 #define RSLC_UNSET 0xffffffffu
 
@@ -306,7 +389,8 @@ struct rslc_var
    uint32_t                binding;
    uint32_t                set;
    uint32_t                block;      /* RSLC_ST_MEMBER / BLOCK: block index */
-   uint32_t                member;     /* RSLC_ST_MEMBER: field index */
+   uint32_t                member;     /* RSLC_ST_MEMBER: field index; SUBPASS:
+                                        * input_attachment_index */
    uint8_t                 storage;    /* enum rslc_storage */
    uint8_t                 dir;        /* RSLC_DIR_* for params */
    uint8_t                 interp;
@@ -314,7 +398,7 @@ struct rslc_var
    uint8_t                 quals;      /* RSLC_VQ_* */
    uint8_t                 builtin;    /* RSLC_BI_* for RSLC_ST_BUILTIN */
    uint8_t                 global;     /* declared at file scope */
-   uint8_t                 pad;
+   uint8_t                 index;      /* RSLC_EXTENDED: a fragment output's blend source */
 };
 
 /* Builtin variables. */
@@ -326,6 +410,46 @@ struct rslc_var
 #define RSLC_BI_POINTSIZE    5
 #define RSLC_BI_FRONTFACING  6
 #define RSLC_BI_INSTANCEINDEX 7
+#define RSLC_BI_SAMPLEID     8   /* RSLC_EXTENDED */
+#define RSLC_BI_CLIPDISTANCE 9   /* RSLC_EXTENDED */
+#define RSLC_BI_CULLDISTANCE 10  /* RSLC_EXTENDED */
+#define RSLC_BI_INVOCATIONID 11  /* RSLC_EXTENDED, geometry */
+#define RSLC_BI_LAYER        12  /* RSLC_EXTENDED, geometry out, fragment in */
+#define RSLC_BI_GLOBALINVOCATIONID 13   /* RSLC_EXTENDED, compute */
+#define RSLC_BI_LOCALINVOCATIONID  14
+#define RSLC_BI_WORKGROUPID        15
+#define RSLC_BI_NUMWORKGROUPS      16
+#define RSLC_BI_LOCALINVOCATIONINDEX 17
+#define RSLC_BI_HELPERINVOCATION   18   /* RSLC_EXTENDED, fragment */
+#define RSLC_BI_POINTCOORD         19   /* RSLC_EXTENDED, fragment */
+#define RSLC_BI_PRIMITIVEID        20   /* RSLC_EXTENDED, geometry gl_PrimitiveIDIn */
+
+/* RSLC_EXTENDED: a geometry stage's primitives, in and out. */
+#define RSLC_GS_POINTS              1
+#define RSLC_GS_LINES               2
+#define RSLC_GS_LINES_ADJACENCY     3
+#define RSLC_GS_TRIANGLES           4
+#define RSLC_GS_TRIANGLES_ADJACENCY 5
+#define RSLC_GS_LINE_STRIP          6
+#define RSLC_GS_TRIANGLE_STRIP      7
+
+/* The vertices an input primitive hands a geometry stage. */
+#define RSLC_GS_IN_VERTICES(prim) ((prim) == RSLC_GS_POINTS ? 1u \
+      : (prim) == RSLC_GS_LINES ? 2u : (prim) == RSLC_GS_LINES_ADJACENCY ? 4u \
+      : (prim) == RSLC_GS_TRIANGLES ? 3u : 6u)
+
+/* The builtins a vertex stage writes through its gl_PerVertex block. */
+#define RSLC_BI_IN_PERVERTEX(b) ((b) == RSLC_BI_POSITION || (b) == RSLC_BI_POINTSIZE \
+      || (b) == RSLC_BI_CLIPDISTANCE || (b) == RSLC_BI_CULLDISTANCE)
+
+/* Elements a stage may write of gl_ClipDistance / gl_CullDistance:
+ * the least maxClipDistances Vulkan guarantees. */
+#define RSLC_MAX_CLIP 8
+
+/* The integer builtins HLSL and MSL hand over as uint (gl_Layer: a
+ * pixel stage's, the only stage those printers take it in). */
+#define RSLC_BI_IS_UINT_IN(b) ((b) == RSLC_BI_VERTEXINDEX || (b) == RSLC_BI_INSTANCEINDEX \
+      || (b) == RSLC_BI_SAMPLEID || (b) == RSLC_BI_LAYER)
 
 /* A uniform block or push-constant block. */
 struct rslc_blockdecl
@@ -337,6 +461,9 @@ struct rslc_blockdecl
    uint32_t                line;
    bool                    push;
    bool                    std140;    /* layout; push blocks default std430 */
+   bool                    buffer;    /* RSLC_EXTENDED: a storage buffer, std430 by default */
+   bool                    readonly;
+   bool                    coherent;
 };
 
 struct rslc_func
@@ -478,10 +605,33 @@ enum rslc_bfn
    RSLC_BFN_TEXTUREGATHEROFFSET,
    RSLC_BFN_DFDX, RSLC_BFN_DFDY, RSLC_BFN_FWIDTH, RSLC_BFN_DFDXFINE, RSLC_BFN_DFDYFINE,
    RSLC_BFN_FWIDTHFINE, RSLC_BFN_DFDXCOARSE, RSLC_BFN_DFDYCOARSE, RSLC_BFN_FWIDTHCOARSE,
+   RSLC_BFN_EMITVERTEX, RSLC_BFN_ENDPRIMITIVE,   /* RSLC_EXTENDED, geometry */
+   /* RSLC_EXTENDED: on a member of a storage buffer */
+   RSLC_BFN_ATOMICADD, RSLC_BFN_ATOMICMIN, RSLC_BFN_ATOMICMAX, RSLC_BFN_ATOMICAND,
+   RSLC_BFN_ATOMICOR, RSLC_BFN_ATOMICXOR, RSLC_BFN_ATOMICEXCHANGE, RSLC_BFN_ATOMICCOMPSWAP,
+   /* RSLC_EXTENDED, compute and images */
+   RSLC_BFN_BARRIER, RSLC_BFN_MEMORYBARRIER, RSLC_BFN_MEMORYBARRIERSHARED,
+   RSLC_BFN_MEMORYBARRIERBUFFER, RSLC_BFN_MEMORYBARRIERIMAGE, RSLC_BFN_GROUPMEMORYBARRIER,
+   RSLC_BFN_IMAGESTORE, RSLC_BFN_IMAGELOAD, RSLC_BFN_IMAGESIZE,
+   RSLC_BFN_SUBPASSLOAD,   /* RSLC_EXTENDED, fragment */
+   /* RSLC_EXTENDED: subgroup operations */
+   RSLC_BFN_SUBGROUPELECT, RSLC_BFN_SUBGROUPMIN, RSLC_BFN_SUBGROUPMAX,
    RSLC_BFN_COUNT
 };
 
+/* RSLC_EXTENDED: the capabilities, extensions and modes a stage's
+ * spirv_execution_mode declarations may add, each; a mode takes up to
+ * three literals. */
+#define RSLC_MAX_XMODE 16
+
 /* The parsed stage. */
+/* Uniform and push blocks one stage may declare. */
+#ifdef RSLC_EXTENDED
+#define RSLC_MAX_BLOCKS 10
+#else
+#define RSLC_MAX_BLOCKS 2
+#endif
+
 struct rslc_prog
 {
    struct rslc_var       **vars;      /* every variable, by id (1-based) */
@@ -491,14 +641,47 @@ struct rslc_prog
    struct rslc_var       **inputs;    /* stage in, by declaration order */
    struct rslc_var       **outputs;
    struct rslc_func       *main_fn;
-   struct rslc_blockdecl   blocks[2]; /* [0] uniform block, [1] push block */
+   /* [0] uniform block, [1] push block; RSLC_EXTENDED: [2..] the
+    * further uniform blocks, by declaration order */
+   struct rslc_blockdecl   blocks[RSLC_MAX_BLOCKS];
    uint32_t                nvars, vars_cap;
    uint32_t                nfuncs, funcs_cap;
    uint32_t                nstructs, structs_cap;
    uint32_t                nsamplers, samplers_cap;
    uint32_t                ninputs, inputs_cap;
    uint32_t                noutputs, outputs_cap;
-   bool                    has_block[2];
+   bool                    has_block[RSLC_MAX_BLOCKS];
+   bool                    early_fragment_tests;   /* RSLC_EXTENDED */
+   bool                    subgroup;   /* RSLC_EXTENDED: calls a subgroup operation */
+   /* RSLC_EXTENDED: one past the highest gl_ClipDistance /
+    * gl_CullDistance element written, 0 when none is */
+   uint8_t                 clip_n;
+   uint8_t                 cull_n;
+   /* RSLC_EXTENDED, geometry: RSLC_GS_* in and out, 0 when undeclared */
+   uint8_t                 gs_in;
+   uint8_t                 gs_out;
+   uint32_t                gs_invocations;   /* 0: one */
+   uint32_t                gs_max_vertices;
+   uint32_t                cs_local[3];      /* RSLC_EXTENDED, compute: 0 is unset */
+#ifdef RSLC_EXTENDED
+   /* geometry: gl_in's members, made with the input primitive layout,
+    * and one past the highest clip / cull element it reads */
+   struct rslc_field      *glin_fields;
+   uint8_t                 clip_in_n;
+   uint8_t                 cull_in_n;
+   /* what the SPIR-V destination alone takes, named for the others'
+    * refusal; NULL when nothing is */
+   const char             *spirv_only;
+   /* spirv_execution_mode (GL_EXT_spirv_intrinsics): the capabilities
+    * and extensions it asks for, and each mode as its word count, the
+    * mode and its literals */
+   uint32_t                xcaps[RSLC_MAX_XMODE];
+   const char             *xexts[RSLC_MAX_XMODE];
+   uint32_t                xmodes[RSLC_MAX_XMODE * 5];
+   uint32_t                nxcaps;
+   uint32_t                nxexts;
+   uint32_t                nxmodes;   /* words in xmodes */
+#endif
 };
 
 /* Source file names seen through #line, for diagnostics. */
@@ -571,6 +754,9 @@ struct rslc_sym *rslc_tok_sym(const struct rslc_ctx *c, const struct rslc_tok *t
  * first sight; rslc_intern is the string of that record.  NULL on
  * arena exhaustion. */
 struct rslc_sym *rslc_sym(struct rslc_ctx *c, const char *s, size_t len);
+/* rslc_sym with h = rslc_hash(s, len) already worked out */
+struct rslc_sym *rslc_sym_hashed(struct rslc_ctx *c, const char *s, size_t len,
+      uint32_t h);
 const char *rslc_intern(struct rslc_ctx *c, const char *s, size_t len);
 const char *rslc_intern_cstr(struct rslc_ctx *c, const char *s);
 uint32_t    rslc_hash(const char *s, size_t len);
@@ -614,6 +800,9 @@ const struct rslc_type *rslc_type_array(struct rslc_ctx *c,
 struct rslc_type *rslc_type_struct(struct rslc_ctx *c, struct rslc_sym *name,
       const struct rslc_field *fields, uint32_t nfields);
 const struct rslc_type *rslc_type_sampler2d(struct rslc_ctx *c, enum rslc_base base);
+/* kind is RSLC_TY_SAMPLER2D or one of the RSLC_EXTENDED sampler kinds. */
+const struct rslc_type *rslc_type_sampler(struct rslc_ctx *c, enum rslc_tkind kind,
+      enum rslc_base base);
 uint32_t rslc_node_new(struct rslc_ctx *c, enum rslc_op op,
       const struct rslc_type *type, uint32_t a, uint32_t b, uint32_t c_,
       uint16_t aux, uint32_t line);
@@ -651,6 +840,9 @@ bool rslc_front_parse(struct rslc_ctx *c, const char *src, size_t len);
 bool  rslc_front_compile(struct rslc_ctx *c, const char *src, size_t len);
 bool  rslc_emit_dst(struct rslc_ctx *c, struct rslc_result *result);
 bool  rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result);
+#ifdef RSLC_EXTENDED
+bool  rslc_emit_dxbc(struct rslc_ctx *c, struct rslc_result *result);   /* rslc_dxbc.c */
+#endif
 
 /* Shared by the backends (TU 2): which functions main reaches, the
  * reflection section, and the blob around a payload. */

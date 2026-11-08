@@ -71,7 +71,8 @@ TEST_CRYPTO_LRC_SRC = crypto/crypto.c crypto/kdf.c crypto/pk.c crypto/x509.c uti
 # Known-answer tests for every primitive (FIPS 197, RFC 4493, the GCM
 # spec vectors, RFC 8439, RFC 4231, RFC 5869, PBKDF2, FIPS 180-4), the
 # DRBG and the platform entropy source, and the public-key side (bignum,
-# RSA PKCS#1 v1.5 verify, P-256 ECDH / ECDSA) against reference vectors.
+# RSA PKCS#1 v1.5 sign and verify, P-256 ECDH / ECDSA, B-233 against
+# RFC 6979) against reference vectors.
 TEST_CRYPTO = test/crypto/test_crypto
 TEST_CRYPTO_SRC = test/crypto/test_crypto.c $(TEST_CRYPTO_LRC_SRC) \
 		hash/lrc_hash.c encodings/encoding_base64.c \
@@ -471,6 +472,8 @@ darwin-floor-check:
 
 unit-tests:
 	# Build and execute tests in order, to avoid coverage file collision
+	$(CC) $(TEST_UNIT_CFLAGS) test/formats/rxml_oom_test.c -o test/formats/rxml_oom_test
+	test/formats/rxml_oom_test
 	# string
 	$(CC) $(TEST_UNIT_CFLAGS) $(TEST_STDSTRING_SRC) $(LIBCHECK_LIBS) -o $(TEST_STDSTRING)
 	$(TEST_STDSTRING)
@@ -564,7 +567,9 @@ QEMU_MIPSEL ?= qemu-mipsel
 # TSan: a table built on first use or a cached CPU-feature check is a
 # reported race here on any runner, where a network test sees it only
 # when two connections happen to start together on two cores. Then the
-# x509 trust store, walked while it is replaced, under TSan and ASan.
+# x509 trust store, walked while it is replaced, the TLS session cache,
+# read while it is rewritten, and the curve constants, first used from
+# several threads, under TSan and ASan.
 crypto-tsan-check:
 	$(CC) -O1 -g -fsanitize=thread -Iinclude test/crypto/crypto_threads_test.c \
 	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) -lpthread -lm \
@@ -580,7 +585,50 @@ crypto-tsan-check:
 	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c -lpthread -lm \
 	   -o test/crypto/x509_store_threads_test
 	test/crypto/x509_store_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -DHAVE_THREADS -DX509_TEST_HOLD_LANE -Iinclude \
+	   test/crypto/x509_store_threads_test.c \
+	   $(filter-out test/crypto/test_crypto.c crypto/x509.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c \
+	   -lpthread -lm -o test/crypto/x509_store_threads_test
+	test/crypto/x509_store_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -DHAVE_THREADS -DX509_TEST_HOLD_LANE -DX509_STORE_TEST_FLAG -Iinclude \
+	   test/crypto/x509_store_threads_test.c \
+	   $(filter-out test/crypto/test_crypto.c crypto/x509.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c \
+	   -lpthread -lm -o test/crypto/x509_store_threads_test
+	test/crypto/x509_store_threads_test
 	rm -f test/crypto/x509_store_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -fsanitize=thread -DHAVE_THREADS -Iinclude test/net/tls_cache_threads_test.c \
+	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c -lpthread -lm \
+	   -o test/net/tls_cache_threads_test
+	TSAN_OPTIONS="halt_on_error=1 exitcode=66" test/net/tls_cache_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -fsanitize=address,undefined -fno-sanitize-recover=all -DHAVE_THREADS \
+	   -Iinclude test/net/tls_cache_threads_test.c \
+	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c -lpthread -lm \
+	   -o test/net/tls_cache_threads_test
+	test/net/tls_cache_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -DHAVE_THREADS -DTLS_TEST_HOLD_LANE -Iinclude test/net/tls_cache_threads_test.c \
+	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c -lpthread -lm \
+	   -o test/net/tls_cache_threads_test
+	test/net/tls_cache_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -DHAVE_THREADS -DTLS_TEST_HOLD_LANE -DTLS_CACHE_TEST_FLAG -Iinclude \
+	   test/net/tls_cache_threads_test.c \
+	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c -lpthread -lm \
+	   -o test/net/tls_cache_threads_test
+	test/net/tls_cache_threads_test
+	rm -f test/net/tls_cache_threads_test
+	$(CC) -O1 -g -D_GNU_SOURCE -fsanitize=thread -DHAVE_THREADS -Iinclude test/crypto/ec_first_use_test.c \
+	   $(filter-out test/crypto/test_crypto.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c -lpthread -lm \
+	   -o test/crypto/ec_first_use_test
+	TSAN_OPTIONS="halt_on_error=1 exitcode=66" test/crypto/ec_first_use_test
+	$(CC) -O1 -g -D_GNU_SOURCE -DHAVE_THREADS -DEC_TEST_HOLD_LANE -Iinclude test/crypto/ec_first_use_test.c \
+	   $(filter-out test/crypto/test_crypto.c crypto/pk.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c \
+	   -lpthread -lm -o test/crypto/ec_first_use_test
+	test/crypto/ec_first_use_test
+	$(CC) -O1 -g -D_GNU_SOURCE -DHAVE_THREADS -DEC_TEST_HOLD_LANE -DEC_TEST_WAIT -Iinclude \
+	   test/crypto/ec_first_use_test.c \
+	   $(filter-out test/crypto/test_crypto.c crypto/pk.c,$(TEST_CRYPTO_SRC)) rthreads/rthreads.c \
+	   -lpthread -lm -o test/crypto/ec_first_use_test
+	test/crypto/ec_first_use_test
+	rm -f test/crypto/ec_first_use_test
 
 crypto-mips-check:
 	@if ! command -v $(MIPSEL_CC) >/dev/null 2>&1; then echo "skip: $(MIPSEL_CC) not installed"; exit 0; fi; \
@@ -652,6 +700,9 @@ win32-waits-check:
 	   rthreads/retro_eventcount.c $(WIN32_WAITS_SRC) \
 	   -o /tmp/lrc_ec_win32.exe || exit 1; \
 	$(MINGW_CC) -static -O1 -DHAVE_THREADS -Iinclude -Wall \
+	   samples/rthreads/retro_eventcount_test/win32_spin_test.c \
+	   $(WIN32_WAITS_SRC) -o /tmp/lrc_spin_win32.exe || exit 1; \
+	$(MINGW_CC) -static -O1 -DHAVE_THREADS -Iinclude -Wall \
 	   samples/rthreads/retro_asym_eventcount_test/retro_asym_eventcount_test.c \
 	   rthreads/retro_asym_eventcount.c rthreads/retro_procbarrier.c \
 	   rthreads/retro_eventcount.c $(WIN32_WAITS_SRC) \
@@ -662,6 +713,9 @@ win32-waits-check:
 	   -o /tmp/lrc_tpool_win32.exe || exit 1; \
 	for h in 1 0; do \
 	   for t in alert keyed event none; do \
+	      RETRO_EVENTCOUNT_HIRES=$$h RETRO_EVENTCOUNT_WIN32=$$t \
+	         $(WINE) /tmp/lrc_spin_win32.exe >/tmp/lrc_waits.log 2>&1 \
+	         || { echo "FAIL: eventcount spin, tier $$t, hires $$h"; cat /tmp/lrc_waits.log; exit 1; }; \
 	      RETRO_EVENTCOUNT_HIRES=$$h RETRO_EVENTCOUNT_WIN32=$$t \
 	         $(WINE) /tmp/lrc_ec_win32.exe >/tmp/lrc_waits.log 2>&1 \
 	         || { echo "FAIL: eventcount, tier $$t, hires $$h"; cat /tmp/lrc_waits.log; exit 1; }; \
@@ -675,7 +729,7 @@ win32-waits-check:
 	   done; \
 	   echo "ok:   Windows wait tiers under Wine, hires $$h"; \
 	done; \
-	rm -f /tmp/lrc_ec_win32.exe /tmp/lrc_asym_win32.exe /tmp/lrc_tpool_win32.exe /tmp/lrc_waits.log
+	rm -f /tmp/lrc_ec_win32.exe /tmp/lrc_spin_win32.exe /tmp/lrc_asym_win32.exe /tmp/lrc_tpool_win32.exe /tmp/lrc_waits.log
 
 all: unit-tests console-libc-check darwin-floor-check crypto-aarch64-check crypto-arm-check crypto-mips-check win32-wine-check win32-waits-check
 	# vfs samples: file size, seek and EOF boundaries, mapped and not

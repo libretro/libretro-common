@@ -55,8 +55,23 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#if !defined(_XBOX)
+#include <windows.h>
+#endif
 #else
 #include <unistd.h> /* stat() is defined here */
+#endif
+
+/* Free-space query: only where the call is known to exist.  Everything
+ * else reports "unknown" (-1) rather than guessing at a header. */
+#if defined(__ANDROID__)
+#include <sys/vfs.h>          /* statfs: every API level, statvfs is 19+ */
+#define PATH_FREE_SPACE_STATFS
+#elif defined(__linux__) || defined(__APPLE__) || defined(__NetBSD__) \
+   || defined(__OpenBSD__) || defined(__DragonFly__) || defined(__HAIKU__) \
+   || defined(__EMSCRIPTEN__) || (defined(__FreeBSD__) && !defined(ORBIS))
+#include <sys/statvfs.h>
+#define PATH_FREE_SPACE_STATVFS
 #endif
 
 /* <direct.h> (MinGW, included just above) can re-establish the mkdir
@@ -163,6 +178,30 @@ bool path_is_directory(const char *path)
    if (path_stat64_cb)
       return (path_stat64_cb(path, NULL) & RETRO_VFS_STAT_IS_DIRECTORY) != 0;
    return (path_stat32_cb(path, NULL) & RETRO_VFS_STAT_IS_DIRECTORY) != 0;
+}
+
+bool path_is_empty_directory(const char *dir)
+{
+   struct retro_vfs_dir_handle *d = retro_vfs_opendir_impl(dir, false);
+
+   if (!d)
+      return false;
+
+   while (retro_vfs_readdir_impl(d))
+   {
+      const char *name = retro_vfs_dirent_get_name_impl(d);
+
+      /* ".", ".." and dotfiles (.nomedia, .DS_Store) do not count:
+       * the open call does not filter them outside Windows */
+      if (name && name[0] != '.')
+      {
+         retro_vfs_closedir_impl(d);
+         return false;
+      }
+   }
+
+   retro_vfs_closedir_impl(d);
+   return true;
 }
 
 bool path_is_character_special(const char *path)
@@ -318,4 +357,57 @@ bool path_mkdir(const char *dir)
          return true;
    }
    return false;
+}
+
+int64_t path_get_free_space(const char *path)
+{
+#if defined(_WIN32) && !defined(_XBOX)
+   ULARGE_INTEGER avail;
+#if defined(__WINRT__)
+   if (GetDiskFreeSpaceExA(path, &avail, NULL, NULL))
+      return (int64_t)avail.QuadPart;
+#else
+   /* GetDiskFreeSpaceEx is not in the first release of Windows 95, and
+    * a static import would stop the binary loading there.  The plain
+    * call is everywhere; it tops out at 2GB on old systems, which is
+    * still a correct lower bound. */
+   typedef BOOL (WINAPI *disk_free_ex_t)(LPCSTR, PULARGE_INTEGER,
+         PULARGE_INTEGER, PULARGE_INTEGER);
+   static disk_free_ex_t p_disk_free_ex = NULL;
+   static int            resolved       = 0;
+   DWORD spc, bps, free_clusters, total_clusters;
+
+   if (!resolved)
+   {
+      HMODULE k32 = GetModuleHandleA("kernel32.dll");
+      resolved    = 1;
+      if (k32)
+         p_disk_free_ex = (disk_free_ex_t)GetProcAddress(k32,
+               "GetDiskFreeSpaceExA");
+   }
+
+   if (p_disk_free_ex)
+   {
+      if (p_disk_free_ex(path, &avail, NULL, NULL))
+         return (int64_t)avail.QuadPart;
+   }
+   else if (GetDiskFreeSpaceA(path, &spc, &bps,
+            &free_clusters, &total_clusters))
+      return (int64_t)free_clusters * (int64_t)spc * (int64_t)bps;
+#endif
+   return -1;
+#elif defined(PATH_FREE_SPACE_STATFS)
+   struct statfs fs;
+   if (statfs(path, &fs) == 0)
+      return (int64_t)fs.f_bavail * (int64_t)fs.f_bsize;
+   return -1;
+#elif defined(PATH_FREE_SPACE_STATVFS)
+   struct statvfs fs;
+   if (statvfs(path, &fs) == 0)
+      return (int64_t)fs.f_bavail * (int64_t)fs.f_frsize;
+   return -1;
+#else
+   (void)path;
+   return -1;
+#endif
 }

@@ -13,9 +13,17 @@ SOURCES := \
 	task_queue_park_test.c \
 	$(LIBRETRO_COMM_DIR)/queues/task_queue.c \
 	$(LIBRETRO_COMM_DIR)/rthreads/rthreads.c \
+	$(LIBRETRO_COMM_DIR)/rthreads/retro_eventcount.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
 	$(LIBRETRO_COMM_DIR)/features/features_cpu.c \
 	$(LIBRETRO_COMM_DIR)/time/rtime.c
+
+# GCD=standin builds it against the stand-in in ../gcd_standin, a
+# libdispatch on rthreads, where there is none.
+ifeq ($(GCD),standin)
+   SOURCES += ../gcd_standin/dispatch_standin.c
+   CFLAGS  += -DHAVE_GCD -I../gcd_standin
+endif
 
 OBJS := $(call sample_objs,$(SOURCES:.c=.o))
 

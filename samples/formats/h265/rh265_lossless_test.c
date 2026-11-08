@@ -148,8 +148,11 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
          static rh265_nal_t slices[128];
          rh265_access_unit_t au;
          static rh265_video_params_t parameters;
+         static rh265_slice_decode_t slice;
+         static uint32_t entries[RH265_SLICE_ENTRY_POINTS_MAX];
          rh265_hw_picture_t pending;
          int prepared, shown;
+         unsigned index;
          const rmp4_track *track = rmp4_get_track(m, trk);
          unsigned length_size = (track->codec_private[21] & 3) + 1;
          if (rh265_video_get_access_unit(h, pkt.data, pkt.size, length_size,
@@ -161,6 +164,17 @@ static long compare(const char *mp4, const uint8_t *ref_a, size_t alen,
          }
          if (rh265_video_get_params(h, (unsigned)au.first.pps_id, &parameters))
          { bad = -1; goto done; }
+         for (index = 0; index < au.num_slices; index++)
+            if (rh265_video_get_slice_decode(h, slices[index].data,
+                      slices[index].size, &slice, entries,
+                      RH265_SLICE_ENTRY_POINTS_MAX)
+                  || slice.picture.header_bytes > slices[index].size
+                  || slice.picture.header_bytes
+                           < 2 + slice.picture.header_bits / 8)
+            {
+               bad = -1;
+               goto done;
+            }
          prepared = rh265_hw_prepare(&hw_state, &parameters, &au, &pending);
          if (prepared == 1)
          {
@@ -474,10 +488,12 @@ int main(void)
          "-x265-params crf=24:sao=1:deblock=1:bframes=3:b-pyramid=1:wpp=0:frame-threads=1");
    oracle_case("lossy_ctu16",   "mandelbrot=s=176x144:r=10", 6, "yuv420p",
          "-x265-params crf=24:ctu=16:sao=1:deblock=1:bframes=2:wpp=0:frame-threads=1");
+   /* One worker: x265 4.1 encoding two slices on several threads writes
+    * slice headers no decoder can read, ffmpeg's included */
    oracle_case("multi_slice_b", "mandelbrot=s=256x256:r=10", 12, "yuv420p",
-         "-x265-params crf=24:slices=2:bframes=3:b-pyramid=1:wpp=1:frame-threads=1");
+         "-x265-params crf=24:slices=2:bframes=3:b-pyramid=1:wpp=1:frame-threads=1:pools=1");
    oracle_case("multi_slice_10", "mandelbrot=s=256x256:r=10", 12, "yuv420p10le",
-         "-x265-params crf=24:slices=2:bframes=3:b-pyramid=1:wpp=1:frame-threads=1");
+         "-x265-params crf=24:slices=2:bframes=3:b-pyramid=1:wpp=1:frame-threads=1:pools=1");
    #ifdef HAVE_THREADS
    if (g_pool)
       tpool_destroy((tpool_t*)g_pool);

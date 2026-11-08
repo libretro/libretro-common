@@ -104,6 +104,7 @@ static INLINE void smb2_set_password(struct smb2_context *ctx, const char *p) { 
 static INLINE void smb2_set_domain(struct smb2_context *ctx, const char *d)   { rsmb_set_domain(SMB2_CTX(ctx), d); }
 static INLINE void smb2_set_timeout(struct smb2_context *ctx, int seconds)    { rsmb_set_timeout(SMB2_CTX(ctx), seconds > 0 ? (unsigned)seconds : 0); }
 static INLINE void smb2_set_readahead(struct smb2_context *ctx, uint32_t bytes){ rsmb_set_readahead(SMB2_CTX(ctx), bytes); }
+static INLINE uint32_t smb2_get_readahead(struct smb2_context *ctx)          { return rsmb_get_readahead(SMB2_CTX(ctx)); }
 static INLINE void smb2_set_security_mode(struct smb2_context *ctx, int mode) { ((struct smb2_compat_ctx*)ctx)->auth_mode = mode; }
 static INLINE void smb2_set_authentication(struct smb2_context *ctx, int mode){ ((struct smb2_compat_ctx*)ctx)->auth_mode = mode; }
 
@@ -149,6 +150,9 @@ static INLINE int  smb2_disconnect_share(struct smb2_context *ctx) { rsmb_discon
 static INLINE int  smb2_context_active(struct smb2_context *ctx)   { return rsmb_get_fd(SMB2_CTX(ctx)) >= 0; }
 static INLINE int  smb2_echo(struct smb2_context *ctx)             { return rsmb_echo(SMB2_CTX(ctx)); }
 static INLINE const char *smb2_get_error(struct smb2_context *ctx) { return rsmb_get_error(SMB2_CTX(ctx)); }
+/* The step a failed smb2_connect_share() was on; RSMB_PHASE_NONE when a
+ * KRB5 request had no realm or got no ticket. Built-in client only. */
+static INLINE enum rsmb_phase smb2_get_phase(struct smb2_context *ctx) { return rsmb_get_phase(SMB2_CTX(ctx)); }
 
 static INLINE struct smb2fh *smb2_open(struct smb2_context *ctx, const char *path, int flags)
 {

@@ -61,9 +61,7 @@
 #ifdef HAVE_RAV1
 #include <formats/rav1_hw_stream.h>
 #endif
-#if defined(HAVE_RAV1) || defined(HAVE_RVP9)
 #include <features/features_cpu.h>
-#endif
 
 /* The demuxer's bounded sample table supplies presentation timestamps
  * without lookahead decoding or reading media bytes. */
@@ -109,7 +107,7 @@ struct rmp4_video_stream
    int64_t h265_timestamp, h265_display_timestamp;
    size_t h265_probe_offset, h265_probe_need, h265_need_lo, h265_need_hi;
    uint32_t h265_decode_sample, h265_probe_sample;
-   int h265_picture_pending, h265_timing_active, h265_have_time;
+   int h265_picture_pending, h265_timing_active, h265_have_time, h265_ahead;
 #ifdef HAVE_RAV1
    rav1_hw_stream_t *av1;
    uint8_t *av1_sequence_bytes;
@@ -922,6 +920,15 @@ static int rmp4_video_hwf_take(rmp4_video_stream_t *s)
    return 0;
 }
 
+static int rmp4_video_h265_output(rmp4_video_stream_t *s, int discard)
+{
+   if (!discard)
+      return rmp4_video_hwf_take(s);
+   rmp4_video_hwf_drop(s);
+   s->rndr_kind = 0;
+   return 0;
+}
+
 static void rmp4_video_stream_close_decoder(rmp4_video_stream_t *s)
 {
    rmp4_video_hwf_drop(s);
@@ -1573,16 +1580,15 @@ static int rmp4_video_vp9_hw_packet(rmp4_video_stream_t *s,
 static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
       const rmp4_packet *pkt, int discard)
 {
-   /* Any decode below can invalidate the previously recorded
-    * picture's planes; re-record on display.  (The wait_key early
-    * return clears too - harmless, callers only render after a
-    * displayed step.) */
+   /* Decoder-owned planes expire on decode; an exported lease stays
+    * valid until a replacement picture arrives or the caller takes it. */
    (void)discard;
 #ifdef HAVE_RAV1
    if (s->codec == RMP4_CODEC_AV1)
       return rmp4_video_av1_packet(s, pkt, discard);
 #endif
-   s->rndr_kind = 0;
+   if (s->rndr_kind != 5)
+      s->rndr_kind = 0;
 #ifdef HAVE_RVP9
    if (s->vp9_hw)
       return rmp4_video_vp9_hw_packet(s, pkt, discard);
@@ -1698,10 +1704,14 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
          s->h265_decode_sample++;
          return 0;
       }
-      dec = rh265_video_decode_timed(s->h265, pkt->data, pkt->size,
-            pkt->timestamp, &s->h265_timestamp);
+      dec = discard
+         ? rh265_video_decode_timed_discard(s->h265, pkt->data, pkt->size,
+               pkt->timestamp, &s->h265_timestamp)
+         : (s->h265_ahead ? rh265_video_decode_timed_ahead
+               : rh265_video_decode_timed)(s->h265, pkt->data, pkt->size,
+               pkt->timestamp, &s->h265_timestamp);
       if (dec == 2) return 2;
-      if (dec == 3) return rmp4_video_hwf_take(s) == 0 ? 3 : -1;
+      if (dec == 3) return rmp4_video_h265_output(s, discard) == 0 ? 3 : -1;
       s->h265_decode_sample++;
       if (dec < 0)
       {
@@ -1718,7 +1728,7 @@ static int rmp4_video_decode_packet(rmp4_video_stream_t *s,
          return 0;
       }
       if (rh265_video_is_hw(s->h265))
-         return rmp4_video_hwf_take(s) == 0 ? 1 : -1;
+         return rmp4_video_h265_output(s, discard) == 0 ? 1 : -1;
       /* Planes stay valid until the next decode; defer conversion. */
       if (!rh265_video_plane(s->h265, 0, NULL, NULL, NULL))
          return -1;
@@ -1907,8 +1917,9 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
          return 1;
       }
    }
-   if (s->h265 && (drained = rh265_video_drain_timed(s->h265,
-               &s->h265_timestamp)) == 2)
+   if (s->h265 && (drained = discard
+            ? rh265_video_drain_timed_discard(s->h265, &s->h265_timestamp)
+            : rh265_video_drain_timed(s->h265, &s->h265_timestamp)) == 2)
    {
       s->waiting = RMP4_VIDEO_WAIT_DECODER;
       return 2;
@@ -1920,7 +1931,7 @@ static int rmp4_video_stream_step(rmp4_video_stream_t *s,
       s->rndr_kind = 0;   /* the drain replaced the current picture */
       if (rh265_video_is_hw(s->h265))
       {
-         if (rmp4_video_hwf_take(s) != 0) return -1;
+         if (rmp4_video_h265_output(s, discard) != 0) return -1;
          s->h265_picture_pending = 1;
          return rmp4_video_h265_picture(s, duration_ms);
       }
@@ -1939,36 +1950,31 @@ static int rmp4_video_stream_advance(rmp4_video_stream_t *s,
       int *duration_ms, int discard)
 {
    int r;
-#if defined(HAVE_RAV1) || defined(HAVE_RVP9)
    int64_t started = 0;
-   int bounded = 0;
-#endif
+   int bounded;
 
    if (!s)
       return -1;
+   bounded = s->h265_ahead && s->h265 && rh265_video_is_hw(s->h265);
    s->completed = 0;
    s->waiting = 0;
 #ifdef HAVE_RAV1
-   bounded = s->codec == RMP4_CODEC_AV1;
+   bounded |= s->codec == RMP4_CODEC_AV1;
 #endif
 #ifdef HAVE_RVP9
    bounded |= s->vp9_hw != NULL;
 #endif
-#if defined(HAVE_RAV1) || defined(HAVE_RVP9)
    if (bounded)
       started = cpu_features_get_time_usec();
-#endif
 
    /* Retry later for input or decoder capacity, without spinning. */
    while ((r = rmp4_video_stream_step(s, duration_ms, discard)) == 0)
    {
-#if defined(HAVE_RAV1) || defined(HAVE_RVP9)
       if (bounded && cpu_features_get_time_usec() - started >= 4000)
       {
          s->waiting = RMP4_VIDEO_WAIT_DECODER;
          return 2;
       }
-#endif
    }
    if (r != 2)
       s->waiting = RMP4_VIDEO_WAIT_NONE;
@@ -2000,6 +2006,12 @@ enum rmp4_video_wait_reason rmp4_video_stream_wait_reason(
       const rmp4_video_stream_t *s)
 {
    return s ? (enum rmp4_video_wait_reason)s->waiting : RMP4_VIDEO_WAIT_NONE;
+}
+
+void rmp4_video_stream_set_decode_ahead(rmp4_video_stream_t *s, int enable)
+{
+   if (s)
+      s->h265_ahead = enable != 0;
 }
 
 int rmp4_video_stream_set_hw(rmp4_video_stream_t *s, int enable)
@@ -2623,6 +2635,18 @@ int64_t rmp4_video_stream_frame_time_ns(const rmp4_video_stream_t *s)
    return s ? rmp4_video_stream_movie_time_ns(s, s->disp_idx - 1) : -1;
 }
 
+int64_t rmp4_video_stream_next_end_time_ns(const rmp4_video_stream_t *s)
+{
+   int64_t delay, ms;
+   if (!s || s->disp_idx < 0 || s->disp_idx >= s->ts_count - 1)
+      return -1;
+   delay = rmp4_video_stream_presentation_delay_ns(s);
+   ms = s->ts[s->disp_idx + 1] / 1000000 - s->ts[0] / 1000000;
+   if (delay < 0 || ms < 0 || ms > (INT64_MAX - delay) / 1000000)
+      return -1;
+   return delay + ms * 1000000;
+}
+
 int rmp4_video_stream_seek_movie_begin_ns(rmp4_video_stream_t *s, int64_t ns)
 {
    const int64_t maximum = (int64_t)((~(uint64_t)0) >> 1);
@@ -3068,6 +3092,40 @@ int64_t rmp4_video_stream_seek_frame(rmp4_video_stream_t *s, int frame)
     * converted, and none of them is renderable now. */
    s->rndr_kind = 0;
    return s->disp_idx < s->ts_count ? s->ts[s->disp_idx] / 1000000 : 0;
+}
+
+int64_t rmp4_video_stream_seek_movie_ms(rmp4_video_stream_t *s, int64_t ms)
+{
+   const int64_t maximum = (int64_t)((~(uint64_t)0) >> 1);
+   int64_t target, time, last;
+   int lo = 0, hi;
+   if (!s || s->ts_count <= 0)
+      return -1;
+   if (ms < 0)
+      ms = 0;
+   target = ms > (maximum - 999999) / 1000000
+      ? maximum : ms * 1000000 + 999999;
+   hi = s->ts_count;
+   while (lo < hi)
+   {
+      int mid = lo + (hi - lo) / 2;
+      time = rmp4_video_stream_movie_time_ns(s, mid);
+      if (time < 0)
+         return -1;
+      if (time <= target)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   if (rmp4_video_stream_seek_frame(s, lo ? lo - 1 : 0) < 0)
+      return -1;
+   time = rmp4_video_stream_movie_time_ns(s, s->disp_idx);
+   last = rmp4_video_stream_movie_time_ns(s, s->ts_count - 1);
+   if (time < 0 || last < 0)
+      return -1;
+   if (target < time || target > last)
+      time = target;
+   return time / 1000000;
 }
 
 int64_t rmp4_video_stream_seek_ms(rmp4_video_stream_t *s, int64_t ms)

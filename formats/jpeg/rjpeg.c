@@ -157,7 +157,7 @@ struct rjpeg
 
    /* Progressive finish-phase tracking (RJPEG_ITER_FINISH_PROG) */
    int                     iter_finish_comp;  /* current component index       */
-   int                     iter_finish_row;   /* current block-row within comp */
+   int                     iter_finish_row;   /* MCU rows inverse-transformed  */
 
    /* Fused iterate+resample state: when iterating baseline interleaved,
     * the resample for MCU-row N runs after MCU-row N+1's entropy decode.
@@ -288,6 +288,14 @@ struct rjpeg_jpeg_s
     * (0 = CMYK, 2 = YCCK) and the two 3-component ones (0 = RGB,
     * 1 = YCbCr).  See rjpeg_process_marker() and rjpeg_output_rows(). */
    int      app14_transform;
+   /* A JFIF APP0 segment was seen: its colour space is YCbCr whatever
+    * else the file says. */
+   int      jfif;
+   /* Three components holding R, G and B rather than Y, Cb and Cr -
+    * decided once the markers are in (rjpeg_is_rgb), as libjpeg does:
+    * JFIF means YCbCr; else Adobe's transform 0 means RGB; else the
+    * component ids 'R', 'G', 'B' do. */
+   int      rgb;
    uint32_t img_x;
    uint32_t img_y;
 
@@ -589,6 +597,40 @@ static void rjpeg_grow_buffer_unsafe(rjpeg_jpeg *j)
    while (j->code_bits <= fill)
    {
       ptrdiff_t remaining = s->img_buffer_end - s->img_buffer;
+
+#if RJPEG_BITBUF_BITS == 64
+      /* Whole refill in one step.  The loop below takes bytes until
+       * the count passes the target, which from code_bits is exactly
+       * k = (FILL - code_bits) / 8 + 1 of them, each landing at
+       * FILL - (code_bits + 8i).  When none of the next eight bytes is
+       * 0xFF - nearly always, in entropy-coded data - those k bytes
+       * read as one big-endian number go in with one shift and one OR,
+       * leaving the buffer, the count and the read position exactly as
+       * the loop would.  An 0xFF anywhere in the eight, fewer than
+       * eight bytes left, or the 24-bit prefix-decoding target take
+       * the byte path. */
+      if (remaining >= 8 && fill == RJPEG_BITBUF_FILL)
+      {
+         const uint64_t ones = ((uint64_t)0x01010101u << 32) | 0x01010101u;
+         const uint8_t *p    = s->img_buffer;
+         /* big-endian, assembled so that GCC and Clang emit one load
+          * and a byte swap on little-endian hosts */
+         uint64_t       v    = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48)
+                             | ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32)
+                             | ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16)
+                             | ((uint64_t)p[6] <<  8) |  (uint64_t)p[7];
+         uint64_t       x    = ~v; /* a zero byte here is an 0xFF in v */
+         if (!((x - ones) & ~x & (ones << 7)))
+         {
+            int k = ((RJPEG_BITBUF_FILL - j->code_bits) >> 3) + 1;
+            j->code_buffer |= (rjpeg_bitbuf)((v >> (64 - 8 * k))
+                  << (64 - j->code_bits - 8 * k));
+            j->code_bits   += 8 * k;
+            s->img_buffer  += k;
+            return;
+         }
+      }
+#endif
 
       if (remaining >= 4)
       {
@@ -2649,6 +2691,15 @@ static int rjpeg_process_marker(rjpeg_jpeg *z, int m)
             && z->img_buffer[3] == 'b'
             && z->img_buffer[4] == 'e')
          z->app14_transform = z->img_buffer[11];
+      if (     m == 0xE0
+            && n >= 5
+            && z->img_buffer_end - z->img_buffer >= 5
+            && z->img_buffer[0] == 'J'
+            && z->img_buffer[1] == 'F'
+            && z->img_buffer[2] == 'I'
+            && z->img_buffer[3] == 'F'
+            && z->img_buffer[4] == 0)
+         z->jfif = 1;
 
       if (z->img_buffer + n > z->img_buffer_end)
          z->img_buffer = z->img_buffer_end;
@@ -2806,9 +2857,16 @@ static int rjpeg_process_frame_header(rjpeg_jpeg *z, int scan)
 
    for (i = 0; i < s->img_n; ++i)
    {
+      int k;
+      /* Any id will do - the scans name components by it - but two
+       * components cannot share one.  JFIF numbers them from 1, some
+       * jpegtran builds from 0, Adobe's CMYK and RGB files use 'C',
+       * 'M', 'Y', 'K' and 'R', 'G', 'B'; libjpeg takes all of these,
+       * and requiring 1.. or 0.. refused every Adobe CMYK file the
+       * 4-component path below exists for. */
       z->img_comp[i].id = RJPEG_GET8(s);
-      if (z->img_comp[i].id != i+1)   /* JFIF requires */
-         if (z->img_comp[i].id != i)  /* some version of jpegtran outputs non-JFIF-compliant files! */
+      for (k = 0; k < i; ++k)
+         if (z->img_comp[k].id == z->img_comp[i].id)
             return 0;
 
       q                = RJPEG_GET8(s);
@@ -2883,10 +2941,22 @@ static int rjpeg_process_frame_header(rjpeg_jpeg *z, int scan)
          z->img_comp[i].ring_h2  = z->img_comp[i].h2;
          z->img_comp[i].coeff_w  = (z->img_comp[i].w2 + 7) >> 3;
          z->img_comp[i].coeff_h  = (z->img_comp[i].h2 + 7) >> 3;
+         /* The scans only ever fill coefficients; the planes are
+          * written by the finish phase, which on the iterative path
+          * inverse-transforms and emits one MCU row at a time - so, as
+          * for baseline, three MCU-row spans of plane are all that is
+          * ever live.  The monolithic path (plane_ring 0) finishes
+          * whole planes and keeps them whole. */
+         if (z->plane_ring)
+         {
+            int span = z->img_comp[i].v * 8 * 3;
+            if (span < z->img_comp[i].ring_h2)
+               z->img_comp[i].ring_h2 = span;
+         }
 
-         /* raw_data: w2*h2 bytes + 15 for alignment */
+         /* raw_data: w2*ring_h2 bytes + 15 for alignment */
          offsets_data[i] = arena_size;
-         arena_size += (size_t)z->img_comp[i].w2 * z->img_comp[i].h2 + 15;
+         arena_size += (size_t)z->img_comp[i].w2 * z->img_comp[i].ring_h2 + 15;
          arena_size = (arena_size + 15) & ~(size_t)15;
 
          /* raw_coeff: coeff_w * coeff_h * 64 shorts + 15 for alignment */
@@ -4275,6 +4345,8 @@ bool rjpeg_start(rjpeg_t *rjpeg)
    j->plane_ring = 1;   /* iterative: fused decode may ring the planes */
    j->img_n = 0;
    j->app14_transform = -1;   /* no Adobe APP14 seen yet */
+   j->jfif            = 0;
+   j->rgb             = 0;
 
    /* Context fields embedded in j */
    j->img_buffer          = (uint8_t*)rjpeg->buff_data;
@@ -4337,10 +4409,21 @@ bool rjpeg_is_valid(rjpeg_t *rjpeg)
 static int rjpeg_resample_setup(rjpeg_jpeg *j, rjpeg_resample *res)
 {
    int k;
-   /* Every component is resampled: 1 (grayscale), 3 (YCbCr) or 4
-    * (CMYK/YCCK, where the K plane carries its own sampling factors
-    * and must be upsampled like any other). */
+   /* Every component is resampled: 1 (grayscale), 3 (YCbCr or RGB)
+    * or 4 (CMYK/YCCK, where the K plane carries its own sampling
+    * factors and must be upsampled like any other). */
    int decode_n = j->img_n;
+
+   j->rgb = 0;
+   if (j->img_n == 3 && !j->jfif)
+   {
+      if (j->app14_transform >= 0)
+         j->rgb = (j->app14_transform == 0);
+      else
+         j->rgb =  j->img_comp[0].id == 'R'
+               &&  j->img_comp[1].id == 'G'
+               &&  j->img_comp[2].id == 'B';
+   }
 
    for (k = 0; k < decode_n; ++k)
    {
@@ -4402,6 +4485,7 @@ static void rjpeg_output_rows(rjpeg_jpeg *z, rjpeg_resample *res,
     * kernel, all fixed once the header is parsed, so it is constant for
     * every row in the image - hoist it out of the row loop. */
    int use_fused = (z->img_n == 3
+         && !z->rgb
          && z->upsample_YCbCr_to_BGRA_kernel
          && decode_n >= 3
          && res[1].hs == 2
@@ -4534,6 +4618,29 @@ static void rjpeg_output_rows(rjpeg_jpeg *z, rjpeg_resample *res,
                   out[i*4 + 2] = RJPEG_MUL255(coutput[0][i], kv);
                   out[i*4 + 3] = 255;
                }
+            }
+         }
+      }
+      else if (z->img_n == 3 && z->rgb)
+      {
+         /* R, G and B planes: no colour transform, only the byte order
+          * the caller asked for. */
+         if (coutput[0] && coutput[1] && coutput[2])
+         {
+            const uint8_t *r = coutput[0], *g = coutput[1], *b = coutput[2];
+            unsigned i;
+            if (!supports_rgba)
+            {
+               const uint8_t *t = r;
+               r = b;
+               b = t;
+            }
+            for (i = 0; i < z->img_x; ++i)
+            {
+               out[i*4    ] = r[i];
+               out[i*4 + 1] = g[i];
+               out[i*4 + 2] = b[i];
+               out[i*4 + 3] = 255;
             }
          }
       }
@@ -5073,7 +5180,16 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
 
          if (m == JPEG_MARKER_EOI)
          {
-            /* All scans consumed — transition to IDCT phase */
+            /* All scans consumed - transition to IDCT phase, which
+             * emits the output as it goes (see FINISH_PROG): the
+             * planes may be ring-sized, so there is no later pass that
+             * could read them whole. */
+            if (!rjpeg->iter_resample_ready
+                  && !rjpeg_iterate_init_resample(rjpeg))
+            {
+               rjpeg->iter_state = RJPEG_ITER_ERROR;
+               return false;
+            }
             rjpeg->iter_finish_comp = 0;
             rjpeg->iter_finish_row  = 0;
             rjpeg->iter_state       = RJPEG_ITER_FINISH_PROG;
@@ -5148,46 +5264,54 @@ bool rjpeg_iterate_image(rjpeg_t *rjpeg)
        * ----------------------------------------------------------- */
       case RJPEG_ITER_FINISH_PROG:
       {
-         int n = rjpeg->iter_finish_comp;
+         /* One MCU row per call, across every component: dequantise
+          * and inverse-transform its block rows into the (ring) planes,
+          * then emit the output rows that are now complete - one MCU
+          * row behind, as the baseline fusion does, because the
+          * vertical resampler's far row for the tail of a span is the
+          * first plane row of the next.  The planes never exist whole
+          * and are never read back cold in a separate resample pass;
+          * rjpeg_process_image finds the output already made. */
+         int m = rjpeg->iter_finish_row;
+         int n;
 
-         /* Find next component that has work remaining */
-         while (n < j->img_n)
+         if (m < j->img_mcu_y)
          {
-            int w = (j->img_comp[n].x + 7) >> 3;
-            int h = (j->img_comp[n].y + 7) >> 3;
-            int row = rjpeg->iter_finish_row;
-
-            if (row < h)
+            unsigned max_row;
+            for (n = 0; n < j->img_n; ++n)
             {
-               /* Process one block-row of this component */
-               int i;
-               for (i = 0; i < w; ++i)
+               int v   = j->img_comp[n].v;
+               int wb  = (j->img_comp[n].x + 7) >> 3;
+               int hb  = (j->img_comp[n].y + 7) >> 3;
+               int br  = m * v;
+               int end = br + v < hb ? br + v : hb;
+               for (; br < end; ++br)
                {
-                  short *data = j->img_comp[n].coeff
-                     + 64 * (i + row * j->img_comp[n].coeff_w);
-                  j->dequant_idct_block_kernel(
-                        j->img_comp[n].data
-                        + j->img_comp[n].w2 * row * 8 + i * 8,
-                        j->img_comp[n].w2, data,
-                        j->dequant[j->img_comp[n].tq]);
+                  uint8_t *dst = j->img_comp[n].data
+                     + (size_t)j->img_comp[n].w2
+                     * (size_t)((br * 8) % j->img_comp[n].ring_h2);
+                  const short *src = j->img_comp[n].coeff
+                     + (size_t)64 * ((size_t)br * j->img_comp[n].coeff_w);
+                  int i;
+                  for (i = 0; i < wb; ++i)
+                     j->dequant_idct_block_kernel(dst + i * 8,
+                           j->img_comp[n].w2, (short*)src + 64 * i,
+                           j->dequant[j->img_comp[n].tq]);
                }
-
-               rjpeg->iter_finish_row = row + 1;
-
-               /* Check if this component is done */
-               if (rjpeg->iter_finish_row >= h)
-               {
-                  /* Move to next component */
-                  rjpeg->iter_finish_comp = n + 1;
-                  rjpeg->iter_finish_row  = 0;
-               }
-               return true; /* yield after each block-row */
             }
+            rjpeg->iter_finish_row = ++m;
 
-            /* This component done, try next */
-            n++;
-            rjpeg->iter_finish_comp = n;
-            rjpeg->iter_finish_row  = 0;
+            rjpeg->iter_rgba_used = rjpeg->supports_rgba;
+            if (m >= j->img_mcu_y)
+               max_row = j->img_y;
+            else
+               max_row = (unsigned)(m - 1) * j->img_v_max * 8;
+            if (max_row > j->img_y)
+               max_row = j->img_y;
+            rjpeg_output_rows(j, rjpeg->iter_res, rjpeg->iter_output,
+                  &rjpeg->iter_out_row, max_row, rjpeg->supports_rgba);
+            if (m < j->img_mcu_y)
+               return true; /* yield after each MCU row */
          }
 
          /* All components finished */
@@ -5326,6 +5450,8 @@ int rjpeg_process_image(rjpeg_t *rjpeg, void **buf_data,
 
          j->img_n            = 0;
          j->app14_transform  = -1;   /* no Adobe APP14 seen yet */
+         j->jfif             = 0;
+         j->rgb              = 0;
 
          if (!rjpeg_decode_jpeg_image(j))
          {

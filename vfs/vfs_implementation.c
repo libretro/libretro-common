@@ -1286,7 +1286,10 @@ int retro_vfs_file_close_impl(libretro_vfs_implementation_file *stream)
       if (sceIoClose((SceUID)stream->fd) < 0)
          result = -1;
 #else
-      if (close(stream->fd) != 0)
+      /* Only a negative return is a failure: on PS2, ps2sdk's close()
+       * passes iomanX's result through, which is the closed descriptor
+       * number on success. */
+      if (close(stream->fd) < 0)
          result = -1;
 #endif
    }
@@ -1835,7 +1838,7 @@ int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file *stream,
 #if defined(VITA)
          ssize_t _got   = (ssize_t)sceIoRead((SceUID)stream->fd, p, (SceSize)_chunk);
 #else
-         ssize_t _got   = read(stream->fd, p, _chunk);
+         ssize_t _got   = read(stream->fd, p, (unsigned)_chunk);
 #endif
          if (_got < 0)
             return (total != 0) ? (int64_t)total : -1;
@@ -1922,7 +1925,7 @@ int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file *stream, cons
 #if defined(VITA)
          ssize_t _put   = (ssize_t)sceIoWrite((SceUID)stream->fd, p, (SceSize)_chunk);
 #else
-         ssize_t _put   = write(stream->fd, p, _chunk);
+         ssize_t _put   = write(stream->fd, p, (unsigned)_chunk);
 #endif
          if (_put < 0)
          {
@@ -3962,7 +3965,7 @@ libretro_vfs_implementation_dir *retro_vfs_opendir_impl(
    if (path_is_smb(name))
    {
       smb_dir_handle *dh = retro_vfs_opendir_smb(name, include_hidden);
-      if (!dh || !dh->dir)
+      if (!dh)
       {
          free(rdir->orig_path);
          free(rdir);

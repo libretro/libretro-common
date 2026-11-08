@@ -82,7 +82,11 @@ struct rslc_pr
     * constant it names prints as its value (Metal builds no global
     * constructors to copy one constant into another) */
    bool                     msl_ginit;
-   uint8_t                 *active[2];
+#ifdef RSLC_EXTENDED
+   bool                     msl_boolread;   /* inside the bool(...) of a block read */
+   bool                     msl_dual;       /* a dual-source output: every color names its index */
+#endif
+   uint8_t                 *active[RSLC_MAX_BLOCKS];
    unsigned                 version;
    unsigned                 indent;
    unsigned                 sampler_prec_done;
@@ -140,6 +144,7 @@ struct rslc_pr
 #define RSLC_HL_FINDLSB       (1u << 24)
 #define RSLC_HL_FINDMSB_I     (1u << 25)
 #define RSLC_HL_FINDMSB_U     (1u << 26)
+#define RSLC_HL_SIZE_X        (1u << 27)   /* RSLC_EXTENDED samplers */
 
 /* ---- output ---- */
 
@@ -247,6 +252,15 @@ static void pr_scalar_name(struct rslc_pr *p, unsigned base)
  * are the GLSL columns, so M[i] and every constructor keep their
  * meaning and the memory layout of a row_major cbuffer member is the
  * std140 one; products swap their operands in mul() (see pr_expr). */
+#ifdef RSLC_EXTENDED
+/* MSL: a storage image's access, from its type. */
+static const char *pr_msl_image_access(const struct rslc_type *t)
+{
+   return t->rows == RSLC_IMG_WRITEONLY ? "write"
+      : t->rows == RSLC_IMG_READONLY ? "read" : "read_write";
+}
+#endif
+
 static void pr_type(struct rslc_pr *p, const struct rslc_type *t)
 {
    switch (t->kind)
@@ -303,6 +317,60 @@ static void pr_type(struct rslc_pr *p, const struct rslc_type *t)
          pr_scalar_prefix(p, t->base);
          pr_s(p, "sampler2D");
          break;
+#ifdef RSLC_EXTENDED
+      case RSLC_TY_SAMPLER2DARRAY:
+      case RSLC_TY_SAMPLER2DMSARRAY:
+      case RSLC_TY_SAMPLERBUFFER:
+         if (p->msl)
+         {
+            pr_s(p, t->kind == RSLC_TY_SAMPLER2DARRAY ? "texture2d_array<"
+                  : t->kind == RSLC_TY_SAMPLER2DMSARRAY ? "texture2d_ms_array<" : "texture_buffer<");
+            pr_scalar_name(p, t->base);
+            pr_c(p, '>');
+            break;
+         }
+         if (p->hlsl)
+         {
+            pr_s(p, t->kind == RSLC_TY_SAMPLER2DARRAY ? "Texture2DArray<"
+                  : t->kind == RSLC_TY_SAMPLER2DMSARRAY ? "Texture2DMSArray<" : "Buffer<");
+            pr_scalar_name(p, t->base);
+            pr_s(p, "4>");
+            break;
+         }
+         pr_scalar_prefix(p, t->base);
+         pr_s(p, t->kind == RSLC_TY_SAMPLER2DARRAY ? "sampler2DArray"
+               : t->kind == RSLC_TY_SAMPLER2DMSARRAY ? "sampler2DMSArray" : "samplerBuffer");
+         break;
+      case RSLC_TY_SUBPASSINPUT:
+         /* MSL alone prints one: the attachment's value, read as a
+          * fragment input */
+         pr_s(p, "float4");
+         break;
+      case RSLC_TY_IMAGE2D:
+      case RSLC_TY_IMAGE2DARRAY:
+         if (p->hlsl)
+         {
+            /* four-component formats only; rgba8 reads and writes as unorm */
+            pr_s(p, t->kind == RSLC_TY_IMAGE2D ? "RWTexture2D<" : "RWTexture2DArray<");
+            if (t->cols == RSLC_IMGFMT_RGBA8)
+               pr_s(p, "unorm ");
+            pr_scalar_name(p, t->base);
+            pr_s(p, "4>");
+            break;
+         }
+         if (p->msl)
+         {
+            pr_s(p, t->kind == RSLC_TY_IMAGE2D ? "texture2d<" : "texture2d_array<");
+            pr_scalar_name(p, t->base);
+            pr_s(p, ", access::");
+            pr_s(p, pr_msl_image_access(t));
+            pr_c(p, '>');
+            break;
+         }
+         pr_scalar_prefix(p, t->base);
+         pr_s(p, t->kind == RSLC_TY_IMAGE2D ? "image2D" : "image2DArray");
+         break;
+#endif
       case RSLC_TY_STRUCT:
          if (t->name)
             pr_ident(p, t->name);
@@ -333,6 +401,9 @@ static void pr_array_suffix(struct rslc_pr *p, const struct rslc_type *t)
    while (t->kind == RSLC_TY_ARRAY)
    {
       pr_c(p, '[');
+#ifdef RSLC_EXTENDED
+      if (t->array_len)   /* a storage buffer's unsized last member */
+#endif
       pr_u(p, t->array_len);
       pr_c(p, ']');
       t = t->elem;
@@ -370,7 +441,10 @@ static const char *pr_block_instance(struct rslc_pr *p, unsigned block)
 {
    const struct rslc_blockdecl *b = &p->c->prog.blocks[block];
    const char *forced = NULL;
-   if (p->names)
+   /* the frontend's names are for its two blocks; further ones keep
+    * theirs. Without RSLC_EXTENDED every block is one of those two,
+    * so the index test folds away. */
+   if (p->names && (RSLC_MAX_BLOCKS == 2 || block < 2))
       forced = b->push ? p->names->push_instance : p->names->ubo_instance;
    if (forced)
       return forced;
@@ -483,8 +557,34 @@ static void pr_hlsl_member(struct rslc_pr *p, unsigned block, uint32_t member)
 static const char *pr_msl_instance(struct rslc_pr *p, unsigned block)
 {
    const struct rslc_blockdecl *b = &p->c->prog.blocks[block];
+#ifdef RSLC_EXTENDED
+   static const char *const further[RSLC_MAX_BLOCKS] = {
+      "_ubo", "_push", "_b2", "_b3", "_b4", "_b5", "_b6", "_b7", "_b8", "_b9" };
+   if (!b->instance && block >= 2)
+      return further[block];
+#endif
    return b->instance ? b->instance->str : (b->push ? "_push" : "_ubo");
 }
+
+#ifdef RSLC_EXTENDED
+/* MSL: a block's struct name, and the address space and reference a
+ * function takes it by: constant for a uniform block, device for a
+ * storage buffer, const device when it is read only. */
+static void pr_msl_block_ref(struct rslc_pr *p, unsigned block)
+{
+   const struct rslc_blockdecl *b = &p->c->prog.blocks[block];
+   pr_s(p, !b->buffer ? "constant " : b->readonly ? "const device " : "device ");
+   pr_s(p, b->type->name ? b->type->name->str : (b->push ? "Push" : "UBO"));
+   pr_s(p, "& ");
+}
+
+/* MSL: the Metal index of a block, sampler or image: the binding the
+ * shader gave it. */
+static uint32_t pr_msl_index(uint32_t binding)
+{
+   return binding == RSLC_UNSET ? 0 : binding;
+}
+#endif
 
 /* Flattened blocks (rslc_names.flatten): the vec4 array's name. */
 static const char *pr_flat_name(struct rslc_pr *p, unsigned block)
@@ -620,6 +720,15 @@ static void pr_var_name(struct rslc_pr *p, const struct rslc_var *v)
             pr_s(p, pr_msl_instance(p, v->block));
             return;
          case RSLC_ST_BUILTIN:
+#ifdef RSLC_EXTENDED
+            /* asked where it is read: a fragment discarded by then
+             * is a helper */
+            if (v->builtin == RSLC_BI_HELPERINVOCATION)
+            {
+               pr_s(p, "simd_is_helper_thread()");
+               return;
+            }
+#endif
             pr_s(p, v->name->str);
             if (p->renamed[v->id])
                pr_s(p, "_g");
@@ -813,6 +922,11 @@ static void pr_cval(struct rslc_pr *p, const struct rslc_type *t, const struct r
 #define PR_PREC_SEQ     16
 
 static void pr_expr(struct rslc_pr *p, uint32_t node, int ctx);
+#ifdef RSLC_EXTENDED
+static int  pr_hlsl_buffer_root(struct rslc_pr *p, uint32_t node);
+static void pr_hlsl_buffer_name(struct rslc_pr *p, unsigned block);
+static void pr_hlsl_buffer_offset(struct rslc_pr *p, uint32_t node, bool std140);
+#endif
 
 static const char *pr_binop_str(uint16_t op, int *prec)
 {
@@ -847,6 +961,17 @@ static const char *pr_binop_str(uint16_t op, int *prec)
 static void pr_hl_tex(struct rslc_pr *p, uint32_t node, bool state)
 {
    const struct rslc_node *n = rslc_node_at(p->c, node);
+#ifdef RSLC_EXTENDED
+   /* an element of a sampler array: the texture and its state alike */
+   if (n->op == RSLC_OP_INDEX && rslc_node_at(p->c, n->a)->op == RSLC_OP_VAR)
+   {
+      pr_hl_tex(p, n->a, state);
+      pr_c(p, '[');
+      pr_expr(p, n->b, PR_PREC_SEQ);
+      pr_c(p, ']');
+      return;
+   }
+#endif
    if (n->op != RSLC_OP_VAR)
    {
       rslc_err(p->c, "hlsl: sampler expression", NULL, n->line);
@@ -870,7 +995,7 @@ static void pr_args(struct rslc_pr *p, uint32_t list)
       if (i)
          pr_s(p, ", ");
       if ((p->hlsl || p->msl) && rslc_node_at(p->c, a)->type
-            && rslc_node_at(p->c, a)->type->kind == RSLC_TY_SAMPLER2D)
+            && RSLC_TY_IS_SAMPLER(rslc_node_at(p->c, a)->type->kind))
       {
          pr_hl_tex(p, a, false);
          pr_s(p, ", ");
@@ -946,7 +1071,7 @@ static void pr_hlsl_builtin(struct rslc_pr *p, const struct rslc_node *n)
    uint32_t    cnt  = list ? rslc_list_len(p->c, list) : 0;
    const char *name = NULL;
    bool        cast = false;   /* wrap in the result type */
-   bool        vertex = p->c->stage == RSLC_STAGE_VERTEX;
+   bool        vertex = p->c->stage != RSLC_STAGE_FRAGMENT;   /* no implicit level */
    struct rslc_cval cv;
 
    switch (bfn)
@@ -1068,6 +1193,22 @@ static void pr_hlsl_builtin(struct rslc_pr *p, const struct rslc_node *n)
          return;
       case RSLC_BFN_TEXTURESIZE:
       {
+#ifdef RSLC_EXTENDED
+         const struct rslc_type *st = pr_arg_type(p, list, 0);
+         if (st->kind != RSLC_TY_SAMPLER2D)
+         {
+            pr_s(p, "rslc_size_x(");
+            pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
+            if (cnt > 1)
+            {
+               pr_s(p, ", uint(");
+               pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+               pr_c(p, ')');
+            }
+            pr_c(p, ')');
+            return;
+         }
+#endif
          pr_s(p, "int2(rslc_size(");
          pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
          pr_s(p, ", uint(");
@@ -1130,6 +1271,27 @@ static void pr_hlsl_builtin(struct rslc_pr *p, const struct rslc_node *n)
          return;
       case RSLC_BFN_TEXELFETCH:
       case RSLC_BFN_TEXELFETCHOFFSET:
+#ifdef RSLC_EXTENDED
+      {
+         /* an array takes its level in a fourth coordinate; a
+          * multisampled image the sample after the coordinate; a
+          * buffer neither */
+         const struct rslc_type *st = pr_arg_type(p, list, 0);
+         if (st->kind != RSLC_TY_SAMPLER2D)
+         {
+            pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
+            pr_s(p, st->kind == RSLC_TY_SAMPLER2DARRAY ? ".Load(int4(" : ".Load(");
+            pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_ASSIGN);
+            if (st->kind != RSLC_TY_SAMPLERBUFFER)
+            {
+               pr_s(p, ", ");
+               pr_expr(p, rslc_list_item(p->c, list, 2), PR_PREC_ASSIGN);
+            }
+            pr_s(p, st->kind == RSLC_TY_SAMPLER2DARRAY ? "))" : ")");
+            return;
+         }
+      }
+#endif
          pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
          pr_s(p, ".Load(int3(");
          pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_ASSIGN);
@@ -1182,9 +1344,78 @@ static void pr_hlsl_builtin(struct rslc_pr *p, const struct rslc_node *n)
       case RSLC_BFN_TEXTUREPROJLODOFFSET:
       case RSLC_BFN_TEXTUREPROJGRAD:
       case RSLC_BFN_TEXTUREPROJGRADOFFSET:
+#ifdef RSLC_EXTENDED
+      case RSLC_BFN_IMAGESIZE:
+#endif
          rslc_err(p->c, "hlsl: no form of this builtin", rslc_bfn_name(bfn), n->line);
          p->ok = false;
          return;
+#ifdef RSLC_EXTENDED
+      case RSLC_BFN_ATOMICADD:
+      case RSLC_BFN_ATOMICMIN:
+      case RSLC_BFN_ATOMICMAX:
+      case RSLC_BFN_ATOMICAND:
+      case RSLC_BFN_ATOMICOR:
+      case RSLC_BFN_ATOMICXOR:
+      case RSLC_BFN_ATOMICEXCHANGE:
+      case RSLC_BFN_ATOMICCOMPSWAP:
+      {
+         uint32_t mem = rslc_list_item(p->c, list, 0);
+         int      blk = pr_hlsl_buffer_root(p, mem);
+         uint32_t k;
+         if (blk < 0)
+         {
+            rslc_err(p->c, "hlsl: an atomic on anything but a storage buffer", NULL, n->line);
+            p->ok = false;
+            return;
+         }
+         pr_s(p, "rslc_");
+         pr_hlsl_buffer_name(p, (unsigned)blk);
+         pr_c(p, '_');
+         pr_s(p, rslc_bfn_name(bfn));
+         pr_s(p, n->type->base == RSLC_BASE_INT ? "_i(" : "_u(");
+         pr_hlsl_buffer_offset(p, mem, p->c->prog.blocks[blk].std140);
+         for (k = 1; k < cnt; k++)
+         {
+            pr_s(p, ", ");
+            pr_expr(p, rslc_list_item(p->c, list, k), PR_PREC_ASSIGN);
+         }
+         pr_c(p, ')');
+         return;
+      }
+      case RSLC_BFN_BARRIER:
+         pr_s(p, "GroupMemoryBarrierWithGroupSync()");
+         return;
+      case RSLC_BFN_MEMORYBARRIERSHARED:
+      case RSLC_BFN_GROUPMEMORYBARRIER:
+         pr_s(p, "GroupMemoryBarrier()");
+         return;
+      case RSLC_BFN_MEMORYBARRIER:
+         pr_s(p, "AllMemoryBarrier()");
+         return;
+      case RSLC_BFN_MEMORYBARRIERBUFFER:
+      case RSLC_BFN_MEMORYBARRIERIMAGE:
+         pr_s(p, "DeviceMemoryBarrier()");
+         return;
+      case RSLC_BFN_IMAGESTORE:
+      case RSLC_BFN_IMAGELOAD:
+      {
+         /* image[uintN(coord)], read or assigned */
+         const struct rslc_type *ct = pr_arg_type(p, list, 1);
+         pr_c(p, '(');
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_ASSIGN);
+         pr_s(p, ct->rows == 3 ? "[uint3(" : "[uint2(");
+         pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_ASSIGN);
+         pr_s(p, ")]");
+         if (bfn == RSLC_BFN_IMAGESTORE)
+         {
+            pr_s(p, " = ");
+            pr_expr(p, rslc_list_item(p->c, list, 2), PR_PREC_ASSIGN);
+         }
+         pr_c(p, ')');
+         return;
+      }
+#endif
       default:
          name = rslc_bfn_name(bfn);
          break;
@@ -1237,13 +1468,42 @@ static void pr_ms_sample(struct rslc_pr *p, uint32_t list, uint32_t cnt,
    pr_c(p, ')');
 }
 
+#ifdef RSLC_EXTENDED
+/* MSL: T.sample(TSmplr, uv.xy, layer [, after(arg)]) for an array,
+ * the layer rounded as GLSL rounds it. */
+static void pr_ms_sample_array(struct rslc_pr *p, uint32_t list, const char *after, uint32_t arg)
+{
+   uint32_t uv = rslc_list_item(p->c, list, 1);
+   pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
+   pr_s(p, ".sample(");
+   pr_hl_tex(p, rslc_list_item(p->c, list, 0), true);
+   pr_s(p, ", (");
+   pr_expr(p, uv, PR_PREC_SEQ);
+   pr_s(p, ").xy, uint(rint((");
+   pr_expr(p, uv, PR_PREC_SEQ);
+   pr_s(p, ").z))");
+   if (after)
+   {
+      pr_s(p, ", ");
+      pr_s(p, after);
+      pr_c(p, '(');
+      if (arg)
+         pr_expr(p, rslc_list_item(p->c, list, arg), PR_PREC_ASSIGN);
+      else
+         pr_s(p, "0.0");
+      pr_c(p, ')');
+   }
+   pr_c(p, ')');
+}
+#endif
+
 static void pr_msl_builtin(struct rslc_pr *p, const struct rslc_node *n)
 {
    unsigned    bfn  = n->a;
    uint32_t    list = n->b;
    uint32_t    cnt  = list ? rslc_list_len(p->c, list) : 0;
    const char *name = NULL;
-   bool        vertex = p->c->stage == RSLC_STAGE_VERTEX;
+   bool        vertex = p->c->stage != RSLC_STAGE_FRAGMENT;   /* no implicit level */
    struct rslc_cval cv;
 
    switch (bfn)
@@ -1385,6 +1645,41 @@ static void pr_msl_builtin(struct rslc_pr *p, const struct rslc_node *n)
          pr_c(p, ')');
          return;
       case RSLC_BFN_TEXTURESIZE:
+#ifdef RSLC_EXTENDED
+      {
+         const struct rslc_type *st = pr_arg_type(p, list, 0);
+         if (st->kind == RSLC_TY_SAMPLERBUFFER)
+         {
+            pr_s(p, "int(");
+            pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
+            pr_s(p, ".get_width())");
+            return;
+         }
+         if (st->kind == RSLC_TY_SAMPLER2DARRAY || st->kind == RSLC_TY_SAMPLER2DMSARRAY)
+         {
+            bool ms = st->kind == RSLC_TY_SAMPLER2DMSARRAY;
+            unsigned k;
+            pr_s(p, "int3(");
+            for (k = 0; k < 3; k++)
+            {
+               if (k)
+                  pr_s(p, ", ");
+               pr_s(p, "int(");
+               pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
+               pr_s(p, k == 0 ? ".get_width(" : k == 1 ? ".get_height(" : ".get_array_size(");
+               if (k < 2 && !ms)
+               {
+                  pr_s(p, "uint(");
+                  pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+                  pr_c(p, ')');
+               }
+               pr_s(p, "))");
+            }
+            pr_c(p, ')');
+            return;
+         }
+      }
+#endif
          pr_s(p, "rslc_size(");
          pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
          pr_s(p, ", uint(");
@@ -1397,6 +1692,14 @@ static void pr_msl_builtin(struct rslc_pr *p, const struct rslc_node *n)
          pr_s(p, ".get_num_mip_levels())");
          return;
       case RSLC_BFN_TEXTURE:
+#ifdef RSLC_EXTENDED
+         if (pr_arg_type(p, list, 0)->kind == RSLC_TY_SAMPLER2DARRAY)
+         {
+            pr_ms_sample_array(p, list, vertex ? "level" : cnt == 3 ? "bias" : NULL,
+                  cnt == 3 ? 2 : 0);
+            return;
+         }
+#endif
          if (vertex)
             pr_ms_sample(p, list, cnt, "sample", "level", 0, 0, 0);
          else if (cnt == 3)
@@ -1414,6 +1717,13 @@ static void pr_msl_builtin(struct rslc_pr *p, const struct rslc_node *n)
             pr_ms_sample(p, list, cnt, "sample", NULL, 0, 0, 2);
          return;
       case RSLC_BFN_TEXTURELOD:
+#ifdef RSLC_EXTENDED
+         if (pr_arg_type(p, list, 0)->kind == RSLC_TY_SAMPLER2DARRAY)
+         {
+            pr_ms_sample_array(p, list, "level", 2);
+            return;
+         }
+#endif
          pr_ms_sample(p, list, cnt, "sample", "level", 2, 0, 0);
          return;
       case RSLC_BFN_TEXTURELODOFFSET:
@@ -1449,6 +1759,38 @@ static void pr_msl_builtin(struct rslc_pr *p, const struct rslc_node *n)
       }
       case RSLC_BFN_TEXELFETCH:
       case RSLC_BFN_TEXELFETCHOFFSET:
+#ifdef RSLC_EXTENDED
+      {
+         /* an array: (xy, layer, level); multisampled: (xy, layer,
+          * sample); a buffer: the element */
+         const struct rslc_type *st = pr_arg_type(p, list, 0);
+         if (st->kind != RSLC_TY_SAMPLER2D)
+         {
+            if (bfn == RSLC_BFN_TEXELFETCHOFFSET)
+            {
+               rslc_err(p->c, "msl: no form of this builtin", rslc_bfn_name(bfn), n->line);
+               p->ok = false;
+               return;
+            }
+            pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
+            if (st->kind == RSLC_TY_SAMPLERBUFFER)
+            {
+               pr_s(p, ".read(uint(");
+               pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+               pr_s(p, "))");
+               return;
+            }
+            pr_s(p, ".read(uint2((");
+            pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+            pr_s(p, ").xy), uint((");
+            pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+            pr_s(p, ").z), uint(");
+            pr_expr(p, rslc_list_item(p->c, list, 2), PR_PREC_SEQ);
+            pr_s(p, "))");
+            return;
+         }
+      }
+#endif
          pr_hl_tex(p, rslc_list_item(p->c, list, 0), false);
          pr_s(p, ".read(uint2(");
          pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_ADD);
@@ -1502,9 +1844,111 @@ static void pr_msl_builtin(struct rslc_pr *p, const struct rslc_node *n)
       case RSLC_BFN_TEXTUREPROJLODOFFSET:
       case RSLC_BFN_TEXTUREPROJGRAD:
       case RSLC_BFN_TEXTUREPROJGRADOFFSET:
+#ifdef RSLC_EXTENDED
+      case RSLC_BFN_ATOMICCOMPSWAP:
+#endif
          rslc_err(p->c, "msl: no form of this builtin", rslc_bfn_name(bfn), n->line);
          p->ok = false;
          return;
+#ifdef RSLC_EXTENDED
+      case RSLC_BFN_ATOMICADD:
+      case RSLC_BFN_ATOMICMIN:
+      case RSLC_BFN_ATOMICMAX:
+      case RSLC_BFN_ATOMICAND:
+      case RSLC_BFN_ATOMICOR:
+      case RSLC_BFN_ATOMICXOR:
+      case RSLC_BFN_ATOMICEXCHANGE:
+         /* on a storage buffer member, as SPIRV-Cross writes them */
+         pr_s(p, bfn == RSLC_BFN_ATOMICADD ? "atomic_fetch_add_explicit("
+               : bfn == RSLC_BFN_ATOMICMIN ? "atomic_fetch_min_explicit("
+               : bfn == RSLC_BFN_ATOMICMAX ? "atomic_fetch_max_explicit("
+               : bfn == RSLC_BFN_ATOMICAND ? "atomic_fetch_and_explicit("
+               : bfn == RSLC_BFN_ATOMICOR ? "atomic_fetch_or_explicit("
+               : bfn == RSLC_BFN_ATOMICXOR ? "atomic_fetch_xor_explicit("
+               : "atomic_exchange_explicit(");
+         pr_s(p, n->type->base == RSLC_BASE_INT ? "(volatile device atomic_int*)&"
+               : "(volatile device atomic_uint*)&");
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_UNARY);
+         pr_s(p, ", ");
+         pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_ASSIGN);
+         pr_s(p, ", memory_order_relaxed)");
+         return;
+      case RSLC_BFN_BARRIER:
+      case RSLC_BFN_MEMORYBARRIERSHARED:
+      case RSLC_BFN_GROUPMEMORYBARRIER:
+         pr_s(p, "threadgroup_barrier(mem_flags::mem_threadgroup)");
+         return;
+      case RSLC_BFN_MEMORYBARRIER:
+         pr_s(p, "threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup"
+               " | mem_flags::mem_texture)");
+         return;
+      case RSLC_BFN_MEMORYBARRIERBUFFER:
+         pr_s(p, "threadgroup_barrier(mem_flags::mem_device)");
+         return;
+      case RSLC_BFN_MEMORYBARRIERIMAGE:
+         pr_s(p, "threadgroup_barrier(mem_flags::mem_texture)");
+         return;
+      case RSLC_BFN_IMAGESTORE:
+      case RSLC_BFN_IMAGELOAD:
+      {
+         /* (image, coord [, texel]): an array's layer goes apart */
+         const struct rslc_type *it = pr_arg_type(p, list, 0);
+         bool arr = it->kind == RSLC_TY_IMAGE2DARRAY;
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_POSTFIX);
+         if (bfn == RSLC_BFN_IMAGESTORE)
+         {
+            pr_s(p, ".write(");
+            pr_expr(p, rslc_list_item(p->c, list, 2), PR_PREC_ASSIGN);
+            pr_s(p, ", ");
+         }
+         else
+            pr_s(p, ".read(");
+         if (arr)
+         {
+            pr_s(p, "uint2((");
+            pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+            pr_s(p, ").xy), uint((");
+            pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+            pr_s(p, ").z))");
+         }
+         else
+         {
+            pr_s(p, "uint2(");
+            pr_expr(p, rslc_list_item(p->c, list, 1), PR_PREC_SEQ);
+            pr_s(p, "))");
+         }
+         return;
+      }
+      case RSLC_BFN_SUBPASSLOAD:
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_POSTFIX);
+         return;
+      case RSLC_BFN_SUBGROUPELECT:
+         pr_s(p, "simd_is_first()");
+         return;
+      case RSLC_BFN_SUBGROUPMIN:
+      case RSLC_BFN_SUBGROUPMAX:
+         pr_s(p, bfn == RSLC_BFN_SUBGROUPMIN ? "simd_min(" : "simd_max(");
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_SEQ);
+         pr_c(p, ')');
+         return;
+      case RSLC_BFN_IMAGESIZE:
+      {
+         const struct rslc_type *it = pr_arg_type(p, list, 0);
+         pr_s(p, it->kind == RSLC_TY_IMAGE2DARRAY ? "int3(int(" : "int2(int(");
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_POSTFIX);
+         pr_s(p, ".get_width()), int(");
+         pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_POSTFIX);
+         pr_s(p, ".get_height())");
+         if (it->kind == RSLC_TY_IMAGE2DARRAY)
+         {
+            pr_s(p, ", int(");
+            pr_expr(p, rslc_list_item(p->c, list, 0), PR_PREC_POSTFIX);
+            pr_s(p, ".get_array_size())");
+         }
+         pr_c(p, ')');
+         return;
+      }
+#endif
       default:
          name = rslc_bfn_name(bfn);
          break;
@@ -1974,6 +2418,30 @@ static void pr_msl_construct(struct rslc_pr *p, uint32_t node)
    pr_c(p, ')');
 }
 
+#ifdef RSLC_EXTENDED
+/* MSL: workgroup memory as a C array, as SPIRV-Cross declares it, or a
+ * reference to one (@ref): T name[N][M] / T (&name)[N][M]. */
+static void pr_msl_shared_decl(struct rslc_pr *p, const struct rslc_var *v, bool ref)
+{
+   const struct rslc_type *t = v->type;
+   while (t->kind == RSLC_TY_ARRAY)
+      t = t->elem;
+   pr_type(p, t);
+   pr_c(p, ' ');
+   if (ref)
+      pr_s(p, v->type->kind == RSLC_TY_ARRAY ? "(&" : "&");
+   pr_var_name(p, v);
+   if (ref && v->type->kind == RSLC_TY_ARRAY)
+      pr_c(p, ')');
+   for (t = v->type; t->kind == RSLC_TY_ARRAY; t = t->elem)
+   {
+      pr_c(p, '[');
+      pr_u(p, t->array_len);
+      pr_c(p, ']');
+   }
+}
+#endif
+
 /* MSL: the environment a function takes as parameters, declared
  * (@decl) or passed. */
 static void pr_msl_env(struct rslc_pr *p, const struct rslc_func *f, bool decl, bool *first)
@@ -1991,6 +2459,42 @@ static void pr_msl_env(struct rslc_pr *p, const struct rslc_func *f, bool decl, 
       *first = false;
       if (v->storage == RSLC_ST_SAMPLER)
       {
+#ifdef RSLC_EXTENDED
+         /* an array of samplers by reference, as SPIRV-Cross takes it;
+          * a buffer or multisampled image has no sampler state */
+         if (v->type->kind == RSLC_TY_ARRAY)
+         {
+            if (decl)
+            {
+               pr_s(p, "thread const array<");
+               pr_type(p, v->type->elem);
+               pr_s(p, ", ");
+               pr_u(p, v->type->array_len);
+               pr_s(p, ">& ");
+            }
+            pr_var_name(p, v);
+            pr_s(p, ", ");
+            if (decl)
+            {
+               pr_s(p, "thread const array<sampler, ");
+               pr_u(p, v->type->array_len);
+               pr_s(p, ">& ");
+            }
+            pr_var_name(p, v);
+            pr_s(p, "Smplr");
+            continue;
+         }
+         if (v->type->kind == RSLC_TY_SAMPLERBUFFER || v->type->kind == RSLC_TY_SAMPLER2DMSARRAY)
+         {
+            if (decl)
+            {
+               pr_type(p, v->type);
+               pr_c(p, ' ');
+            }
+            pr_var_name(p, v);
+            continue;
+         }
+#endif
          if (decl)
          {
             pr_type(p, v->type);
@@ -2004,6 +2508,29 @@ static void pr_msl_env(struct rslc_pr *p, const struct rslc_func *f, bool decl, 
          pr_s(p, "Smplr");
          continue;
       }
+#ifdef RSLC_EXTENDED
+      if (v->storage == RSLC_ST_IMAGE || v->storage == RSLC_ST_SUBPASS)
+      {
+         if (decl)
+         {
+            pr_type(p, v->type);
+            pr_c(p, ' ');
+         }
+         pr_var_name(p, v);
+         continue;
+      }
+      if (v->storage == RSLC_ST_SHARED)
+      {
+         if (decl)
+         {
+            pr_s(p, "threadgroup ");
+            pr_msl_shared_decl(p, v, true);
+            continue;
+         }
+         pr_var_name(p, v);
+         continue;
+      }
+#endif
       if (decl)
       {
          pr_s(p, "thread ");
@@ -2012,7 +2539,7 @@ static void pr_msl_env(struct rslc_pr *p, const struct rslc_func *f, bool decl, 
       }
       pr_var_name(p, v);
    }
-   for (i = 0; i < 2; i++)
+   for (i = 0; i < RSLC_MAX_BLOCKS; i++)
    {
       const struct rslc_blockdecl *b = &pr->blocks[i];
       if (!env[pr->nvars + i])
@@ -2022,9 +2549,14 @@ static void pr_msl_env(struct rslc_pr *p, const struct rslc_func *f, bool decl, 
       *first = false;
       if (decl)
       {
+#ifdef RSLC_EXTENDED
+         (void)b;
+         pr_msl_block_ref(p, i);
+#else
          pr_s(p, "constant ");
          pr_s(p, b->type->name ? b->type->name->str : (b->push ? "Push" : "UBO"));
          pr_s(p, "& ");
+#endif
       }
       pr_s(p, pr_msl_instance(p, i));
    }
@@ -2113,6 +2645,12 @@ static void pr_msl_env_mark(struct rslc_pr *p, uint8_t *env, uint32_t node, bool
          {
             case RSLC_ST_IN: case RSLC_ST_OUT: case RSLC_ST_BUILTIN:
             case RSLC_ST_GLOBAL: case RSLC_ST_SAMPLER:
+#ifdef RSLC_EXTENDED
+            case RSLC_ST_IMAGE: case RSLC_ST_SHARED: case RSLC_ST_SUBPASS:
+               /* a call, not a value handed down */
+               if (v->builtin == RSLC_BI_HELPERINVOCATION)
+                  return;
+#endif
                slot = n->a;
                break;
             case RSLC_ST_BLOCK: case RSLC_ST_MEMBER:
@@ -2171,7 +2709,7 @@ static bool pr_msl_env_build(struct rslc_pr *p)
    const struct rslc_prog *pr = &p->c->prog;
    bool changed = true;
    uint32_t i;
-   p->envn = pr->nvars + 2;
+   p->envn = pr->nvars + RSLC_MAX_BLOCKS;
    p->fenv = (uint8_t*)rslc_arena_zalloc(p->c, (size_t)p->envn * (pr->nfuncs + 1));
    if (!p->fenv)
       return false;
@@ -2209,6 +2747,255 @@ static void pr_mat_div_scalar(struct rslc_pr *p, uint32_t m, uint32_t s, int ctx
    if (prec > ctx)
       pr_c(p, ')');
 }
+
+#ifdef RSLC_EXTENDED
+/* ---- HLSL storage buffers ----
+ * A storage block becomes a (RW)ByteAddressBuffer named after the
+ * block, at t<binding> read only and u<binding> otherwise, as SPIRV-Cross
+ * lays it out: reads Load at the member's byte offset, a struct element
+ * through a loader made for it, atomics through Interlocked helpers. */
+
+/* The block (uniform or storage) an access is rooted in, or -1. */
+static int pr_block_root(struct rslc_pr *p, uint32_t node)
+{
+   for (;;)
+   {
+      const struct rslc_node *n = rslc_node_at(p->c, node);
+      if (n->op == RSLC_OP_INDEX || n->op == RSLC_OP_MEMBER)
+      {
+         node = n->a;
+         continue;
+      }
+      if (n->op == RSLC_OP_VAR)
+      {
+         const struct rslc_var *v = p->c->prog.vars[n->a];
+         if (v->storage == RSLC_ST_MEMBER || v->storage == RSLC_ST_BLOCK)
+            return (int)v->block;
+      }
+      return -1;
+   }
+}
+
+/* The storage block an access is rooted in, or -1. */
+static int pr_hlsl_buffer_root(struct rslc_pr *p, uint32_t node)
+{
+   for (;;)
+   {
+      const struct rslc_node *n = rslc_node_at(p->c, node);
+      if (n->op == RSLC_OP_INDEX || n->op == RSLC_OP_MEMBER)
+      {
+         node = n->a;
+         continue;
+      }
+      if (n->op == RSLC_OP_VAR)
+      {
+         const struct rslc_var *v = p->c->prog.vars[n->a];
+         if ((v->storage == RSLC_ST_MEMBER || v->storage == RSLC_ST_BLOCK)
+               && p->c->prog.blocks[v->block].buffer)
+            return (int)v->block;
+      }
+      return -1;
+   }
+}
+
+static void pr_hlsl_buffer_name(struct rslc_pr *p, unsigned block)
+{
+   pr_ident(p, p->c->prog.blocks[block].type->name);
+}
+
+/* The byte offset of an access into a storage block, as an expression. */
+static void pr_hlsl_buffer_offset(struct rslc_pr *p, uint32_t node, bool std140)
+{
+   const struct rslc_node *n = rslc_node_at(p->c, node);
+   if (n->op == RSLC_OP_VAR)
+   {
+      const struct rslc_var *v = p->c->prog.vars[n->a];
+      if (v->storage == RSLC_ST_MEMBER)
+         pr_u(p, rslc_layout_field_offset(p->c->prog.blocks[v->block].type, v->member, std140));
+      else
+         pr_c(p, '0');
+      return;
+   }
+   if (n->op == RSLC_OP_MEMBER)
+   {
+      const struct rslc_node *base = rslc_node_at(p->c, n->a);
+      uint32_t off = rslc_layout_field_offset(base->type, n->b, std140);
+      if (base->op == RSLC_OP_VAR)
+      {
+         pr_u(p, off);
+         return;
+      }
+      pr_c(p, '(');
+      pr_hlsl_buffer_offset(p, n->a, std140);
+      pr_s(p, " + ");
+      pr_u(p, off);
+      pr_c(p, ')');
+      return;
+   }
+   {
+      /* an element: its index times the stride, a vector's at four */
+      const struct rslc_node *base = rslc_node_at(p->c, n->a);
+      uint32_t a, s, st;
+      if (base->type->kind == RSLC_TY_VEC)
+         st = 4;
+      else
+         rslc_layout_of_type(base->type, std140, &a, &s, &st);
+      pr_c(p, '(');
+      pr_hlsl_buffer_offset(p, n->a, std140);
+      pr_s(p, " + uint(");
+      pr_expr(p, n->b, PR_PREC_ASSIGN);
+      pr_s(p, ") * ");
+      pr_u(p, st);
+      pr_c(p, ')');
+   }
+}
+
+/* Reads a scalar or vector of a storage block at a byte offset the
+ * caller prints between the parentheses. */
+static bool pr_hlsl_buffer_load_head(struct rslc_pr *p, unsigned block, const struct rslc_type *t)
+{
+   unsigned n = t->kind == RSLC_TY_VEC ? t->rows : 1;
+   if ((t->kind != RSLC_TY_SCALAR && t->kind != RSLC_TY_VEC) || t->base == RSLC_BASE_BOOL)
+   {
+      rslc_err(p->c, "hlsl: a storage buffer member that is not a number or vector", NULL, 0);
+      p->ok = false;
+      return false;
+   }
+   if (t->base == RSLC_BASE_FLOAT)
+      pr_s(p, "asfloat(");
+   else if (t->base == RSLC_BASE_INT)
+      pr_s(p, "asint(");
+   else
+      pr_c(p, '(');
+   pr_hlsl_buffer_name(p, block);
+   pr_s(p, ".Load");
+   if (n > 1)
+      pr_u(p, n);
+   pr_c(p, '(');
+   return true;
+}
+
+/* A read of a storage block: a number or vector loads, a struct goes
+ * through its loader. */
+static void pr_hlsl_buffer_read(struct rslc_pr *p, unsigned block, uint32_t node)
+{
+   const struct rslc_type *t  = rslc_node_at(p->c, node)->type;
+   bool std140 = p->c->prog.blocks[block].std140;
+   if (t->kind == RSLC_TY_STRUCT)
+   {
+      pr_s(p, "rslc_load_");
+      pr_hlsl_buffer_name(p, block);
+      pr_c(p, '_');
+      pr_ident(p, t->name);
+      pr_c(p, '(');
+      pr_hlsl_buffer_offset(p, node, std140);
+      pr_c(p, ')');
+      return;
+   }
+   if (!pr_hlsl_buffer_load_head(p, block, t))
+      return;
+   pr_hlsl_buffer_offset(p, node, std140);
+   pr_s(p, "))");
+}
+
+/* The declaration, a loader for each struct its arrays hold, and the
+ * atomics of a writable one. */
+static void pr_hlsl_buffer_decl(struct rslc_pr *p, unsigned block)
+{
+   static const char *const ops[7][2] = {
+      { "atomicAdd", "InterlockedAdd" }, { "atomicMin", "InterlockedMin" },
+      { "atomicMax", "InterlockedMax" }, { "atomicAnd", "InterlockedAnd" },
+      { "atomicOr", "InterlockedOr" }, { "atomicXor", "InterlockedXor" },
+      { "atomicExchange", "InterlockedExchange" } };
+   static const char *const tys[2] = { "int", "uint" };
+   const struct rslc_blockdecl *b = &p->c->prog.blocks[block];
+   uint32_t i, k, f;
+   pr_s(p, b->readonly ? "ByteAddressBuffer " : "RWByteAddressBuffer ");
+   pr_hlsl_buffer_name(p, block);
+   pr_s(p, b->readonly ? " : register(t" : " : register(u");
+   pr_u(p, b->binding == RSLC_UNSET ? 0 : b->binding);
+   pr_s(p, ");");
+   pr_nl(p);
+   for (i = 0; i < b->type->nfields; i++)
+   {
+      const struct rslc_type *st = b->type->fields[i].type;
+      while (st->kind == RSLC_TY_ARRAY)
+         st = st->elem;
+      if (st->kind != RSLC_TY_STRUCT)
+         continue;
+      pr_ident(p, st->name);
+      pr_s(p, " rslc_load_");
+      pr_hlsl_buffer_name(p, block);
+      pr_c(p, '_');
+      pr_ident(p, st->name);
+      pr_s(p, "(uint at)");
+      pr_nl(p);
+      pr_c(p, '{');
+      p->indent++;
+      pr_nl(p);
+      pr_ident(p, st->name);
+      pr_s(p, " r;");
+      for (f = 0; f < st->nfields; f++)
+      {
+         pr_nl(p);
+         pr_s(p, "r.");
+         pr_ident(p, st->fields[f].name);
+         pr_s(p, " = ");
+         if (!pr_hlsl_buffer_load_head(p, block, st->fields[f].type))
+            return;
+         pr_s(p, "at + ");
+         pr_u(p, rslc_layout_field_offset(st, f, b->std140));
+         pr_s(p, "));");
+      }
+      pr_nl(p);
+      pr_s(p, "return r;");
+      p->indent--;
+      pr_nl(p);
+      pr_c(p, '}');
+      pr_nl(p);
+   }
+   if (b->readonly)
+      return;
+   for (k = 0; k < 2; k++)
+   {
+      for (i = 0; i < 7; i++)
+      {
+         pr_s(p, tys[k]);
+         pr_s(p, " rslc_");
+         pr_hlsl_buffer_name(p, block);
+         pr_c(p, '_');
+         pr_s(p, ops[i][0]);
+         pr_c(p, '_');
+         pr_c(p, tys[k][0]);
+         pr_s(p, "(uint o, ");
+         pr_s(p, tys[k]);
+         pr_s(p, " v) { ");
+         pr_s(p, tys[k]);
+         pr_s(p, " r; ");
+         pr_hlsl_buffer_name(p, block);
+         pr_c(p, '.');
+         pr_s(p, ops[i][1]);
+         pr_s(p, "(o, v, r); return r; }");
+         pr_nl(p);
+      }
+      pr_s(p, tys[k]);
+      pr_s(p, " rslc_");
+      pr_hlsl_buffer_name(p, block);
+      pr_s(p, "_atomicCompSwap_");
+      pr_c(p, tys[k][0]);
+      pr_s(p, "(uint o, ");
+      pr_s(p, tys[k]);
+      pr_s(p, " c, ");
+      pr_s(p, tys[k]);
+      pr_s(p, " v) { ");
+      pr_s(p, tys[k]);
+      pr_s(p, " r; ");
+      pr_hlsl_buffer_name(p, block);
+      pr_s(p, ".InterlockedCompareExchange(o, c, v, r); return r; }");
+      pr_nl(p);
+   }
+}
+#endif
 
 static void pr_expr(struct rslc_pr *p, uint32_t node, int ctx)
 {
@@ -2250,6 +3037,31 @@ static void pr_expr(struct rslc_pr *p, uint32_t node, int ctx)
       }
    }
 
+#ifdef RSLC_EXTENDED
+   /* MSL holds a block's bool as a uint: a read turns it back */
+   if (p->msl && !p->msl_boolread && n->type && n->type->base == RSLC_BASE_BOOL
+         && (n->type->kind == RSLC_TY_SCALAR || n->type->kind == RSLC_TY_VEC)
+         && (n->op == RSLC_OP_VAR || n->op == RSLC_OP_INDEX || n->op == RSLC_OP_MEMBER)
+         && pr_block_root(p, node) >= 0)
+   {
+      p->msl_boolread = true;
+      pr_type(p, n->type);
+      pr_c(p, '(');
+      pr_expr(p, node, PR_PREC_SEQ);
+      pr_c(p, ')');
+      p->msl_boolread = false;
+      return;
+   }
+   if (p->hlsl && (n->op == RSLC_OP_VAR || n->op == RSLC_OP_INDEX || n->op == RSLC_OP_MEMBER))
+   {
+      int blk = pr_hlsl_buffer_root(p, node);
+      if (blk >= 0)
+      {
+         pr_hlsl_buffer_read(p, (unsigned)blk, node);
+         return;
+      }
+   }
+#endif
    switch (n->op)
    {
       case RSLC_OP_CONST:
@@ -2348,7 +3160,7 @@ static void pr_expr(struct rslc_pr *p, uint32_t node, int ctx)
                uint32_t a = rslc_list_item(p->c, n->b, i);
                if (i)
                   pr_s(p, ", ");
-               if (rslc_node_at(p->c, a)->type->kind == RSLC_TY_SAMPLER2D)
+               if (RSLC_TY_IS_SAMPLER(rslc_node_at(p->c, a)->type->kind))
                {
                   pr_hl_tex(p, a, false);
                   pr_s(p, ", ");
@@ -2546,6 +3358,14 @@ static void pr_expr(struct rslc_pr *p, uint32_t node, int ctx)
          break;
       }
       case RSLC_OP_ASSIGN:
+#ifdef RSLC_EXTENDED
+         if (p->hlsl && pr_hlsl_buffer_root(p, n->a) >= 0)
+         {
+            rslc_err(p->c, "hlsl: a store to a storage buffer; only its atomics write", NULL, n->line);
+            p->ok = false;
+            return;
+         }
+#endif
          if (PR_PREC_ASSIGN > ctx)
             pr_c(p, '(');
          pr_expr(p, n->a, PR_PREC_UNARY);
@@ -3179,6 +3999,7 @@ static void pr_stmt(struct rslc_pr *p, uint32_t node)
       case RSLC_OP_SWITCH:
       {
          uint32_t i, cnt = n->b ? rslc_list_len(p->c, n->b) : 0;
+         bool braced = false;   /* MSL: the open case section is in braces */
          pr_s(p, "switch (");
          pr_expr(p, n->a, PR_PREC_SEQ);
          pr_s(p, ") {");
@@ -3189,6 +4010,13 @@ static void pr_stmt(struct rslc_pr *p, uint32_t node)
             const struct rslc_node *s = rslc_node_at(p->c, sn);
             if (s->op == RSLC_OP_CASE)
             {
+               uint32_t k;
+               if (braced)
+               {
+                  pr_nl(p);
+                  pr_c(p, '}');
+                  braced = false;
+               }
                p->indent--;
                pr_nl(p);
                if (s->a)
@@ -3199,11 +4027,38 @@ static void pr_stmt(struct rslc_pr *p, uint32_t node)
                }
                else
                   pr_s(p, "default:");
+               /* Metal is C++: a jump to a later case may not cross
+                * a declaration, so a section that declares, with a
+                * case after it, is a block */
+               if (p->msl)
+               {
+                  bool decl = false;
+                  for (k = i + 1; k < cnt; k++)
+                  {
+                     const struct rslc_node *t = rslc_node_at(p->c, rslc_list_item(p->c, n->b, k));
+                     if (t->op == RSLC_OP_CASE)
+                     {
+                        if (decl)
+                        {
+                           pr_s(p, " {");
+                           braced = true;
+                        }
+                        break;
+                     }
+                     if (t->op == RSLC_OP_DECL)
+                        decl = true;
+                  }
+               }
                p->indent++;
                continue;
             }
             pr_nl(p);
             pr_stmt(p, sn);
+         }
+         if (braced)
+         {
+            pr_nl(p);
+            pr_c(p, '}');
          }
          p->indent--;
          pr_nl(p);
@@ -3320,7 +4175,7 @@ static void pr_func_head(struct rslc_pr *p, const struct rslc_func *f)
       if (p->msl)
       {
          /* out and inout by reference; a sampler as its pair */
-         if (v->type->kind == RSLC_TY_SAMPLER2D)
+         if (RSLC_TY_IS_SAMPLER(v->type->kind))
          {
             pr_type(p, v->type);
             pr_c(p, ' ');
@@ -3349,7 +4204,7 @@ static void pr_func_head(struct rslc_pr *p, const struct rslc_func *f)
       else
          pr_c(p, '_');
       pr_array_suffix(p, v->type);
-      if (p->hlsl && v->type->kind == RSLC_TY_SAMPLER2D)
+      if (p->hlsl && RSLC_TY_IS_SAMPLER(v->type->kind))
       {
          /* the texture's sampler state travels with it */
          pr_s(p, ", SamplerState _");
@@ -3405,6 +4260,11 @@ static void pr_hl_note(struct rslc_pr *p, const struct rslc_node *n)
          break;
       case RSLC_BFN_TEXTURESIZE:
          t = rslc_node_at(p->c, rslc_list_item(p->c, n->b, 0))->type;
+         if (t->kind != RSLC_TY_SAMPLER2D)
+         {
+            p->hl_uses |= RSLC_HL_SIZE_X;
+            break;
+         }
          p->hl_uses |= t->base == RSLC_BASE_INT ? RSLC_HL_SIZE_I
             : t->base == RSLC_BASE_UINT ? RSLC_HL_SIZE_U : RSLC_HL_SIZE_F;
          break;
@@ -3494,7 +4354,7 @@ static void pr_block_decl(struct rslc_pr *p, unsigned idx)
    const char *type_name = b->type->name ? b->type->name->str : (b->push ? "Push" : "UBO");
    const char *inst      = pr_block_instance(p, idx);
    uint32_t i;
-   if (p->names)
+   if (p->names && idx < 2)
    {
       const char *forced = b->push ? p->names->push_block : p->names->ubo_block;
       if (forced)
@@ -3532,9 +4392,25 @@ static void pr_block_decl(struct rslc_pr *p, unsigned idx)
    /* CafeGLSL takes the push block as a second uniform block, laid out
     * as the source declared it; the runtime reads offsets back from
     * the .gsh */
+#ifdef RSLC_EXTENDED
+   if (b->buffer)
+   {
+      pr_s(p, b->std140 ? "layout(std140) " : "layout(std430) ");
+      if (b->readonly)
+         pr_s(p, "readonly ");
+      if (b->coherent)
+         pr_s(p, "coherent ");
+      pr_s(p, "buffer ");
+   }
+   else
+   {
+#endif
    if (!b->push || b->std140)
       pr_s(p, "layout(std140) ");
    pr_s(p, "uniform ");
+#ifdef RSLC_EXTENDED
+   }
+#endif
    pr_s(p, type_name);
    pr_s(p, " {");
    p->indent++;
@@ -3569,10 +4445,64 @@ static bool pr_type_is_integer(const struct rslc_type *t)
       && (t->base == RSLC_BASE_INT || t->base == RSLC_BASE_UINT);
 }
 
+#ifdef RSLC_EXTENDED
+/* An in / out block, matched across stages by its block name. */
+static void pr_ioblock_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
+{
+   const struct rslc_type *bt = v->type;
+   uint32_t k;
+   while (bt->kind == RSLC_TY_ARRAY)
+      bt = bt->elem;
+   if (v->location != RSLC_UNSET && !p->es)
+   {
+      pr_s(p, "layout(location = ");
+      pr_u(p, v->location);
+      pr_s(p, ") ");
+   }
+   pr_s(p, is_in ? "in " : "out ");
+   pr_ident(p, bt->name);
+   pr_s(p, " {");
+   pr_nl(p);
+   for (k = 0; k < bt->nfields; k++)
+   {
+      const struct rslc_field *f = &bt->fields[k];
+      pr_s(p, "   ");
+      if (f->interp == RSLC_INTERP_FLAT || pr_type_is_integer(f->type))
+         pr_s(p, "flat ");
+      else if (f->interp == RSLC_INTERP_NOPERSPECTIVE && !p->es)
+         pr_s(p, "noperspective ");
+      if (f->quals & RSLC_VQ_CENTROID)
+         pr_s(p, "centroid ");
+      if (f->quals & RSLC_VQ_SAMPLE)
+         pr_s(p, "sample ");
+      pr_type(p, f->type);
+      pr_c(p, ' ');
+      pr_ident(p, f->name);
+      pr_array_suffix(p, f->type);
+      pr_c(p, ';');
+      pr_nl(p);
+   }
+   pr_s(p, "} ");
+   pr_var_name(p, v);
+   pr_array_suffix(p, v->type);
+   pr_c(p, ';');
+   pr_nl(p);
+}
+#endif
+
 static void pr_io_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
 {
    bool layout_ok = p->es ? p->version >= 300 : p->version >= 330;
    bool fragment  = p->c->stage == RSLC_STAGE_FRAGMENT;
+#ifdef RSLC_EXTENDED
+   if (v->quals & RSLC_VQ_PERVERTEX)
+      return;   /* gl_in is the stage's own */
+   if (v->quals & RSLC_VQ_IOBLOCK)
+   {
+      pr_ioblock_decl(p, v, is_in);
+      return;
+   }
+#endif
    /* fragment outputs keep their location; attributes and varyings are
     * bound by name by the driver.  CafeGLSL takes a location on every
     * in and out, as the Wii U lane has always handed it. */
@@ -3580,6 +4510,11 @@ static void pr_io_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
    {
       pr_s(p, "layout(location = ");
       pr_u(p, v->location);
+      if (v->index)
+      {
+         pr_s(p, ", index = ");
+         pr_u(p, v->index);
+      }
       pr_s(p, ") ");
    }
    if (!(fragment && !is_in))
@@ -3613,6 +4548,28 @@ static bool pr_global_init_in_place(struct rslc_pr *p, const struct rslc_var *v)
 /* Globals, then prototypes and bodies for the functions main reaches:
  * a global's constant initialiser prints in place, any other runs at
  * the top of main. */
+#ifdef RSLC_EXTENDED
+/* A storage image's layout format by its RSLC_IMGFMT_* (SPIR-V) value. */
+static const char *pr_image_format(unsigned fmt)
+{
+   switch (fmt)
+   {
+      case RSLC_IMGFMT_RGBA32F:  return "rgba32f";
+      case RSLC_IMGFMT_RGBA16F:  return "rgba16f";
+      case RSLC_IMGFMT_R32F:     return "r32f";
+      case RSLC_IMGFMT_RGBA8:    return "rgba8";
+      case RSLC_IMGFMT_RGBA32I:  return "rgba32i";
+      case RSLC_IMGFMT_RGBA16I:  return "rgba16i";
+      case RSLC_IMGFMT_RGBA8I:   return "rgba8i";
+      case RSLC_IMGFMT_R32I:     return "r32i";
+      case RSLC_IMGFMT_RGBA32UI: return "rgba32ui";
+      case RSLC_IMGFMT_RGBA16UI: return "rgba16ui";
+      case RSLC_IMGFMT_RGBA8UI:  return "rgba8ui";
+      default:                   return "r32ui";
+   }
+}
+#endif
+
 static void pr_globals_and_funcs(struct rslc_pr *p)
 {
    struct rslc_ctx        *c  = p->c;
@@ -3735,7 +4692,7 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
 
    /* a flattened block reads its integer members through bitcasts */
    if (p->names && p->names->flatten)
-      for (i = 0; i < 2; i++)
+      for (i = 0; i < RSLC_MAX_BLOCKS; i++)
       {
          uint32_t k;
          if (!pr->has_block[i])
@@ -3801,14 +4758,14 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
       const struct rslc_type *t = pr->structs[i];
       bool is_block = false;
       unsigned k;
-      for (k = 0; k < 2; k++)
+      for (k = 0; k < RSLC_MAX_BLOCKS; k++)
          if (pr->has_block[k] && pr->blocks[k].type == t)
             is_block = true;
       if (!is_block && t->name)
          pr_struct(p, t, NULL);
    }
 
-   for (i = 0; i < 2; i++)
+   for (i = 0; i < RSLC_MAX_BLOCKS; i++)
       if (pr->has_block[i])
          pr_block_decl(p, i);
 
@@ -3818,9 +4775,76 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
       pr_type(p, pr->samplers[i]->type);
       pr_c(p, ' ');
       pr_var_name(p, pr->samplers[i]);
+      pr_array_suffix(p, pr->samplers[i]->type);
       pr_c(p, ';');
       pr_nl(p);
    }
+   if (pr->early_fragment_tests)
+   {
+      pr_s(p, "layout(early_fragment_tests) in;");
+      pr_nl(p);
+   }
+#ifdef RSLC_EXTENDED
+   if (p->c->stage == RSLC_STAGE_GEOMETRY)
+   {
+      static const char *const prims[] = { "", "points", "lines", "lines_adjacency",
+            "triangles", "triangles_adjacency", "line_strip", "triangle_strip" };
+      pr_s(p, "layout(");
+      pr_s(p, prims[pr->gs_in]);
+      if (pr->gs_invocations)
+      {
+         pr_s(p, ", invocations = ");
+         pr_u(p, pr->gs_invocations);
+      }
+      pr_s(p, ") in;");
+      pr_nl(p);
+      pr_s(p, "layout(");
+      pr_s(p, prims[pr->gs_out]);
+      pr_s(p, ", max_vertices = ");
+      pr_u(p, pr->gs_max_vertices);
+      pr_s(p, ") out;");
+      pr_nl(p);
+   }
+   if (p->c->stage == RSLC_STAGE_COMPUTE)
+   {
+      static const char *const axes[3] = { "local_size_x = ", ", local_size_y = ",
+            ", local_size_z = " };
+      unsigned k;
+      pr_s(p, "layout(");
+      for (k = 0; k < 3; k++)
+      {
+         pr_s(p, axes[k]);
+         pr_u(p, pr->cs_local[k] ? pr->cs_local[k] : 1);
+      }
+      pr_s(p, ") in;");
+      pr_nl(p);
+   }
+   /* storage images, with their format, and workgroup memory */
+   for (i = 1; i < pr->nvars; i++)
+   {
+      const struct rslc_var *v = pr->vars[i];
+      if (v->storage == RSLC_ST_IMAGE)
+      {
+         pr_s(p, "layout(");
+         pr_s(p, pr_image_format(v->type->cols));
+         pr_s(p, ") uniform ");
+         if (v->quals & RSLC_VQ_READONLY)
+            pr_s(p, "readonly ");
+         if (v->quals & RSLC_VQ_WRITEONLY)
+            pr_s(p, "writeonly ");
+      }
+      else if (v->storage == RSLC_ST_SHARED)
+         pr_s(p, "shared ");
+      else
+         continue;
+      pr_type(p, v->type);
+      pr_c(p, ' ');
+      pr_var_name(p, v);
+      pr_array_suffix(p, v->type);
+      pr_c(p, ';');
+      pr_nl(p);
+   }
+#endif
    for (i = 0; i < pr->ninputs; i++)
       pr_io_decl(p, pr->inputs[i], true);
    for (i = 0; i < pr->noutputs; i++)
@@ -3928,6 +4952,27 @@ static void pr_hlsl_helpers(struct rslc_pr *p)
       pr_s(p, "> t, uint lod) { uint2 d; uint l; t.GetDimensions(lod, d.x, d.y, l); return d; }");
       pr_nl(p);
    }
+#ifdef RSLC_EXTENDED
+   if (p->hl_uses & RSLC_HL_SIZE_X)
+   {
+      /* every RSLC_EXTENDED kind and base: overloads nothing calls cost nothing */
+      for (k = 0; k < 3; k++)
+      {
+         pr_s(p, "int3 rslc_size_x(Texture2DArray<");
+         pr_s(p, tex[k]);
+         pr_s(p, "> t, uint lod) { uint3 d; uint l; t.GetDimensions(lod, d.x, d.y, d.z, l); return int3(d); }");
+         pr_nl(p);
+         pr_s(p, "int3 rslc_size_x(Texture2DMSArray<");
+         pr_s(p, tex[k]);
+         pr_s(p, "> t) { uint3 d; uint s; t.GetDimensions(d.x, d.y, d.z, s); return int3(d); }");
+         pr_nl(p);
+         pr_s(p, "int rslc_size_x(Buffer<");
+         pr_s(p, tex[k]);
+         pr_s(p, "> t) { uint d; t.GetDimensions(d); return int(d); }");
+         pr_nl(p);
+      }
+   }
+#endif
    if (p->hl_uses & RSLC_HL_LEVELS)
    {
       pr_s(p, "int rslc_levels(Texture2D<float4> t) { uint2 d; uint l; t.GetDimensions(0u, d.x, d.y, l); return int(l); }");
@@ -4015,6 +5060,14 @@ static void pr_hlsl_semantic(struct rslc_pr *p, const struct rslc_var *v, bool i
          case RSLC_BI_VERTEXINDEX:   pr_s(p, "SV_VertexID"); return;
          case RSLC_BI_INSTANCEINDEX: pr_s(p, "SV_InstanceID"); return;
          case RSLC_BI_FRONTFACING:   pr_s(p, "SV_IsFrontFace"); return;
+         case RSLC_BI_SAMPLEID:      pr_s(p, "SV_SampleIndex"); return;
+#ifdef RSLC_EXTENDED
+         case RSLC_BI_LAYER:         pr_s(p, "SV_RenderTargetArrayIndex"); return;
+         case RSLC_BI_GLOBALINVOCATIONID:   pr_s(p, "SV_DispatchThreadID"); return;
+         case RSLC_BI_LOCALINVOCATIONID:    pr_s(p, "SV_GroupThreadID"); return;
+         case RSLC_BI_WORKGROUPID:          pr_s(p, "SV_GroupID"); return;
+         case RSLC_BI_LOCALINVOCATIONINDEX: pr_s(p, "SV_GroupIndex"); return;
+#endif
          default: return;
       }
    }
@@ -4022,14 +5075,68 @@ static void pr_hlsl_semantic(struct rslc_pr *p, const struct rslc_var *v, bool i
       pr_s(p, "SV_Target");
    else
       pr_s(p, "TEXCOORD");
-   pr_u(p, v->location == RSLC_UNSET ? 0 : v->location);
+   /* the second blend source of a dual-source pair is the next target */
+   pr_u(p, (v->location == RSLC_UNSET ? 0 : v->location) + v->index);
 }
+
+#ifdef RSLC_EXTENDED
+static bool pr_hlsl_is_distance(const struct rslc_var *v);
+static void pr_hlsl_ioblock_field_name(struct rslc_pr *p, const struct rslc_type *bt, uint32_t k);
+#endif
 
 /* One field of the stage's input or output struct. */
 static void pr_hlsl_io_field(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
 {
    bool fragment = p->c->stage == RSLC_STAGE_FRAGMENT;
    bool builtin  = v->storage == RSLC_ST_BUILTIN;
+#ifdef RSLC_EXTENDED
+   /* a vertex attribute is not interpolated: it takes no modifier */
+   if (p->c->stage == RSLC_STAGE_VERTEX && is_in)
+      builtin = true;
+   /* an in / out block: a field per member, one location each from the
+    * block's, as SPIRV-Cross lays them out */
+   if (v->quals & RSLC_VQ_IOBLOCK)
+   {
+      const struct rslc_type *bt = v->type;
+      uint32_t loc = v->location == RSLC_UNSET ? 0 : v->location;
+      uint32_t k;
+      for (k = 0; k < bt->nfields; k++)
+      {
+         const struct rslc_field *f = &bt->fields[k];
+         pr_nl(p);
+         if (!(fragment && !is_in))
+         {
+            if (f->interp == RSLC_INTERP_FLAT || pr_type_is_integer(f->type))
+               pr_s(p, "nointerpolation ");
+            else if (f->interp == RSLC_INTERP_NOPERSPECTIVE)
+               pr_s(p, "noperspective ");
+            if (f->quals & RSLC_VQ_CENTROID)
+               pr_s(p, "centroid ");
+            if (f->quals & RSLC_VQ_SAMPLE)
+               pr_s(p, "sample ");
+         }
+         pr_type(p, f->type);
+         pr_c(p, ' ');
+         pr_hlsl_ioblock_field_name(p, bt, k);
+         pr_s(p, " : TEXCOORD");
+         pr_u(p, loc + k);
+         pr_c(p, ';');
+      }
+      return;
+   }
+   if (pr_hlsl_is_distance(v))
+   {
+      unsigned n = v->type->array_len;
+      pr_nl(p);
+      pr_s(p, "float");
+      if (n > 1)
+         pr_u(p, n);
+      pr_c(p, ' ');
+      pr_var_name(p, v);
+      pr_s(p, v->builtin == RSLC_BI_CLIPDISTANCE ? "0 : SV_ClipDistance0;" : "0 : SV_CullDistance0;");
+      return;
+   }
+#endif
    pr_nl(p);
    if (!builtin && !(fragment && !is_in))
    {
@@ -4042,7 +5149,7 @@ static void pr_hlsl_io_field(struct rslc_pr *p, const struct rslc_var *v, bool i
       if (v->quals & RSLC_VQ_SAMPLE)
          pr_s(p, "sample ");
    }
-   if (builtin && (v->builtin == RSLC_BI_VERTEXINDEX || v->builtin == RSLC_BI_INSTANCEINDEX))
+   if (builtin && RSLC_BI_IS_UINT_IN(v->builtin))
       pr_s(p, "uint");
    else
       pr_type(p, v->type);
@@ -4065,15 +5172,95 @@ static bool pr_hlsl_builtin_in(const struct rslc_var *v, bool *in_struct)
       case RSLC_BI_VERTEXINDEX:
       case RSLC_BI_INSTANCEINDEX:
       case RSLC_BI_FRONTFACING:
+      case RSLC_BI_SAMPLEID:
+#ifdef RSLC_EXTENDED
+      case RSLC_BI_LAYER:
+      case RSLC_BI_GLOBALINVOCATIONID:
+      case RSLC_BI_LOCALINVOCATIONID:
+      case RSLC_BI_WORKGROUPID:
+      case RSLC_BI_LOCALINVOCATIONINDEX:
+#endif
          return true;
       case RSLC_BI_POSITION:
       case RSLC_BI_FRAGDEPTH:
+#ifdef RSLC_EXTENDED
+      case RSLC_BI_CLIPDISTANCE:
+      case RSLC_BI_CULLDISTANCE:
+#endif
          return false;
       default:
          *in_struct = false;
          return false;
    }
 }
+
+#ifdef RSLC_EXTENDED
+/* gl_ClipDistance / gl_CullDistance travel as one floatN with an
+ * SV_ClipDistance0 / SV_CullDistance0 semantic. */
+static bool pr_hlsl_is_distance(const struct rslc_var *v)
+{
+   return v->storage == RSLC_ST_BUILTIN
+      && (v->builtin == RSLC_BI_CLIPDISTANCE || v->builtin == RSLC_BI_CULLDISTANCE);
+}
+
+/* The field an in / out block member travels in: Block_member. */
+static void pr_hlsl_ioblock_field_name(struct rslc_pr *p, const struct rslc_type *bt, uint32_t k)
+{
+   pr_ident(p, bt->name);
+   pr_c(p, '_');
+   pr_ident(p, bt->fields[k].name);
+}
+
+/* Copies an in / out block between its static and the stage struct,
+ * member by member. */
+static void pr_hlsl_ioblock_copy(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
+{
+   const struct rslc_type *bt = v->type;
+   uint32_t k;
+   for (k = 0; k < bt->nfields; k++)
+   {
+      pr_nl(p);
+      if (is_in)
+      {
+         pr_var_name(p, v);
+         pr_c(p, '.');
+         pr_ident(p, bt->fields[k].name);
+         pr_s(p, " = stage_input.");
+         pr_hlsl_ioblock_field_name(p, bt, k);
+      }
+      else
+      {
+         pr_s(p, "stage_output.");
+         pr_hlsl_ioblock_field_name(p, bt, k);
+         pr_s(p, " = ");
+         pr_var_name(p, v);
+         pr_c(p, '.');
+         pr_ident(p, bt->fields[k].name);
+      }
+      pr_c(p, ';');
+   }
+}
+#endif
+
+#ifdef RSLC_EXTENDED
+/* Whether a struct packs the same in a cbuffer as under std140: it
+ * does when every member is a four-wide vector or an array or struct
+ * of them, which neither rule can pack tighter. */
+static bool pr_hlsl_struct_packs_alike(const struct rslc_type *t)
+{
+   uint32_t i;
+   while (t->kind == RSLC_TY_ARRAY)
+      t = t->elem;
+   if (t->kind == RSLC_TY_VEC)
+      return t->rows == 4 && t->base != RSLC_BASE_BOOL;
+   if (t->kind != RSLC_TY_STRUCT || !t->nfields)
+      return false;
+   for (i = 0; i < t->nfields; i++)
+      if (!pr_hlsl_struct_packs_alike(t->fields[i].type))
+         return false;
+   return true;
+}
+#endif
 
 static void pr_hlsl_cbuffer(struct rslc_pr *p, unsigned idx)
 {
@@ -4084,6 +5271,16 @@ static void pr_hlsl_cbuffer(struct rslc_pr *p, unsigned idx)
    pr_s(p, b->type->name ? b->type->name->str : (b->push ? "Push" : "UBO"));
    /* the uniform block is slot 0 and the push block slot 1, as the
     * D3D filter chains bind them */
+#ifdef RSLC_EXTENDED
+   /* an emulator's blocks sit at the bindings it gave them */
+   if (!b->push && (idx >= 2 || b->binding != RSLC_UNSET))
+   {
+      pr_s(p, " : register(b");
+      pr_u(p, b->binding == RSLC_UNSET ? 0 : b->binding);
+      pr_c(p, ')');
+   }
+   else
+#endif
    pr_s(p, b->push ? " : register(b1)" : " : register(b0)");
    pr_nl(p);
    pr_c(p, '{');
@@ -4107,7 +5304,11 @@ static void pr_hlsl_cbuffer(struct rslc_pr *p, unsigned idx)
             return;
          }
       }
-      if (t->kind == RSLC_TY_STRUCT || (t->kind == RSLC_TY_ARRAY && t->elem->kind == RSLC_TY_STRUCT))
+      if ((t->kind == RSLC_TY_STRUCT || (t->kind == RSLC_TY_ARRAY && t->elem->kind == RSLC_TY_STRUCT))
+#ifdef RSLC_EXTENDED
+            && !(std140 && pr_hlsl_struct_packs_alike(t))
+#endif
+         )
       {
          rslc_err(p->c, "hlsl: struct block member", f->name->str, f->line);
          p->ok = false;
@@ -4198,7 +5399,7 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
       const struct rslc_type *t = pr->structs[i];
       bool is_block = false;
       unsigned k;
-      for (k = 0; k < 2; k++)
+      for (k = 0; k < RSLC_MAX_BLOCKS; k++)
          if (pr->has_block[k] && pr->blocks[k].type == t)
             is_block = true;
       if (!is_block && t->name)
@@ -4226,9 +5427,18 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
          pr_hlsl_lift(p, pr->funcs[i]->body);
 
    pr_hlsl_helpers(p);
-   for (i = 0; i < 2; i++)
+   for (i = 0; i < RSLC_MAX_BLOCKS; i++)
       if (pr->has_block[i])
+      {
+#ifdef RSLC_EXTENDED
+         if (pr->blocks[i].buffer)
+         {
+            pr_hlsl_buffer_decl(p, i);
+            continue;
+         }
+#endif
          pr_hlsl_cbuffer(p, i);
+      }
 
    for (i = 0; i < pr->nsamplers; i++)
    {
@@ -4236,18 +5446,72 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
       pr_type(p, v->type);
       pr_c(p, ' ');
       pr_var_name(p, v);
+      pr_array_suffix(p, v->type);
       pr_s(p, " : register(t");
       pr_u(p, v->binding == RSLC_UNSET ? 0 : v->binding);
       pr_s(p, ");");
       pr_nl(p);
+#ifdef RSLC_EXTENDED
+      /* a buffer and a multisampled image are only loaded from */
+      if (v->type->kind == RSLC_TY_SAMPLERBUFFER || v->type->kind == RSLC_TY_SAMPLER2DMSARRAY
+            || (v->type->kind == RSLC_TY_ARRAY && (v->type->elem->kind == RSLC_TY_SAMPLERBUFFER
+                  || v->type->elem->kind == RSLC_TY_SAMPLER2DMSARRAY)))
+         continue;
+#endif
       pr_s(p, "SamplerState _");
       pr_var_name(p, v);
-      pr_s(p, "_sampler : register(s");
+      pr_s(p, "_sampler");
+      pr_array_suffix(p, v->type);
+      pr_s(p, " : register(s");
       pr_u(p, v->binding == RSLC_UNSET ? 0 : v->binding);
       pr_s(p, ");");
       pr_nl(p);
    }
 
+#ifdef RSLC_EXTENDED
+   /* an in / out block's struct, for the static that holds it */
+   for (i = 1; i < pr->nvars; i++)
+   {
+      const struct rslc_var *v = pr->vars[i];
+      uint32_t k;
+      bool seen = false;
+      if (!v->global || !(v->quals & RSLC_VQ_IOBLOCK))
+         continue;
+      for (k = 1; k < i; k++)
+         if ((pr->vars[k]->quals & RSLC_VQ_IOBLOCK) && pr->vars[k]->global
+               && pr->vars[k]->type->name == v->type->name)
+            seen = true;
+      if (!seen)
+         pr_struct(p, v->type, NULL);
+   }
+#endif
+#ifdef RSLC_EXTENDED
+   /* storage images at u<binding>, workgroup memory as groupshared */
+   for (i = 1; i < pr->nvars; i++)
+   {
+      const struct rslc_var *v = pr->vars[i];
+      if (v->storage == RSLC_ST_IMAGE)
+      {
+         pr_type(p, v->type);
+         pr_c(p, ' ');
+         pr_var_name(p, v);
+         pr_s(p, " : register(u");
+         pr_u(p, v->binding == RSLC_UNSET ? 0 : v->binding);
+         pr_s(p, ");");
+         pr_nl(p);
+      }
+      else if (v->storage == RSLC_ST_SHARED)
+      {
+         pr_s(p, "groupshared ");
+         pr_type(p, v->type);
+         pr_c(p, ' ');
+         pr_var_name(p, v);
+         pr_array_suffix(p, v->type);
+         pr_c(p, ';');
+         pr_nl(p);
+      }
+   }
+#endif
    /* the interface as statics the body reads and writes; the wrapper
     * main copies them from and to the stage structs */
    for (i = 1; i < pr->nvars; i++)
@@ -4321,6 +5585,26 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
    pr_globals_and_funcs(p);
 
    /* the entry point around rslc_main */
+   if (p->c->prog.early_fragment_tests)
+   {
+      pr_s(p, "[earlydepthstencil]");
+      pr_nl(p);
+   }
+#ifdef RSLC_EXTENDED
+   if (p->c->stage == RSLC_STAGE_COMPUTE)
+   {
+      unsigned k;
+      pr_s(p, "[numthreads(");
+      for (k = 0; k < 3; k++)
+      {
+         if (k)
+            pr_s(p, ", ");
+         pr_u(p, pr->cs_local[k] ? pr->cs_local[k] : 1);
+      }
+      pr_s(p, ")]");
+      pr_nl(p);
+   }
+#endif
    pr_s(p, nout ? "rslc_out main(" : "void main(");
    if (nin)
       pr_s(p, "rslc_in stage_input");
@@ -4339,6 +5623,13 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
       bool in_struct;
       if (!v->global || (v->storage == RSLC_ST_BUILTIN && !p->used[i]))
          continue;
+#ifdef RSLC_EXTENDED
+      if (v->storage == RSLC_ST_IN && (v->quals & RSLC_VQ_IOBLOCK))
+      {
+         pr_hlsl_ioblock_copy(p, v, true);
+         continue;
+      }
+#endif
       if (v->storage == RSLC_ST_IN
             || (v->storage == RSLC_ST_BUILTIN && pr_hlsl_builtin_in(v, &in_struct)))
       {
@@ -4346,13 +5637,13 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
          pr_var_name(p, v);
          pr_s(p, " = ");
          if (v->storage == RSLC_ST_BUILTIN
-               && (v->builtin == RSLC_BI_VERTEXINDEX || v->builtin == RSLC_BI_INSTANCEINDEX))
+               && RSLC_BI_IS_UINT_IN(v->builtin))
             pr_s(p, "int(stage_input.");
          else
             pr_s(p, "stage_input.");
          pr_var_name(p, v);
          if (v->storage == RSLC_ST_BUILTIN
-               && (v->builtin == RSLC_BI_VERTEXINDEX || v->builtin == RSLC_BI_INSTANCEINDEX))
+               && RSLC_BI_IS_UINT_IN(v->builtin))
             pr_c(p, ')');
          pr_c(p, ';');
          if (v->storage == RSLC_ST_BUILTIN && v->builtin == RSLC_BI_FRAGCOORD)
@@ -4371,6 +5662,35 @@ static bool pr_hlsl(struct rslc_pr *p, struct rslc_result *result)
       bool in_struct;
       if (!v->global || (v->storage == RSLC_ST_BUILTIN && !p->used[i]))
          continue;
+#ifdef RSLC_EXTENDED
+      if (v->storage == RSLC_ST_OUT && (v->quals & RSLC_VQ_IOBLOCK))
+      {
+         pr_hlsl_ioblock_copy(p, v, false);
+         continue;
+      }
+      if (pr_hlsl_is_distance(v))
+      {
+         unsigned n = v->type->array_len, k;
+         for (k = 0; k < n; k++)
+         {
+            pr_nl(p);
+            pr_s(p, "stage_output.");
+            pr_var_name(p, v);
+            pr_c(p, '0');
+            if (n > 1)
+            {
+               pr_c(p, '.');
+               pr_c(p, "xyzw"[k]);
+            }
+            pr_s(p, " = ");
+            pr_var_name(p, v);
+            pr_c(p, '[');
+            pr_u(p, k);
+            pr_s(p, "];");
+         }
+         continue;
+      }
+#endif
       if (v->storage == RSLC_ST_OUT
             || (v->storage == RSLC_ST_BUILTIN && !pr_hlsl_builtin_in(v, &in_struct) && in_struct))
       {
@@ -4477,8 +5797,11 @@ static bool pr_msl_member(struct rslc_pr *p, const struct rslc_type *t, bool pac
    switch (t->kind)
    {
       case RSLC_TY_SCALAR:
+#ifndef RSLC_EXTENDED
          if (t->base == RSLC_BASE_BOOL)
             return false;   /* 1 byte here, 4 in the block */
+#endif
+         /* RSLC_EXTENDED: a bool is held as a uint, as the block lays it */
          *align = *size = 4;
          return true;
       case RSLC_TY_VEC:
@@ -4504,10 +5827,49 @@ static bool pr_msl_member(struct rslc_pr *p, const struct rslc_type *t, bool pac
             return false;
          if (std140 && ea < 16)
             return false;   /* std140 pads elements to 16, MSL does not */
+#ifdef RSLC_EXTENDED
+         {
+            /* the element stride must be the block's */
+            uint32_t a, sz, st;
+            rslc_layout_of_type(t, std140, &a, &sz, &st);
+            if ((es + ea - 1) / ea * ea != st)
+               return false;
+         }
+         /* a storage buffer's unsized last member: one element here */
+         *align = ea;
+         *size  = es * (t->array_len ? t->array_len : 1);
+         return true;
+#else
          *align = ea;
          *size  = es * t->array_len;
          return true;
+#endif
       }
+#ifdef RSLC_EXTENDED
+      case RSLC_TY_STRUCT:
+      {
+         /* a struct whose members sit where the block's layout puts them */
+         uint32_t i, cur = 0, maxa = 4, a, sz, st;
+         for (i = 0; i < t->nfields; i++)
+         {
+            uint32_t fa, fs, at;
+            /* a struct prints its bools as bool, one byte */
+            if (t->fields[i].type->base == RSLC_BASE_BOOL
+                  || !pr_msl_member(p, t->fields[i].type, false, std140, &fa, &fs))
+               return false;
+            at = (cur + fa - 1) / fa * fa;
+            if (at != rslc_layout_field_offset(t, i, std140))
+               return false;
+            cur = at + fs;
+            if (fa > maxa)
+               maxa = fa;
+         }
+         rslc_layout_of_type(t, std140, &a, &sz, &st);
+         *align = maxa;
+         *size  = (cur + maxa - 1) / maxa * maxa;
+         return *size == sz;
+      }
+#endif
       default:
          return false;
    }
@@ -4517,7 +5879,11 @@ static bool pr_msl_member(struct rslc_pr *p, const struct rslc_type *t, bool pac
 static void pr_msl_block(struct rslc_pr *p, unsigned idx)
 {
    const struct rslc_blockdecl *b = &p->c->prog.blocks[idx];
+#ifdef RSLC_EXTENDED
+   bool std140 = b->push || b->buffer ? b->std140 : true;
+#else
    bool std140 = b->push ? b->std140 : true;
+#endif
    uint32_t i, cur = 0, npad = 0;
    pr_s(p, "struct ");
    pr_s(p, b->type->name ? b->type->name->str : (b->push ? "Push" : "UBO"));
@@ -4557,6 +5923,25 @@ static void pr_msl_block(struct rslc_pr *p, unsigned idx)
       pr_nl(p);
       if (packed)
          pr_s(p, "packed_float3");
+#ifdef RSLC_EXTENDED
+      else if (f->type->base == RSLC_BASE_BOOL
+            && (f->type->kind == RSLC_TY_SCALAR || f->type->kind == RSLC_TY_VEC))
+      {
+         pr_s(p, "uint");
+         if (f->type->kind == RSLC_TY_VEC)
+            pr_u(p, f->type->rows);
+      }
+      else if (f->type->kind == RSLC_TY_ARRAY && !f->type->array_len)
+      {
+         /* an unsized last member, as SPIRV-Cross declares it */
+         pr_type(p, f->type->elem);
+         pr_c(p, ' ');
+         pr_ident(p, f->name);
+         pr_s(p, "[1];");
+         cur = off + size;
+         continue;
+      }
+#endif
       else
          pr_type(p, f->type);
       pr_c(p, ' ');
@@ -4708,6 +6093,16 @@ static void pr_msl_io_leaf(struct rslc_pr *p, const struct rslc_var *v,
       pr_s(p, "color(");
       pr_u(p, loc);
       pr_c(p, ')');
+#ifdef RSLC_EXTENDED
+      if (v->index || p->msl_dual)   /* a dual-source pair names both */
+#else
+      if (v->index)
+#endif
+      {
+         pr_s(p, ", index(");
+         pr_u(p, v->index);
+         pr_c(p, ')');
+      }
    }
    else
    {
@@ -4728,6 +6123,13 @@ static void pr_msl_io_leaf(struct rslc_pr *p, const struct rslc_var *v,
    }
    pr_s(p, "]];");
 }
+
+#ifdef RSLC_EXTENDED
+#define PR_MSL_IS_DISTANCE(v) ((v)->storage == RSLC_ST_BUILTIN \
+      && ((v)->builtin == RSLC_BI_CLIPDISTANCE || (v)->builtin == RSLC_BI_CULLDISTANCE))
+#else
+#define PR_MSL_IS_DISTANCE(v) 0
+#endif
 
 static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
 {
@@ -4756,18 +6158,52 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
       const struct rslc_type *t = pr->structs[i];
       bool is_block = false;
       unsigned k;
-      for (k = 0; k < 2; k++)
+      for (k = 0; k < RSLC_MAX_BLOCKS; k++)
          if (pr->has_block[k] && pr->blocks[k].type == t)
             is_block = true;
       if (!is_block && t->name)
          pr_struct(p, t, NULL);
    }
-   for (i = 0; i < 2; i++)
+   for (i = 0; i < RSLC_MAX_BLOCKS; i++)
       if (pr->has_block[i])
          pr_msl_block(p, i);
+#ifdef RSLC_EXTENDED
+   /* two blocks the stage uses may not share a Metal buffer index */
+   {
+      uint32_t k, j;
+      for (k = 0; k < RSLC_MAX_BLOCKS; k++)
+         for (j = k + 1; j < RSLC_MAX_BLOCKS; j++)
+         {
+            const struct rslc_blockdecl *a = &pr->blocks[k], *b = &pr->blocks[j];
+            uint32_t ia, ib;
+            if (!pr->has_block[k] || !pr->has_block[j]
+                  || !menv[pr->nvars + k] || !menv[pr->nvars + j])
+               continue;
+            ia = a->binding != RSLC_UNSET ? a->binding : a->push ? 1 : 0;
+            ib = b->binding != RSLC_UNSET ? b->binding : b->push ? 1 : 0;
+            if (ia == ib)
+            {
+               rslc_err(p->c, "msl: two blocks at one buffer index",
+                     b->type->name ? b->type->name->str : NULL, b->line);
+               return false;
+            }
+         }
+   }
+#endif
 
+#ifdef RSLC_EXTENDED
+   /* only the inputs the stage reads, as SPIRV-Cross keeps them: Metal
+    * wants a vertex descriptor entry for every attribute declared */
+   for (i = 0; i < pr->ninputs; i++)
+      if (menv[pr->inputs[i]->id])
+         nin++;
+   for (i = 0; i < pr->noutputs; i++)
+      if (pr->outputs[i]->index)
+         p->msl_dual = true;
+#else
    for (i = 0; i < pr->ninputs; i++)
       nin++;
+#endif
    for (i = 0; i < pr->noutputs; i++)
       nout++;
    for (i = 1; i < pr->nvars; i++)
@@ -4776,7 +6212,7 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
       if (!v->global || v->storage != RSLC_ST_BUILTIN || !p->used[i])
          continue;
       if (v->builtin == RSLC_BI_POSITION || v->builtin == RSLC_BI_POINTSIZE
-            || v->builtin == RSLC_BI_FRAGDEPTH)
+            || v->builtin == RSLC_BI_FRAGDEPTH || PR_MSL_IS_DISTANCE(v))
          nout++;
    }
    if (nin)
@@ -4786,6 +6222,9 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
       pr_c(p, '{');
       p->indent++;
       for (i = 0; i < pr->ninputs; i++)
+#ifdef RSLC_EXTENDED
+         if (menv[pr->inputs[i]->id])
+#endif
          pr_msl_io_field(p, pr->inputs[i], true);
       p->indent--;
       pr_nl(p);
@@ -4807,6 +6246,32 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
                && (v->builtin == RSLC_BI_POSITION || v->builtin == RSLC_BI_POINTSIZE
                   || v->builtin == RSLC_BI_FRAGDEPTH))
             pr_msl_io_field(p, v, false);
+#ifdef RSLC_EXTENDED
+         /* the distances as Metal takes them, and each as a varying, as
+          * SPIRV-Cross writes them */
+         if (v->global && p->used[i] && PR_MSL_IS_DISTANCE(v))
+         {
+            unsigned k, n = v->type->array_len;
+            bool clip = v->builtin == RSLC_BI_CLIPDISTANCE;
+            pr_nl(p);
+            pr_s(p, "float ");
+            pr_var_name(p, v);
+            pr_s(p, clip ? " [[clip_distance]] [" : " [[cull_distance]] [");
+            pr_u(p, n);
+            pr_s(p, "];");
+            for (k = 0; k < n; k++)
+            {
+               pr_nl(p);
+               pr_s(p, "float ");
+               pr_var_name(p, v);
+               pr_c(p, '_');
+               pr_u(p, k);
+               pr_s(p, clip ? " [[user(clip" : " [[user(cull");
+               pr_u(p, k);
+               pr_s(p, ")]];");
+            }
+         }
+#endif
       }
       p->indent--;
       pr_nl(p);
@@ -4819,6 +6284,13 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
 
    /* the entry point: the stage structs, every block and sampler at
     * its binding, the builtins used */
+   if (fragment && p->c->prog.early_fragment_tests)
+      pr_s(p, "[[early_fragment_tests]] ");
+#ifdef RSLC_EXTENDED
+   if (c->stage == RSLC_STAGE_COMPUTE)
+      pr_s(p, "kernel ");
+   else
+#endif
    pr_s(p, fragment ? "fragment " : "vertex ");
    pr_s(p, nout ? "main0_out main0(" : "void main0(");
    first = true;
@@ -4827,15 +6299,31 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
       pr_s(p, "main0_in in [[stage_in]]");
       first = false;
    }
-   for (i = 0; i < 2; i++)
+   for (i = 0; i < RSLC_MAX_BLOCKS; i++)
    {
       const struct rslc_blockdecl *b;
       if (!pr->has_block[i])
          continue;
       b = &pr->blocks[i];
+#ifdef RSLC_EXTENDED
+      if (b->binding != RSLC_UNSET && !menv[pr->nvars + i])
+         continue;   /* unused: left out, as SPIRV-Cross leaves it */
+#endif
       if (!first)
          pr_s(p, ", ");
       first = false;
+#ifdef RSLC_EXTENDED
+      /* an emulator's blocks and buffers at the buffer index it gave them */
+      if (b->binding != RSLC_UNSET)
+      {
+         pr_msl_block_ref(p, i);
+         pr_s(p, pr_msl_instance(p, i));
+         pr_s(p, " [[buffer(");
+         pr_u(p, b->binding);
+         pr_s(p, ")]]");
+         continue;
+      }
+#endif
       pr_s(p, "constant ");
       pr_s(p, b->type->name ? b->type->name->str : (b->push ? "Push" : "UBO"));
       pr_s(p, "& ");
@@ -4848,6 +6336,10 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
    {
       const struct rslc_var *v = pr->samplers[i];
       uint32_t binding = v->binding == RSLC_UNSET ? 0 : v->binding;
+#ifdef RSLC_EXTENDED
+      if (v->binding != RSLC_UNSET && !menv[v->id])
+         continue;
+#endif
       if (!first)
          pr_s(p, ", ");
       first = false;
@@ -4856,12 +6348,63 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
       pr_var_name(p, v);
       pr_s(p, " [[texture(");
       pr_u(p, binding);
+#ifdef RSLC_EXTENDED
+      /* a buffer and a multisampled image are only read: no sampler */
+      if (v->type->kind == RSLC_TY_SAMPLERBUFFER || v->type->kind == RSLC_TY_SAMPLER2DMSARRAY)
+      {
+         pr_s(p, ")]]");
+         continue;
+      }
+      if (v->type->kind == RSLC_TY_ARRAY)
+      {
+         pr_s(p, ")]], array<sampler, ");
+         pr_u(p, v->type->array_len);
+         pr_s(p, "> ");
+         pr_var_name(p, v);
+         pr_s(p, "Smplr [[sampler(");
+         pr_u(p, binding);
+         pr_s(p, ")]]");
+         continue;
+      }
+#endif
       pr_s(p, ")]], sampler ");
       pr_var_name(p, v);
       pr_s(p, "Smplr [[sampler(");
       pr_u(p, binding);
       pr_s(p, ")]]");
    }
+#ifdef RSLC_EXTENDED
+   for (i = 1; i < pr->nvars; i++)
+   {
+      const struct rslc_var *v = pr->vars[i];
+      if (v->storage != RSLC_ST_IMAGE || !menv[i])
+         continue;
+      if (!first)
+         pr_s(p, ", ");
+      first = false;
+      pr_type(p, v->type);
+      pr_c(p, ' ');
+      pr_var_name(p, v);
+      pr_s(p, " [[texture(");
+      pr_u(p, pr_msl_index(v->binding));
+      pr_s(p, ")]]");
+   }
+   /* an input attachment is the colour attachment's value on entry */
+   for (i = 1; i < pr->nvars; i++)
+   {
+      const struct rslc_var *v = pr->vars[i];
+      if (v->storage != RSLC_ST_SUBPASS || !menv[i])
+         continue;
+      if (!first)
+         pr_s(p, ", ");
+      first = false;
+      pr_s(p, "float4 ");
+      pr_var_name(p, v);
+      pr_s(p, " [[color(");
+      pr_u(p, v->member);
+      pr_s(p, ")]]");
+   }
+#endif
    for (i = 1; i < pr->nvars; i++)
    {
       const struct rslc_var *v = pr->vars[i];
@@ -4874,6 +6417,20 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
          case RSLC_BI_FRONTFACING:   attr = "bool gl_FrontFacing [[front_facing]]"; break;
          case RSLC_BI_VERTEXINDEX:   attr = "uint gl_VertexIndex_in [[vertex_id]]"; break;
          case RSLC_BI_INSTANCEINDEX: attr = "uint gl_InstanceIndex_in [[instance_id]]"; break;
+         case RSLC_BI_SAMPLEID:      attr = "uint gl_SampleID_in [[sample_id]]"; break;
+#ifdef RSLC_EXTENDED
+         case RSLC_BI_LAYER:         attr = "uint gl_Layer_in [[render_target_array_index]]"; break;
+         case RSLC_BI_GLOBALINVOCATIONID:
+            attr = "uint3 gl_GlobalInvocationID [[thread_position_in_grid]]"; break;
+         case RSLC_BI_LOCALINVOCATIONID:
+            attr = "uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]]"; break;
+         case RSLC_BI_WORKGROUPID:
+            attr = "uint3 gl_WorkGroupID [[threadgroup_position_in_grid]]"; break;
+         case RSLC_BI_NUMWORKGROUPS:
+            attr = "uint3 gl_NumWorkGroups [[threadgroups_per_grid]]"; break;
+         case RSLC_BI_LOCALINVOCATIONINDEX:
+            attr = "uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]]"; break;
+#endif
          default: continue;
       }
       if (!first)
@@ -4921,7 +6478,7 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
             pr_s(p, " = {};");
             break;
          case RSLC_ST_BUILTIN:
-            if (v->builtin == RSLC_BI_VERTEXINDEX || v->builtin == RSLC_BI_INSTANCEINDEX)
+            if (RSLC_BI_IS_UINT_IN(v->builtin))
             {
                pr_nl(p);
                pr_s(p, "int ");
@@ -4931,7 +6488,7 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
                pr_s(p, "_in);");
             }
             else if (v->builtin == RSLC_BI_POSITION || v->builtin == RSLC_BI_POINTSIZE
-                  || v->builtin == RSLC_BI_FRAGDEPTH)
+                  || v->builtin == RSLC_BI_FRAGDEPTH || PR_MSL_IS_DISTANCE(v))
             {
                pr_nl(p);
                pr_type(p, v->type);
@@ -4940,6 +6497,15 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
                pr_s(p, " = {};");
             }
             break;
+#ifdef RSLC_EXTENDED
+         case RSLC_ST_SHARED:
+            /* workgroup memory lives in the kernel's scope */
+            pr_nl(p);
+            pr_s(p, "threadgroup ");
+            pr_msl_shared_decl(p, v, false);
+            pr_c(p, ';');
+            break;
+#endif
          case RSLC_ST_GLOBAL:
             pr_nl(p);
             pr_type(p, v->type);
@@ -4985,6 +6551,36 @@ static bool pr_msl(struct rslc_pr *p, struct rslc_result *result)
       const struct rslc_var *v = pr->vars[i];
       if (!menv[i] || v->storage != RSLC_ST_BUILTIN)
          continue;
+#ifdef RSLC_EXTENDED
+      if (PR_MSL_IS_DISTANCE(v))
+      {
+         unsigned k;
+         for (k = 0; k < v->type->array_len; k++)
+         {
+            pr_nl(p);
+            pr_s(p, "out.");
+            pr_var_name(p, v);
+            pr_c(p, '[');
+            pr_u(p, k);
+            pr_s(p, "] = ");
+            pr_var_name(p, v);
+            pr_c(p, '[');
+            pr_u(p, k);
+            pr_s(p, "];");
+            pr_nl(p);
+            pr_s(p, "out.");
+            pr_var_name(p, v);
+            pr_c(p, '_');
+            pr_u(p, k);
+            pr_s(p, " = ");
+            pr_var_name(p, v);
+            pr_c(p, '[');
+            pr_u(p, k);
+            pr_s(p, "];");
+         }
+         continue;
+      }
+#endif
       if (v->builtin != RSLC_BI_POSITION && v->builtin != RSLC_BI_POINTSIZE
             && v->builtin != RSLC_BI_FRAGDEPTH)
          continue;
@@ -5036,7 +6632,7 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
       if (pr->funcs[k]->name)
          p->symfn[pr->funcs[k]->name->index] = 1;
    rslc_reach_funcs(c, p->reach);
-   for (k = 0; k < 2; k++)
+   for (k = 0; k < RSLC_MAX_BLOCKS; k++)
       if (pr->has_block[k])
       {
          p->active[k] = (uint8_t*)rslc_arena_zalloc(c, pr->blocks[k].type->nfields
@@ -5081,6 +6677,98 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
       if (pr->vars[k]->global && pr->vars[k]->init)
          pr_mark_members(p, pr->vars[k]->init);
 
+#ifdef RSLC_EXTENDED
+   /* HLSL and MSL have no form of the clip and cull distances or of
+    * in / out blocks yet */
+   if ((p->hlsl || p->msl) && c->stage == RSLC_STAGE_GEOMETRY)
+   {
+      rslc_err(c, p->hlsl ? "hlsl: no geometry stage yet" : "msl: no geometry stage", NULL, 0);
+      return false;
+   }
+   /* subgroup operations have a form in SPIR-V and MSL alone; HLSL's
+    * shader models here have no helper invocation either */
+   if (!p->msl && pr->subgroup)
+   {
+      rslc_err(c, p->hlsl ? "hlsl: no form of subgroup operations"
+            : "glsl: no form of subgroup operations", NULL, 0);
+      return false;
+   }
+   if (p->hlsl)
+      for (k = 1; k < pr->nvars; k++)
+         if (pr->vars[k]->storage == RSLC_ST_BUILTIN && p->used[k]
+               && pr->vars[k]->builtin == RSLC_BI_HELPERINVOCATION)
+         {
+            rslc_err(c, "hlsl: no form of gl_HelperInvocation", NULL, 0);
+            return false;
+         }
+   /* an input attachment has a form in MSL alone */
+   if (!p->msl)
+      for (k = 1; k < pr->nvars; k++)
+         if (pr->vars[k]->storage == RSLC_ST_SUBPASS)
+         {
+            rslc_err(c, p->hlsl ? "hlsl: no form of subpassInput" : "glsl: no form of subpassInput",
+                  NULL, pr->vars[k]->line);
+            return false;
+         }
+   if (p->hlsl && c->stage == RSLC_STAGE_COMPUTE)
+   {
+      uint32_t k;
+      if (p->version < 50)
+      {
+         rslc_err(c, "hlsl: a compute stage needs shader model 5", NULL, 0);
+         return false;
+      }
+      for (k = 1; k < pr->nvars; k++)
+      {
+         const struct rslc_var *v = pr->vars[k];
+         if (v->storage == RSLC_ST_BUILTIN && v->builtin == RSLC_BI_NUMWORKGROUPS && p->used[k])
+         {
+            rslc_err(c, "hlsl: no form of gl_NumWorkGroups", NULL, 0);
+            return false;
+         }
+         if (v->storage == RSLC_ST_IMAGE && v->type->cols != RSLC_IMGFMT_RGBA32F
+               && v->type->cols != RSLC_IMGFMT_RGBA16F && v->type->cols != RSLC_IMGFMT_RGBA8
+               && v->type->cols != RSLC_IMGFMT_RGBA32I && v->type->cols != RSLC_IMGFMT_RGBA16I
+               && v->type->cols != RSLC_IMGFMT_RGBA8I && v->type->cols != RSLC_IMGFMT_RGBA32UI
+               && v->type->cols != RSLC_IMGFMT_RGBA16UI && v->type->cols != RSLC_IMGFMT_RGBA8UI)
+         {
+            rslc_err(c, "hlsl: only four-component storage images", NULL, v->line);
+            return false;
+         }
+      }
+   }
+   /* HLSL carries each in one SV_ClipDistance0 / SV_CullDistance0 */
+   if (p->hlsl && (c->prog.clip_n > 4 || c->prog.cull_n > 4))
+   {
+      rslc_err(c, "hlsl: more than four clip or cull distances", NULL, 0);
+      return false;
+   }
+   if (p->hlsl || p->msl)
+   {
+      bool     ioblock = false, wide = false;
+      uint32_t k, f;
+      for (k = 0; k < c->prog.ninputs + c->prog.noutputs; k++)
+      {
+         const struct rslc_var *v = k < c->prog.ninputs ? c->prog.inputs[k]
+            : c->prog.outputs[k - c->prog.ninputs];
+         if (!(v->quals & RSLC_VQ_IOBLOCK))
+            continue;
+         ioblock = true;
+         /* HLSL gives each member one location: a member that takes
+          * more has no form there yet */
+         for (f = 0; f < v->type->nfields; f++)
+            if (v->type->fields[f].type->kind != RSLC_TY_SCALAR
+                  && v->type->fields[f].type->kind != RSLC_TY_VEC)
+               wide = true;
+      }
+      if (ioblock && (p->msl || wide))
+      {
+         rslc_err(c, p->hlsl ? "hlsl: an in / out block member wider than one location"
+               : "msl: no form of an in / out block", NULL, 0);
+         return false;
+      }
+   }
+#endif
    if (!rslc_blob_begin(c, &p->out, 4096, p->active, p->used))
       return false;
    if (!(p->hlsl ? pr_hlsl(p, result) : p->msl ? pr_msl(p, result) : pr_glsl(p, result)))

@@ -194,6 +194,9 @@ struct rsmb_ctx
    uint8_t  connected;
    char     server[256];
    char     error[128];
+   /* a send or receive that fails is RSMB_PHASE_CONNECT, whatever
+    * step the connect was on */
+   enum rsmb_phase phase;
    /* Kerberos: set, the session is authenticated with a ticket for
     * cifs/@server from @krb_kdc, falling back to NTLMSSP when the
     * KDC cannot be reached or refuses */
@@ -253,6 +256,14 @@ static size_t rsmb_utf16(const char *s, uint8_t *out, size_t cap, int path)
 }
 
 /* UTF-16LE to UTF-8 into a NUL-terminated buffer. */
+/* @off + @len lies within @total, checked so neither sum can wrap a
+ * 32-bit size_t. */
+static int rsmb_span_ok(size_t off, size_t len, size_t total)
+{
+   return off <= total && len <= total - off;
+}
+
+/* UTF-16LE to UTF-8; a surrogate without its pair becomes U+FFFD. */
 static void rsmb_utf8(const uint8_t *in, size_t in_len, char *out, size_t cap)
 {
    size_t i = 0, o = 0;
@@ -260,11 +271,16 @@ static void rsmb_utf8(const uint8_t *in, size_t in_len, char *out, size_t cap)
    {
       uint32_t cp = smb_get16(in + i);
       i += 2;
-      if (cp >= 0xd800 && cp < 0xdc00 && i + 1 < in_len)
+      if (cp >= 0xd800 && cp < 0xe000)
       {
-         uint32_t lo = smb_get16(in + i);
-         i += 2;
-         cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+         uint32_t lo = (cp < 0xdc00 && i + 1 < in_len) ? smb_get16(in + i) : 0;
+         if (lo >= 0xdc00 && lo < 0xe000)
+         {
+            i += 2;
+            cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+         }
+         else
+            cp = 0xfffd;
       }
       if (cp < 0x80)
          out[o++] = (char)cp;
@@ -316,6 +332,7 @@ static int rsmb_send_raw(struct rsmb_ctx *c, const uint8_t *msg, size_t len)
    if (!socket_send_all_blocking_with_timeout(c->fd, nb, 4 + len, (int)c->timeout * 1000, true))
    {
       rsmb_err(c, "send failed or timed out");
+      c->phase = RSMB_PHASE_CONNECT;
       return -1;
    }
    return 0;
@@ -329,17 +346,20 @@ static int rsmb_recv_raw(struct rsmb_ctx *c, size_t *len)
    if (socket_receive_all_blocking_with_timeout(c->fd, nb, 4, (int)c->timeout * 1000) <= 0)
    {
       rsmb_err(c, "receive failed or timed out");
+      c->phase = RSMB_PHASE_CONNECT;
       return -1;
    }
    n = ((size_t)nb[1] << 16) | ((size_t)nb[2] << 8) | nb[3];
    if (nb[0] != 0 || n < SMB2_HDR_SIZE || n > c->buf_size)
    {
       rsmb_err(c, "bad frame");
+      c->phase = RSMB_PHASE_CONNECT;
       return -1;
    }
    if (socket_receive_all_blocking_with_timeout(c->fd, c->rx, n, (int)c->timeout * 1000) <= 0)
    {
       rsmb_err(c, "receive failed or timed out");
+      c->phase = RSMB_PHASE_CONNECT;
       return -1;
    }
    *len = n;
@@ -1363,7 +1383,7 @@ static int rsmb_session_setup_ntlm(struct rsmb_ctx *c)
       tinfo_len = smb_get16(chal + 40);
       {
          size_t toff = smb_get32(chal + 44);
-         if (toff + tinfo_len > chal_len)
+         if (!rsmb_span_ok(toff, tinfo_len, chal_len))
          {
             rsmb_err(c, "bad challenge");
             return -1;
@@ -1647,6 +1667,7 @@ int rsmb_connect(struct rsmb_ctx *c, const char *server, const char *share)
 
    rsmb_disconnect(c);
    strlcpy(c->server, server, sizeof(c->server));
+   c->phase = RSMB_PHASE_RESOLVE;
    fd = socket_init((void**)&addr, c->port ? c->port : SMB2_PORT, server, SOCKET_TYPE_STREAM, AF_UNSPEC);
    if (fd < 0 || !addr)
    {
@@ -1655,6 +1676,7 @@ int rsmb_connect(struct rsmb_ctx *c, const char *server, const char *share)
          freeaddrinfo_retro(addr);
       return -1;
    }
+   c->phase = RSMB_PHASE_CONNECT;
    if (!socket_connect_with_timeout(fd, addr, (int)c->timeout * 1000))
    {
       freeaddrinfo_retro(addr);
@@ -1678,15 +1700,22 @@ int rsmb_connect(struct rsmb_ctx *c, const char *server, const char *share)
    c->encrypt       = 0;
    c->nonce_counter = 0;
 
-   if (rsmb_negotiate(c) != 0 || rsmb_session_setup(c) != 0
-         || rsmb_tree_connect(c, share) != 0)
-   {
-      socket_close(c->fd);
-      c->fd = -1;
-      return -1;
-   }
+   if (rsmb_negotiate(c) != 0)
+      goto fail;
+   c->phase = RSMB_PHASE_SESSION;
+   if (rsmb_session_setup(c) != 0)
+      goto fail;
+   c->phase = RSMB_PHASE_TREE;
+   if (rsmb_tree_connect(c, share) != 0)
+      goto fail;
+   c->phase     = RSMB_PHASE_NONE;
    c->connected = 1;
    return 0;
+
+fail:
+   socket_close(c->fd);
+   c->fd = -1;
+   return -1;
 }
 
 void rsmb_disconnect(struct rsmb_ctx *c)
@@ -1738,6 +1767,7 @@ void rsmb_free(struct rsmb_ctx *c)
 
 const char *rsmb_get_error(const struct rsmb_ctx *c) { return c->error; }
 uint32_t    rsmb_get_status(const struct rsmb_ctx *c) { return c->status; }
+enum rsmb_phase rsmb_get_phase(const struct rsmb_ctx *c) { return c->phase; }
 unsigned    rsmb_get_sign_alg(const struct rsmb_ctx *c)
 {
    if (c->dialect < DIALECT_300)
@@ -2133,6 +2163,8 @@ void rsmb_set_readahead(struct rsmb_ctx *c, uint32_t bytes)
    c->readahead     = bytes;
    c->readahead_set = 1;
 }
+
+uint32_t rsmb_get_readahead(const struct rsmb_ctx *c) { return c->readahead; }
 uint32_t rsmb_max_write(const struct rsmb_ctx *c) { return c->max_write; }
 
 int rsmb_stat(struct rsmb_ctx *c, const char *path, struct rsmb_stat *st)
@@ -2273,6 +2305,7 @@ const struct rsmb_dirent *rsmb_readdir(struct rsmb_ctx *c, struct rsmb_dir *d)
    for (;;)
    {
       const uint8_t *e;
+      size_t remaining, entry_len;
       uint32_t next, name_len;
 
       if (d->buf_off >= d->buf_len)
@@ -2283,11 +2316,15 @@ const struct rsmb_dirent *rsmb_readdir(struct rsmb_ctx *c, struct rsmb_dir *d)
             return NULL;
       }
       e = d->buf + d->buf_off;
-      if (d->buf_len - d->buf_off < 64)
+      remaining = d->buf_len - d->buf_off;
+      if (remaining < 64)
          return NULL;
       next     = smb_get32(e);
       name_len = smb_get32(e + 60);
-      if (64 + name_len > d->buf_len - d->buf_off)
+      if ((size_t)name_len > remaining - 64)
+         return NULL;
+      entry_len = 64 + (size_t)name_len;
+      if (next && ((size_t)next < entry_len || (size_t)next > remaining))
          return NULL;
       d->ent.st.size   = smb_get64(e + 40);
       d->ent.st.mtime  = rsmb_filetime(smb_get64(e + 24));

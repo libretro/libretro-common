@@ -110,6 +110,13 @@ typedef struct file_archive_transfer
     * that parks a member and lets the scan continue is counted when it
     * is found; one that parks and stops is counted when it drains. */
    bool     pending_counted;
+   /* Set before INIT: 7z and rar then leave a directory entry's name,
+    * ending in '/', in current_file_path, as zip does.  7z passes it
+    * to file_cb too; rar calls no file_cb for a directory. */
+   bool     name_dirs;
+   /* The zip's end record carries a TorrentZip comment.  Set by the zip
+    * reader when it opens the archive, false for any other. */
+   bool     torrentzip;
 } file_archive_transfer_t;
 
 typedef struct
@@ -324,6 +331,24 @@ uint32_t file_archive_get_file_crc32(const char *path);
  * file found inside is used.
  **/
 uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size);
+
+/**
+ * file_archive_get_file_crc32_size_and_ext:
+ * @path                         : filename path of archive
+ * @size                         : size of the file inside the archive
+ * @ext                          : that file's extension, or "" when
+ *                                 not found; may be NULL
+ * @len                          : size of @ext in bytes
+ * @entries                      : the archive's entry count as its
+ *                                 header gives it, or 0 when not
+ *                                 found; may be NULL
+ *
+ * Returns: CRC32 of the specified file in the archive, otherwise 0.
+ * If no path within the archive is specified, the first
+ * file found inside is used.
+ **/
+uint32_t file_archive_get_file_crc32_size_and_ext(const char *path,
+      uint64_t *size, char *ext, size_t len, unsigned *entries);
 
 extern const struct file_archive_file_backend zlib_backend;
 extern const struct file_archive_file_backend sevenzip_backend;

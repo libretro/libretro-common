@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 #include <net/net_nfs3.h>
 #include <net/net_compat.h>
@@ -114,6 +115,7 @@
 #define NFS4ERR_BADSESSION     10052
 #define NFS4ERR_COMPLETE_ALREADY 10054
 #define NFS4ERR_DEADSESSION    10078
+#define NFS4ERR_BADXDR         10036
 #define NF4DIR            2
 /* attribute bits: type(1) size(4) in word 0, time_modify(53) in word 1 */
 #define FATTR4_W0_TYPE    (1u << 1)
@@ -257,6 +259,146 @@ static void rnfs_err(struct rnfs_ctx *c, const char *msg)
    strlcpy(c->error, msg, sizeof(c->error));
 }
 
+/* v3, MOUNT and v4 share these numbers. */
+static const char *rnfs_status_name(uint32_t st)
+{
+   switch (st)
+   {
+      case 1:     return "PERM";
+      case 2:     return "NOENT";
+      case 5:     return "IO";
+      case 13:    return "ACCESS";
+      case 20:    return "NOTDIR";
+      case 22:    return "INVAL";
+      case 63:    return "NAMETOOLONG";
+      case 70:    return "STALE";
+      case 10001: return "BADHANDLE";
+      case 10004: return "NOTSUPP";
+      case 10006: return "SERVERFAULT";
+      case 10016: return "WRONGSEC";
+      case 10018: return "RESOURCE";
+      case 10020: return "NOFILEHANDLE";
+      case 10021: return "MINOR_VERS_MISMATCH";
+      case 10036: return "BADXDR";
+      case 10044: return "OP_ILLEGAL";
+      default:    break;
+   }
+   return NULL;
+}
+
+/* Component @n of @path, cut to fit @out. */
+static void rnfs_component(const char *path, int n, char *out, size_t len)
+{
+   size_t l;
+   for (;;)
+   {
+      const char *e;
+      while (*path == '/')
+         path++;
+      e = strchr(path, '/');
+      l = e ? (size_t)(e - path) : strlen(path);
+      if (n-- <= 0 || !*path)
+         break;
+      path += l;
+   }
+   if (l >= len)
+      l = len - 1;
+   memcpy(out, path, l);
+   out[l] = '\0';
+}
+
+/* @step answered @st (on component @comp of @path, given one). A Linux
+ * server refuses a client on a port above 1023, as this one always is,
+ * unless the export says 'insecure'; its mountd also answers ACCES for
+ * a path it does not export. */
+static void rnfs_err_status(struct rnfs_ctx *c, const char *step,
+      const char *path, int comp, uint32_t st)
+{
+   char        name[25];
+   char        num[24];
+   int         mnt  = c->version != 4 && !strcmp(step, "MOUNT");
+   const char *pfx  = c->version == 4 ? "NFS4ERR_" : mnt ? "MNT3ERR_" : "NFS3ERR_";
+   const char *sn   = (st == 13 && c->version != 4) ? "ACCES" : rnfs_status_name(st);
+   const char *hint = "";
+
+   if (!sn)
+   {
+      snprintf(num, sizeof(num), "status %u", (unsigned)st);
+      sn  = num;
+      pfx = "";
+   }
+   if (mnt && st == 13)
+      hint = "; not exported to us, or a Linux export needs 'insecure' (client port >1023)";
+   else if (st == 1 || (c->version == 4 && (st == 13 || st == 10016)))
+      hint = "; a Linux export needs 'insecure' (client port >1023)";
+   name[0] = '\0';
+   if (path)
+      rnfs_component(path, comp, name, sizeof(name));
+   if (c->version == 4)
+      snprintf(c->error, sizeof(c->error), "v4.%u %s%s%s: %s%s%s",
+            (unsigned)c->minor, step, *name ? " " : "", name, pfx, sn, hint);
+   else
+      snprintf(c->error, sizeof(c->error), "v3 %s%s%s: %s%s%s",
+            step, *name ? " " : "", name, pfx, sn, hint);
+}
+
+/* The OS error the socket call that just failed left, where the
+ * platform keeps one; else 0. */
+static int rnfs_socket_error(void)
+{
+#if defined(_WIN32)
+   return WSAGetLastError();
+#elif defined(__PS3__) || defined(VITA) || defined(WIIU) \
+      || (defined(GEKKO) && !defined(GEKKO_NATIVE)) || defined(_3DS)
+   return 0;
+#else
+   return errno;
+#endif
+}
+
+/* A connect to @port that failed with @err after @waited usec. */
+static void rnfs_err_connect(struct rnfs_ctx *c, uint16_t port, int err,
+      retro_time_t waited)
+{
+   const char *why = NULL;
+#if defined(_WIN32)
+   if (err == WSAECONNREFUSED)
+      why = "refused";
+   else if (err == WSAEHOSTUNREACH || err == WSAENETUNREACH)
+      why = "unreachable";
+#else
+#ifdef ECONNREFUSED
+   if (err == ECONNREFUSED)
+      why = "refused";
+#endif
+#if defined(EHOSTUNREACH) && defined(ENETUNREACH)
+   if (err == EHOSTUNREACH || err == ENETUNREACH)
+      why = "unreachable";
+#endif
+#endif
+   if (!why && waited >= (retro_time_t)c->timeout * 900000)
+      snprintf(c->error, sizeof(c->error), "connect to %.64s:%u timed out after %us",
+            c->server, (unsigned)port, c->timeout);
+   else if (!why)
+      snprintf(c->error, sizeof(c->error), "connect to %.64s:%u failed (error %d)",
+            c->server, (unsigned)port, err);
+   else
+      snprintf(c->error, sizeof(c->error), "connect to %.64s:%u %s",
+            c->server, (unsigned)port, why);
+}
+
+/* A reply that did not come: silence for the whole timeout, or the
+ * server hanging up. */
+static void rnfs_err_recv(struct rnfs_ctx *c, retro_time_t start)
+{
+   if (cpu_features_get_time_usec() - start >= (retro_time_t)c->timeout * 900000)
+      snprintf(c->error, sizeof(c->error), "no reply from %.64s in %us",
+            c->server, c->timeout);
+   else
+      snprintf(c->error, sizeof(c->error), "%.64s closed the connection",
+            c->server);
+}
+
 /* XDR writer / reader over a byte buffer. */
 struct xdr
 {
@@ -315,17 +457,49 @@ static uint64_t xdr_get_u64(struct xdr *x)
    return (hi << 32) | xdr_get_u32(x);
 }
 
-/* Returns a pointer into the buffer; *len the octet count. */
+/* Returns a pointer into the buffer; *len the octet count. The
+ * length and its pad are checked apart so a server-sent count near
+ * 2^32 cannot wrap the sum on 32-bit targets. */
 static const uint8_t *xdr_get_opaque(struct xdr *x, size_t *len)
 {
    const uint8_t *d;
    size_t n = xdr_get_u32(x);
    size_t pad = (4 - (n & 3)) & 3;
-   if (x->fail || (size_t)(x->end - x->p) < n + pad) { x->fail = 1; *len = 0; return NULL; }
+   size_t avail;
+   if (x->fail || (avail = (size_t)(x->end - x->p)) < n || avail - n < pad)
+   {
+      x->fail = 1;
+      *len    = 0;
+      return NULL;
+   }
    d = x->p;
    x->p += n + pad;
    *len = n;
    return d;
+}
+
+/* @n fixed octets (a stateid, a verifier, a session id): copied to
+ * @dst when the reply holds them, else the cursor fails and @dst is
+ * zeroed. Every raw read goes through here or xdr_skip, so the cursor
+ * never passes the end. */
+static void xdr_get_fixed(struct xdr *x, void *dst, size_t n)
+{
+   if (x->fail || (size_t)(x->end - x->p) < n)
+   {
+      x->fail = 1;
+      memset(dst, 0, n);
+      return;
+   }
+   memcpy(dst, x->p, n);
+   x->p += n;
+}
+
+static void xdr_skip(struct xdr *x, size_t n)
+{
+   if (x->fail || (size_t)(x->end - x->p) < n)
+      x->fail = 1;
+   else
+      x->p += n;
 }
 
 static int xdr_get_fh(struct xdr *x, struct rnfs_fh *fh)
@@ -377,19 +551,22 @@ static void xdr_get_wcc_data(struct xdr *x)
 static int rnfs_tcp_connect(struct rnfs_ctx *c, uint16_t port)
 {
    struct addrinfo *addr = NULL;
+   retro_time_t start;
    int fd = socket_init((void**)&addr, port, c->server, SOCKET_TYPE_STREAM, AF_UNSPEC);
    if (fd < 0 || !addr)
    {
       if (addr)
          freeaddrinfo_retro(addr);
-      rnfs_err(c, "cannot resolve server");
+      snprintf(c->error, sizeof(c->error), "cannot resolve %.64s", c->server);
       return -1;
    }
+   start = cpu_features_get_time_usec();
    if (!socket_connect_with_timeout(fd, addr, (int)c->timeout * 1000))
    {
+      int err = rnfs_socket_error();
+      rnfs_err_connect(c, port, err, cpu_features_get_time_usec() - start);
       freeaddrinfo_retro(addr);
       socket_close(fd);
-      rnfs_err(c, "connect failed");
       return -1;
    }
    freeaddrinfo_retro(addr);
@@ -451,12 +628,65 @@ static int rnfs_rpc_send(struct rnfs_ctx *c, int fd, uint32_t prog, uint32_t ver
    return 0;
 }
 
+/* A whole reply record at @reply: its xid in @xid_out, and the cursor
+ * placed after the accepted-reply header; -1, with the reason, for a
+ * reply that was denied or not accepted. */
+static int rnfs_rpc_reply(struct rnfs_ctx *c, uint32_t *xid_out,
+      struct xdr *reply)
+{
+   static const char *const rpc_auth[] = { "AUTH_OK", "AUTH_BADCRED",
+      "AUTH_REJECTEDCRED", "AUTH_BADVERF", "AUTH_REJECTEDVERF",
+      "AUTH_TOOWEAK" };
+   static const char *const rpc_accept[] = { "SUCCESS", "PROG_UNAVAIL",
+      "PROG_MISMATCH", "PROC_UNAVAIL", "GARBAGE_ARGS", "SYSTEM_ERR" };
+   uint32_t st;
+   *xid_out = xdr_get_u32(reply);
+   if (xdr_get_u32(reply) != 1)               /* REPLY */
+   {
+      rnfs_err(c, "rpc reply malformed");
+      return -1;
+   }
+   if (xdr_get_u32(reply) != 0)               /* MSG_DENIED */
+   {
+      if (xdr_get_u32(reply) != 1)            /* RPC_MISMATCH */
+         rnfs_err(c, "rpc denied: RPC_MISMATCH");
+      else if ((st = xdr_get_u32(reply)) < 6)
+         snprintf(c->error, sizeof(c->error), "rpc denied: %s", rpc_auth[st]);
+      else
+         snprintf(c->error, sizeof(c->error), "rpc denied: auth error %u",
+               (unsigned)st);
+      return -1;
+   }
+   xdr_get_u32(reply);                        /* verifier flavor */
+   {
+      size_t vl;
+      xdr_get_opaque(reply, &vl);
+   }
+   if ((st = xdr_get_u32(reply)) != 0 || reply->fail)
+   {
+      if (st == 2)
+      {
+         uint32_t lo = xdr_get_u32(reply);
+         uint32_t hi = xdr_get_u32(reply);
+         snprintf(c->error, sizeof(c->error),
+               "rpc PROG_MISMATCH: server offers v%u-%u", (unsigned)lo, (unsigned)hi);
+      }
+      else if (st > 0 && st < 6)
+         snprintf(c->error, sizeof(c->error), "rpc %s", rpc_accept[st]);
+      else
+         rnfs_err(c, "rpc call not accepted");
+      return -1;
+   }
+   return 0;
+}
+
 /* Receive one reply record into c->rx; its xid in @xid_out and the
  * reply cursor placed after the accepted-reply header. */
 static int rnfs_rpc_recv(struct rnfs_ctx *c, int fd, uint32_t *xid_out, struct xdr *reply)
 {
-   uint32_t rlen;
-   int      to = (int)c->timeout * 1000;
+   uint32_t     rlen;
+   int          to    = (int)c->timeout * 1000;
+   retro_time_t start = cpu_features_get_time_usec();
 
    /* reply: one or more fragments, concatenated */
    rlen = 0;
@@ -466,7 +696,7 @@ static int rnfs_rpc_recv(struct rnfs_ctx *c, int fd, uint32_t *xid_out, struct x
       uint32_t frag, last;
       if (!socket_receive_all_blocking_with_timeout(fd, hdr, 4, to))
       {
-         rnfs_err(c, "receive failed or timed out");
+         rnfs_err_recv(c, start);
          return -1;
       }
       last = hdr[0] & 0x80;
@@ -479,7 +709,7 @@ static int rnfs_rpc_recv(struct rnfs_ctx *c, int fd, uint32_t *xid_out, struct x
       }
       if (!socket_receive_all_blocking_with_timeout(fd, c->rx + rlen, frag, to))
       {
-         rnfs_err(c, "receive failed or timed out");
+         rnfs_err_recv(c, start);
          return -1;
       }
       rlen += frag;
@@ -489,23 +719,7 @@ static int rnfs_rpc_recv(struct rnfs_ctx *c, int fd, uint32_t *xid_out, struct x
    }
 
    reply->p = c->rx; reply->end = c->rx + rlen; reply->fail = 0;
-   *xid_out = xdr_get_u32(reply);
-   if (xdr_get_u32(reply) != 1 || xdr_get_u32(reply) != 0)
-   {
-      rnfs_err(c, "rpc reply rejected");
-      return -1;
-   }
-   xdr_get_u32(reply);                        /* verifier flavor */
-   {
-      size_t vl;
-      xdr_get_opaque(reply, &vl);
-   }
-   if (xdr_get_u32(reply) != 0 || reply->fail)
-   {
-      rnfs_err(c, "rpc call not accepted");
-      return -1;
-   }
-   return 0;
+   return rnfs_rpc_reply(c, xid_out, reply);
 }
 
 static void rnfs_drop(struct rnfs_ctx *c);
@@ -563,7 +777,6 @@ static int rnfs_call(struct rnfs_ctx *c, uint32_t proc,
          free(held);
          /* what the failed mount answered is not this call's status */
          c->status = RNFS_STATUS_NONE;
-         rnfs_err(c, "not connected");
          return -1;
       }
    }
@@ -588,11 +801,11 @@ static uint16_t rnfs_getport(struct rnfs_ctx *c, uint32_t prog, uint32_t vers)
       return 0;
    x.p = args; x.end = args + sizeof(args); x.fail = 0;
    xdr_u32(&x, prog); xdr_u32(&x, vers); xdr_u32(&x, 6); xdr_u32(&x, 0);
-   if (rnfs_rpc(c, fd, PMAP_PROG, PMAP_VERS, PMAP_GETPORT, args, 16, &reply) == 0)
-      port = (uint16_t)xdr_get_u32(&reply);
+   if (rnfs_rpc(c, fd, PMAP_PROG, PMAP_VERS, PMAP_GETPORT, args, 16, &reply) == 0
+         && !(port = (uint16_t)xdr_get_u32(&reply)))
+      rnfs_err(c, prog == MOUNT_PROG ? "portmapper: no MOUNT v3 service"
+            : "portmapper: no NFS v3 service");
    socket_close(fd);
-   if (!port)
-      rnfs_err(c, "portmapper has no such service");
    return port;
 }
 
@@ -675,7 +888,7 @@ static uint32_t nfs4_sequence_res(struct xdr *r, struct rnfs_ctx *c,
       c->slot_seq[slot]--;
       return st;
    }
-   r->p += 16;                          /* sessionid */
+   xdr_skip(r, 16);                     /* sessionid */
    xdr_get_u32(r); xdr_get_u32(r);      /* sequenceid, slotid */
    xdr_get_u32(r); xdr_get_u32(r);      /* highest, target highest */
    xdr_get_u32(r);                      /* status flags */
@@ -714,7 +927,6 @@ static int nfs4_compound(struct rnfs_ctx *c, const uint8_t *ops, size_t ops_len,
    if (c->fd < 0 && rnfs_redial(c) != 0)
    {
       c->status = RNFS_STATUS_NONE;
-      rnfs_err(c, "not connected");
       return -1;
    }
    for (;;)
@@ -730,7 +942,10 @@ static int nfs4_compound(struct rnfs_ctx *c, const uint8_t *ops, size_t ops_len,
       if (sequenced)
          nfs4_sequence(&x, c, 0);
       if (x.fail || (size_t)(x.end - x.p) < ops_len)
+      {
+         rnfs_err(c, "request too large");
          return -1;
+      }
       memcpy(x.p, ops, ops_len); x.p += ops_len;
 
       if (rnfs_rpc(c, c->fd, NFS_PROG, 4, NFS4_COMPOUND, args,
@@ -762,11 +977,14 @@ static int nfs4_compound(struct rnfs_ctx *c, const uint8_t *ops, size_t ops_len,
    return reply->fail ? -1 : 0;
 }
 
-/* Next result: its status, positioned at the body. */
+/* Next result: its status, positioned at the body. A reply that
+ * ended before it is a decode error, never NFS4_OK. */
 static uint32_t nfs4_res(struct xdr *r)
 {
+   uint32_t st;
    xdr_get_u32(r);                      /* opnum */
-   return xdr_get_u32(r);
+   st = xdr_get_u32(r);
+   return r->fail ? NFS4ERR_BADXDR : st;
 }
 
 static void nfs4_put_fh(struct xdr *x, const struct rnfs_fh *fh)
@@ -794,7 +1012,7 @@ static int nfs4_get_fattr(struct xdr *r, struct rnfs_stat *st)
    struct xdr a;
    if (n >= 1) w0 = xdr_get_u32(r);
    if (n >= 2) w1 = xdr_get_u32(r);
-   while (n > 2) { xdr_get_u32(r); n--; }
+   while (n > 2 && !r->fail) { xdr_get_u32(r); n--; }
    v = xdr_get_opaque(r, &vl);
    if (!v)
       return -1;
@@ -902,13 +1120,20 @@ static int nfs4_setclientid(struct rnfs_ctx *c)
    xdr_u32(&x, 1);                      /* callback_ident */
    if (x.fail || nfs4_compound(c, ops, (size_t)(x.p - ops), 1, &r) != 0)
       return -1;
-   if (c->status != NFS3_OK || nfs4_res(&r) != NFS3_OK)
+   st = nfs4_res(&r);
+   if (c->status != NFS3_OK || st != NFS3_OK)
    {
-      rnfs_err(c, "setclientid refused");
+      rnfs_err_status(c, "SETCLIENTID", NULL, 0,
+            c->status != NFS3_OK ? c->status : st);
       return -1;
    }
    clientid = xdr_get_u64(&r);
-   memcpy(verf, r.p, 8);
+   xdr_get_fixed(&r, verf, 8);
+   if (r.fail)
+   {
+      rnfs_err(c, "setclientid reply truncated");
+      return -1;
+   }
    x.p = ops; x.fail = 0;
    xdr_u32(&x, OP_SETCLIENTID_CONFIRM);
    xdr_u64(&x, clientid);
@@ -918,7 +1143,8 @@ static int nfs4_setclientid(struct rnfs_ctx *c)
    st = nfs4_res(&r);
    if (c->status != NFS3_OK || st != NFS3_OK)
    {
-      rnfs_err(c, "setclientid confirm refused");
+      rnfs_err_status(c, "SETCLIENTID_CONFIRM", NULL, 0,
+            c->status != NFS3_OK ? c->status : st);
       return -1;
    }
    c->clientid = clientid;
@@ -965,9 +1191,11 @@ static int nfs4_session_setup(struct rnfs_ctx *c)
       return -1;
    if (c->status == NFS4ERR_MINOR_VERS_MISMATCH)
       return 1;
-   if (c->status != NFS3_OK || nfs4_res(&r) != NFS3_OK)
+   st = nfs4_res(&r);
+   if (c->status != NFS3_OK || st != NFS3_OK)
    {
-      rnfs_err(c, "exchange_id refused");
+      rnfs_err_status(c, "EXCHANGE_ID", NULL, 0,
+            c->status != NFS3_OK ? c->status : st);
       return -1;
    }
    c->clientid = xdr_get_u64(&r);
@@ -999,12 +1227,14 @@ static int nfs4_session_setup(struct rnfs_ctx *c)
    xdr_u32(&x, 0);                      /* AUTH_NONE */
    if (x.fail || nfs4_compound(c, ops, (size_t)(x.p - ops), 1, &r) != 0)
       return -1;
-   if (c->status != NFS3_OK || nfs4_res(&r) != NFS3_OK)
+   st = nfs4_res(&r);
+   if (c->status != NFS3_OK || st != NFS3_OK)
    {
-      rnfs_err(c, "create_session refused");
+      rnfs_err_status(c, "CREATE_SESSION", NULL, 0,
+            c->status != NFS3_OK ? c->status : st);
       return -1;
    }
-   memcpy(c->sessionid, r.p, 16); r.p += 16;
+   xdr_get_fixed(&r, c->sessionid, 16);
    xdr_get_u32(&r);                     /* sequence */
    xdr_get_u32(&r);                     /* flags */
    xdr_get_u32(&r);                     /* fore: header padding */
@@ -1013,7 +1243,7 @@ static int nfs4_session_setup(struct rnfs_ctx *c)
    n = xdr_get_u32(&r);                 /* max requests: the slots granted */
    if (r.fail || !n)
    {
-      rnfs_err(c, "create_session reply");
+      rnfs_err(c, "v4 CREATE_SESSION: bad reply");
       return -1;
    }
    c->slots     = (uint32_t)(n < RNFS_SLOTS ? n : RNFS_SLOTS);
@@ -1034,7 +1264,7 @@ static int nfs4_session_setup(struct rnfs_ctx *c)
    st = nfs4_res(&r);
    if (st != NFS3_OK && st != NFS4ERR_COMPLETE_ALREADY)
    {
-      rnfs_err(c, "reclaim_complete refused");
+      rnfs_err_status(c, "RECLAIM_COMPLETE", NULL, 0, st);
       return -1;
    }
    return 0;
@@ -1060,21 +1290,26 @@ static int nfs4_establish(struct rnfs_ctx *c)
 
 /* The export root: PUTROOTFH then LOOKUP down the pseudo path. */
 /* PUTROOTFH, a LOOKUP per component of @path, GETFH: the handle of
- * @path in the server's pseudo-filesystem into c->root.
+ * @path in the server's pseudo-filesystem into c->root. With @note,
+ * a refusal says which operation the server refused, and how.
  *
  * Returns: 0; -1 when the path is not there; -2 when the call itself
  * failed, which no other path would change. */
-static int nfs4_mount_path(struct rnfs_ctx *c, const char *path)
+static int nfs4_mount_path(struct rnfs_ctx *c, const char *path, int note)
 {
    size_t   cap = NFS3_FHSIZE + 64 + strlen(path) * 2 + 32;
    uint8_t *ops = (uint8_t*)malloc(cap);
    struct xdr x, r;
    const char *p = path;
    unsigned n = 1, i;
+   uint32_t st = NFS3_OK;
    int ret = -1;
 
    if (!ops)
-      return -1;
+   {
+      rnfs_err(c, "out of memory");
+      return -2;
+   }
    x.p = ops; x.end = ops + cap; x.fail = 0;
    xdr_u32(&x, OP_PUTROOTFH);
    for (;;)
@@ -1098,12 +1333,23 @@ static int nfs4_mount_path(struct rnfs_ctx *c, const char *path)
       ret = -2;
       goto done;
    }
-   for (i = 0; i < n - 1; i++)
-      if (nfs4_res(&r) != NFS3_OK)
-         goto done;
-   if (nfs4_res(&r) != NFS3_OK || xdr_get_fh(&r, &c->root) != 0)
-      goto done;
-   ret = 0;
+   for (i = 0; i < n; i++)
+      if ((st = nfs4_res(&r)) != NFS3_OK)
+         break;
+   if (st == NFS3_OK && xdr_get_fh(&r, &c->root) == 0)
+      ret = 0;
+   else if (note && st == NFS3_OK)
+      rnfs_err(c, "v4 mount: bad GETFH reply");
+   else if (note)
+   {
+      const char *step = "mount: LOOKUP";
+      if (i == 0)
+         step = "mount: PUTROOTFH";
+      else if (i == n - 1)
+         step = "mount: GETFH";
+      rnfs_err_status(c, step, (i == 0 || i == n - 1) ? NULL : path,
+            (int)i - 1, st);
+   }
 done:
    free(ops);
    return ret;
@@ -1127,7 +1373,7 @@ static int nfs4_mount(struct rnfs_ctx *c)
       char        first[256];
       const char *e;
       size_t      len;
-      int         ret = nfs4_mount_path(c, p);
+      int         ret = nfs4_mount_path(c, p, 1);
       if (ret == 0)
          return 0;
       if (ret == -2)
@@ -1147,13 +1393,13 @@ static int nfs4_mount(struct rnfs_ctx *c)
       }
       memcpy(first, p, len);
       first[len] = '\0';
-      if ((ret = nfs4_mount_path(c, first)) == 0)
+      if ((ret = nfs4_mount_path(c, first, 0)) == 0)
          break;                        /* it is there: the rest is wrong */
       if (ret == -2)
          return -1;
       p = e;
    }
-   rnfs_err(c, "export not found");
+   /* the last whole path tried has said why */
    return -1;
 }
 
@@ -1173,10 +1419,14 @@ static int nfs4_walk_once(struct rnfs_ctx *c, const char *path, struct rnfs_fh *
    struct xdr x, r;
    const char *p = path;
    unsigned n = 1, i;
+   uint32_t rs;
    int ret = -1;
 
    if (!ops)
+   {
+      rnfs_err(c, "out of memory");
       return -1;
+   }
    if (last)
       last[0] = '\0';
    x.p = ops; x.end = ops + cap; x.fail = 0;
@@ -1192,7 +1442,10 @@ static int nfs4_walk_once(struct rnfs_ctx *c, const char *path, struct rnfs_fh *
       e   = strchr(p, '/');
       len = e ? (size_t)(e - p) : strlen(p);
       if (len >= 256)
+      {
+         rnfs_err(c, "name too long");
          goto done;
+      }
       if (parent)
       {
          q = e;
@@ -1217,25 +1470,34 @@ static int nfs4_walk_once(struct rnfs_ctx *c, const char *path, struct rnfs_fh *
    if (x.fail || nfs4_compound(c, ops, (size_t)(x.p - ops), n, &r) != 0)
       goto done;
    for (i = 0; i < n - 2; i++)
-      if (nfs4_res(&r) != NFS3_OK)
+      if ((rs = nfs4_res(&r)) != NFS3_OK)
       {
-         rnfs_err(c, "not found");
+         rnfs_err_status(c, i == 0 ? "PUTFH" : "LOOKUP",
+               i == 0 ? NULL : path, (int)i - 1, rs);
          goto done;
       }
-   if (nfs4_res(&r) != NFS3_OK || xdr_get_fh(&r, fh) != 0)
+   if ((rs = nfs4_res(&r)) != NFS3_OK)
    {
-      rnfs_err(c, "not found");
+      rnfs_err_status(c, "GETFH", NULL, 0, rs);
       goto done;
    }
-   if (nfs4_res(&r) != NFS3_OK)
+   if (xdr_get_fh(&r, fh) != 0)
    {
-      rnfs_err(c, "getattr failed");
+      rnfs_err(c, "v4 GETFH: bad reply");
+      goto done;
+   }
+   if ((rs = nfs4_res(&r)) != NFS3_OK)
+   {
+      rnfs_err_status(c, "GETATTR", NULL, 0, rs);
       goto done;
    }
    {
       struct rnfs_stat tmp;
       if (nfs4_get_fattr(&r, &tmp) != 0)
+      {
+         rnfs_err(c, "v4 GETATTR: bad reply");
          goto done;
+      }
       if (st)
          *st = tmp;
    }
@@ -1243,6 +1505,36 @@ static int nfs4_walk_once(struct rnfs_ctx *c, const char *path, struct rnfs_fh *
 done:
    free(ops);
    return ret;
+}
+
+/* A stateid in a reply, written to @stateid only when whole. */
+static int nfs4_get_stateid(struct xdr *r, uint8_t *stateid)
+{
+   uint8_t sid[16];
+   xdr_get_fixed(r, sid, 16);
+   if (r->fail)
+      return -1;
+   memcpy(stateid, sid, 16);
+   return 0;
+}
+
+/* OPEN4resok up to its delegation: stateid, change_info (atomic +
+ * 2 x u64), rflags, attrset. No delegation is asked for, so a granted
+ * one is refused. @stateid is written only for a whole result. */
+static int nfs4_open_res(struct xdr *r, uint8_t *stateid, uint32_t *rflags)
+{
+   uint8_t  sid[16];
+   uint32_t nb;
+   xdr_get_fixed(r, sid, 16);
+   xdr_get_u32(r); xdr_get_u64(r); xdr_get_u64(r);
+   *rflags = xdr_get_u32(r);
+   nb      = xdr_get_u32(r);            /* attrset */
+   while (nb-- && !r->fail)
+      xdr_get_u32(r);
+   if (xdr_get_u32(r) != 0 || r->fail)  /* delegation type */
+      return -1;
+   memcpy(stateid, sid, 16);
+   return 0;
 }
 
 /* OPEN with create in @dir, then OPEN_CONFIRM when asked; the result
@@ -1254,7 +1546,6 @@ static int nfs4_open_create(struct rnfs_ctx *c, const struct rnfs_fh *dir,
    struct xdr x, r;
    uint32_t rflags;
    size_t sl;
-   const uint8_t *sid;
 
    x.p = ops; x.end = ops + sizeof(ops); x.fail = 0;
    nfs4_put_fh(&x, dir);
@@ -1290,20 +1581,8 @@ static int nfs4_open_create(struct rnfs_ctx *c, const struct rnfs_fh *dir,
       return -1;
    }
    c->open_seq++;
-   /* stateid, change_info(atomic + 2 x u64), rflags, attrset, delegation */
-   sid = r.p; r.p += 16;
-   xdr_get_u32(&r); xdr_get_u64(&r); xdr_get_u64(&r);
-   rflags = xdr_get_u32(&r);
-   {
-      uint32_t nb = xdr_get_u32(&r);
-      while (nb--) xdr_get_u32(&r);
-   }
-   {
-      uint32_t dt = xdr_get_u32(&r);   /* delegation: none expected */
-      if (dt != 0)
-         return -1;
-   }
-   memcpy(f->stateid, sid, 16);
+   if (nfs4_open_res(&r, f->stateid, &rflags) != 0)
+      return -1;
    if (nfs4_res(&r) != NFS3_OK || xdr_get_fh(&r, &f->fh) != 0)
       return -1;
    if (nfs4_res(&r) == NFS3_OK)
@@ -1329,7 +1608,8 @@ static int nfs4_open_create(struct rnfs_ctx *c, const struct rnfs_fh *dir,
          return -1;
       }
       c->open_seq++;
-      memcpy(f->stateid, r.p, 16);
+      if (nfs4_get_stateid(&r, f->stateid) != 0)
+         return -1;
    }
    (void)sl;
    return 0;
@@ -1372,15 +1652,7 @@ static int nfs4_open_reclaim(struct rnfs_ctx *c, struct rnfs_file *f)
    if (nfs4_res(&r) != NFS3_OK || (st = nfs4_res(&r)) != NFS3_OK)
       return -1;
    c->open_seq++;
-   memcpy(f->stateid, r.p, 16); r.p += 16;
-   xdr_get_u32(&r); xdr_get_u64(&r); xdr_get_u64(&r);   /* change_info */
-   rflags = xdr_get_u32(&r);
-   {
-      uint32_t nb = xdr_get_u32(&r);    /* attrset */
-      while (nb-- && !r.fail)
-         xdr_get_u32(&r);
-   }
-   if (r.fail || xdr_get_u32(&r) != 0)  /* no delegation asked, none taken */
+   if (nfs4_open_res(&r, f->stateid, &rflags) != 0)
       return -1;
    f->opened = 1;
    nfs4_state_link(c, f);
@@ -1395,7 +1667,8 @@ static int nfs4_open_reclaim(struct rnfs_ctx *c, struct rnfs_file *f)
             || nfs4_res(&r) != NFS3_OK || nfs4_res(&r) != NFS3_OK)
          return -1;
       c->open_seq++;
-      memcpy(f->stateid, r.p, 16);
+      if (nfs4_get_stateid(&r, f->stateid) != 0)
+         return -1;
    }
    return 0;
 }
@@ -1638,12 +1911,31 @@ static int nfs4_rename(struct rnfs_ctx *c, const char *from, const char *to)
    return 0;
 }
 
+/* The rest of a READDIR reply at @r: its cookie verifier, then the
+ * entry list taken into d->buf as received. @d is left as it was for
+ * a reply cut short. */
+static int rnfs_readdir_take(struct rnfs_dir *d, struct xdr *r)
+{
+   uint8_t verf[8];
+   size_t  n;
+   xdr_get_fixed(r, verf, 8);
+   if (r->fail)
+      return -1;
+   memcpy(d->cookieverf, verf, 8);
+   n = (size_t)(r->end - r->p);
+   if (n > NFS3_MAX_IO)
+      n = NFS3_MAX_IO;
+   memcpy(d->buf, r->p, n);
+   d->buf_len = n;
+   d->buf_off = 0;
+   return 0;
+}
+
 /* One READDIR page into d->buf: entries of cookie, name, fattr4. */
 static int nfs4_readdir_fill(struct rnfs_ctx *c, struct rnfs_dir *d)
 {
    uint8_t ops[NFS3_FHSIZE + 64];
    struct xdr x, r;
-   size_t n;
    x.p = ops; x.end = ops + sizeof(ops); x.fail = 0;
    nfs4_put_fh(&x, &d->fh);
    xdr_u32(&x, OP_READDIR);
@@ -1654,19 +1946,15 @@ static int nfs4_readdir_fill(struct rnfs_ctx *c, struct rnfs_dir *d)
    xdr_u32(&x, 2); xdr_u32(&x, FATTR4_W0_TYPE | FATTR4_W0_SIZE); xdr_u32(&x, FATTR4_W1_TIME_MODIFY);
    if (nfs4_compound(c, ops, (size_t)(x.p - ops), 2, &r) != 0)
       return -1;
-   if (nfs4_res(&r) != NFS3_OK || nfs4_res(&r) != NFS3_OK)
    {
-      rnfs_err(c, "readdir failed");
-      return -1;
+      uint32_t st;
+      if ((st = nfs4_res(&r)) != NFS3_OK || (st = nfs4_res(&r)) != NFS3_OK)
+      {
+         rnfs_err_status(c, "READDIR", NULL, 0, st);
+         return -1;
+      }
    }
-   memcpy(d->cookieverf, r.p, 8); r.p += 8;
-   n = (size_t)(r.end - r.p);
-   if (n > NFS3_MAX_IO)
-      n = NFS3_MAX_IO;
-   memcpy(d->buf, r.p, n);
-   d->buf_len = n;
-   d->buf_off = 0;
-   return 0;
+   return rnfs_readdir_take(d, &r);
 }
 
 struct rnfs_ctx *rnfs_new(void)
@@ -1725,6 +2013,7 @@ void rnfs_set_ports(struct rnfs_ctx *c, uint16_t nfs_port, uint16_t mount_port)
 const char *rnfs_get_error(const struct rnfs_ctx *c) { return c->error; }
 uint32_t    rnfs_get_status(const struct rnfs_ctx *c) { return c->status; }
 int         rnfs_get_fd(const struct rnfs_ctx *c)     { return c->fd; }
+const char *rnfs_get_export(const struct rnfs_ctx *c) { return c->export_path; }
 
 int rnfs_connect(struct rnfs_ctx *c, const char *server, const char *export_path)
 {
@@ -1777,9 +2066,14 @@ int rnfs_connect(struct rnfs_ctx *c, const char *server, const char *export_path
    }
    socket_close(mfd);
    c->status = xdr_get_u32(&reply);
-   if (c->status != NFS3_OK || xdr_get_fh(&reply, &c->root) != 0)
+   if (c->status != NFS3_OK)
    {
-      rnfs_err(c, c->status == 13 ? "mount refused (access denied)" : "mount failed");
+      rnfs_err_status(c, "MOUNT", NULL, 0, c->status);
+      return -1;
+   }
+   if (xdr_get_fh(&reply, &c->root) != 0)
+   {
+      rnfs_err(c, "v3 MOUNT: bad reply");
       return -1;
    }
 
@@ -1842,8 +2136,14 @@ static int rnfs_redial(struct rnfs_ctx *c)
    char server[256];
    char export_path[512];
    int  ret;
-   if (c->redialing || !c->server[0])
+   /* a dial that failed inside a dial has said why */
+   if (c->redialing)
       return -1;
+   if (!c->server[0])
+   {
+      rnfs_err(c, "not connected");
+      return -1;
+   }
    strlcpy(server, c->server, sizeof(server));
    strlcpy(export_path, c->export_path, sizeof(export_path));
    c->redialing = 1;
@@ -1988,7 +2288,7 @@ static int rnfs_walk_from(struct rnfs_ctx *c, const char *norm, size_t start,
          /* a cached handle the server no longer knows */
          if (start && (c->status == NFS3ERR_STALE || c->status == NFS3ERR_BADHANDLE))
             *stale = 1;
-         rnfs_err(c, c->status == NFS3ERR_NOENT ? "not found" : "lookup failed");
+         rnfs_err_status(c, "LOOKUP", p, 0, c->status);
          return -1;
       }
       if (xdr_get_fh(&reply, fh) != 0)
@@ -2139,16 +2439,30 @@ struct rnfs_file *rnfs_open(struct rnfs_ctx *c, const char *path, int flags)
    char last[256];
    struct rnfs_fh dir;
 
+   c->error[0] = '\0';
    if (!f)
+   {
+      rnfs_err(c, "out of memory");
       return NULL;
+   }
    memset(&st, 0, sizeof(st));
 
    if (c->version == 4)
    {
       if (flags & RNFS_O_CREAT)
       {
-         if (nfs4_walk(c, path, &dir, NULL, 1, last, sizeof(last)) != 0 || !last[0]
-               || nfs4_open_create(c, &dir, last, (flags & RNFS_O_TRUNC) != 0, f) != 0)
+         if (nfs4_walk(c, path, &dir, NULL, 1, last, sizeof(last)) != 0)
+         {
+            free(f);
+            return NULL;
+         }
+         if (!last[0])
+         {
+            rnfs_err(c, "is a directory");
+            free(f);
+            return NULL;
+         }
+         if (nfs4_open_create(c, &dir, last, (flags & RNFS_O_TRUNC) != 0, f) != 0)
          {
             free(f);
             return NULL;
@@ -2185,8 +2499,14 @@ struct rnfs_file *rnfs_open(struct rnfs_ctx *c, const char *path, int flags)
    {
       uint8_t args[NFS3_FHSIZE + 4 + 260 + 40];
       struct xdr x, reply;
-      if (rnfs_walk(c, path, &dir, NULL, 1, last, sizeof(last)) != 0 || !last[0])
+      if (rnfs_walk(c, path, &dir, NULL, 1, last, sizeof(last)) != 0)
       {
+         free(f);
+         return NULL;
+      }
+      if (!last[0])
+      {
+         rnfs_err(c, "is a directory");
          free(f);
          return NULL;
       }
@@ -2410,6 +2730,303 @@ broken:
    return 1;
 }
 
+/* One READ reply's record, read as it is parsed: what precedes the
+ * data into c->rx, the data itself straight to where the READ's octets
+ * go. Nothing is asked of the socket that the reply has not promised
+ * by then, so a short reply fails rather than waits. */
+struct rnfs_rd
+{
+   struct rnfs_ctx *c;
+   retro_time_t start;
+   size_t have;     /* octets of the record in c->rx */
+   uint32_t frag;   /* octets left in the fragment being read */
+   int fd;
+   int to;
+   int last;        /* that fragment is the record's last */
+};
+
+/* The next fragment's mark; a record that ends before it is broken */
+static int rnfs_rd_mark(struct rnfs_rd *s)
+{
+   uint8_t hdr[4];
+   if (s->last)
+   {
+      rnfs_err(s->c, "bad read reply");
+      return -1;
+   }
+   if (!socket_receive_all_blocking_with_timeout(s->fd, hdr, 4, s->to))
+   {
+      rnfs_err_recv(s->c, s->start);
+      return -1;
+   }
+   s->last = hdr[0] & 0x80;
+   s->frag = ((uint32_t)(hdr[0] & 0x7f) << 24)
+           | ((uint32_t)hdr[1] << 16) | ((uint32_t)hdr[2] << 8) | hdr[3];
+   return 0;
+}
+
+/* @n octets of the record into @dst, across fragment marks */
+static int rnfs_rd_take(struct rnfs_rd *s, uint8_t *dst, size_t n)
+{
+   while (n)
+   {
+      size_t k;
+      while (!s->frag)
+         if (rnfs_rd_mark(s) != 0)
+            return -1;
+      k = n < s->frag ? n : s->frag;
+      if (!socket_receive_all_blocking_with_timeout(s->fd, dst, k, s->to))
+      {
+         rnfs_err_recv(s->c, s->start);
+         return -1;
+      }
+      s->frag        -= (uint32_t)k;
+      s->c->rx_bytes += k;
+      dst            += k;
+      n              -= k;
+   }
+   return 0;
+}
+
+/* At least @n octets past the cursor in c->rx */
+static int rnfs_rd_need(struct rnfs_rd *s, struct xdr *r, size_t n)
+{
+   size_t in = (size_t)(r->end - r->p);
+   if (in >= n)
+      return 0;
+   n -= in;
+   if (n > s->c->buf_size - s->have)
+   {
+      rnfs_err(s->c, "reply too large");
+      return -1;
+   }
+   if (rnfs_rd_take(s, s->c->rx + s->have, n) != 0)
+      return -1;
+   s->have += n;
+   r->end   = s->c->rx + s->have;
+   return 0;
+}
+
+/* The rest of the record into c->rx, for the parsers that take one
+ * whole */
+static int rnfs_rd_rest(struct rnfs_rd *s, struct xdr *r)
+{
+   while (s->frag || !s->last)
+   {
+      if (!s->frag)
+      {
+         if (rnfs_rd_mark(s) != 0)
+            return -1;
+         continue;
+      }
+      if (rnfs_rd_need(s, r, (size_t)(r->end - r->p) + s->frag) != 0)
+         return -1;
+   }
+   return 0;
+}
+
+static uint32_t rnfs_peek_u32(const uint8_t *p)
+{
+   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+        | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Receives one READ reply. @slot gets the in-flight index its xid
+ * names, RNFS_PIPELINE for none; the rest is rnfs_parse_read's, whose
+ * returns it gives, the reply's data going straight to @out at its
+ * offset. -2 when the connection can not be trusted on: the caller
+ * drops it. A reply the fast path does not take - an error, a GRACE,
+ * READ_PLUS refused - is read whole and parsed as ever. */
+static int rnfs_recv_read(struct rnfs_ctx *c, struct rnfs_file *f,
+      uint64_t off, uint8_t *out, const uint32_t *xids, const size_t *offs,
+      const size_t *lens, const unsigned *sslot, unsigned inflight,
+      unsigned *slot, size_t *got, uint32_t *eof)
+{
+   struct rnfs_rd s;
+   struct xdr r;
+   uint8_t *res;
+   uint8_t *dst;
+   size_t   want, pad, dl;
+   uint64_t at;
+   uint32_t xid, vlen, op;
+   unsigned i;
+
+   s.c     = c;
+   s.start = cpu_features_get_time_usec();
+   s.have  = 0;
+   s.frag  = 0;
+   s.fd    = c->fd;
+   s.to    = (int)c->timeout * 1000;
+   s.last  = 0;
+   r.p     = r.end = c->rx;
+   r.fail  = 0;
+   *slot   = RNFS_PIPELINE;
+
+   /* xid, REPLY, reply_stat and two more: every reply has them */
+   if (rnfs_rd_need(&s, &r, 20) != 0)
+      return -2;
+   xid = rnfs_peek_u32(r.p);
+   for (i = 0; i < inflight; i++)
+      if (xids[i] == xid)
+         *slot = i;
+   vlen = rnfs_peek_u32(r.p + 16);
+   if (     *slot == RNFS_PIPELINE
+         || rnfs_peek_u32(r.p + 4) != 1 || rnfs_peek_u32(r.p + 8) != 0
+         || vlen > 400
+         || rnfs_rd_need(&s, &r, 20 + ((vlen + 3) & ~3u) + 4) != 0
+         || rnfs_peek_u32(r.p + 20 + ((vlen + 3) & ~3u)) != 0)
+   {
+      /* not ours, or not accepted: read to its end, as ever */
+      if (rnfs_rd_rest(&s, &r) != 0)
+         return -2;
+      if (rnfs_rpc_reply(c, &xid, &r) != 0)
+         return -2;
+      if (*slot == RNFS_PIPELINE)
+         return 1;
+      goto whole;
+   }
+   r.p += 20 + ((vlen + 3) & ~3u) + 4;
+
+   want = lens[*slot];
+   dst  = out + offs[*slot];
+   at   = off + offs[*slot];
+   res  = r.p;                          /* where the NFS result starts */
+
+   if (c->version == 4)
+   {
+      uint32_t tl;
+      if (     rnfs_rd_need(&s, &r, 8) != 0)
+         return -2;
+      tl = rnfs_peek_u32(r.p + 4);
+      /* any status but OK, and any tag past what a client sends, the
+       * slow way */
+      if (rnfs_peek_u32(r.p) != NFS3_OK || tl > 64)
+         goto rest;
+      /* status, tag, numres, SEQUENCE, PUTFH, READ's op and status,
+       * eof, and READ's length or READ_PLUS's count */
+      if (rnfs_rd_need(&s, &r, 8 + ((tl + 3) & ~3u) + 4
+               + (c->have_session ? 8 + 36 : 0) + 8 + 8 + 4 + 4) != 0)
+         return -2;
+      c->status = xdr_get_u32(&r);
+      xdr_skip(&r, 4 + ((tl + 3) & ~3u));  /* tag */
+      xdr_get_u32(&r);                     /* numres */
+      if (     c->have_session
+            && nfs4_sequence_res(&r, c, sslot[*slot]) != NFS3_OK)
+         return -2;   /* a status OK compound has its SEQUENCE OK */
+      if (nfs4_res(&r) != NFS3_OK)         /* PUTFH */
+         return -2;
+      op = xdr_get_u32(&r);
+      if (xdr_get_u32(&r) != NFS3_OK || r.fail)
+         return -2;
+      *eof = xdr_get_u32(&r);
+      if (op == OP_READ_PLUS)
+      {
+         uint32_t n   = xdr_get_u32(&r);
+         size_t   pos = 0;
+         while (n--)
+         {
+            uint32_t type;
+            /* type, offset, and a data run's length - or the first
+             * half of a hole's, which is longer still */
+            if (rnfs_rd_need(&s, &r, 16) != 0)
+               return -2;
+            type = xdr_get_u32(&r);
+            if (xdr_get_u64(&r) != at + pos)
+               goto broken;               /* runs out of order */
+            if (type == NFS4_CONTENT_DATA)
+            {
+               dl = xdr_get_u32(&r);
+               if (dl > want - pos)
+                  goto broken;
+               pad = (4 - (dl & 3)) & 3;
+               if (rnfs_rd_take(&s, dst + pos, dl) != 0)
+                  return -2;
+               pos += dl;
+               if (rnfs_rd_need(&s, &r, pad) != 0)
+                  return -2;
+               r.p += pad;
+            }
+            else if (type == NFS4_CONTENT_HOLE)
+            {
+               uint64_t slen;
+               if (rnfs_rd_need(&s, &r, 8) != 0)
+                  return -2;
+               slen = xdr_get_u64(&r);
+               if (slen > want - pos)
+                  slen = want - pos;       /* a hole may run on past the request */
+               memset(dst + pos, 0, (size_t)slen);
+               pos += (size_t)slen;
+            }
+            else
+               goto broken;
+         }
+         if (     (!pos && want && !*eof)
+               || (*eof && at + pos < f->size))
+            goto broken;
+         if (rnfs_rd_rest(&s, &r) != 0)
+            return -2;
+         *got = pos;
+         return 1;
+broken:
+         /* a reply no READ could have given: plain READ from here on,
+          * and this range asked again as that */
+         if (rnfs_rd_rest(&s, &r) != 0)
+            return -2;
+         c->read_plus = 0;
+         return 2;
+      }
+      dl = xdr_get_u32(&r);
+   }
+   else
+   {
+      uint32_t follows;
+      if (rnfs_rd_need(&s, &r, 8) != 0)
+         return -2;
+      follows = rnfs_peek_u32(r.p + 4);
+      if (rnfs_peek_u32(r.p) != NFS3_OK || follows > 1)
+         goto rest;
+      if (rnfs_rd_need(&s, &r, 8 + (follows ? 84 : 0) + 12) != 0)
+         return -2;
+      {
+         struct rnfs_stat st;
+         uint32_t count;
+         c->status = xdr_get_u32(&r);
+         xdr_get_post_op_attr(&r, &st);
+         count = xdr_get_u32(&r);
+         *eof  = xdr_get_u32(&r);
+         dl    = xdr_get_u32(&r);
+         if (r.fail || dl != count)
+         {
+            rnfs_err(c, "bad read reply");
+            return -2;
+         }
+      }
+   }
+   /* the data, last in the reply, where it goes */
+   if (dl > want)
+   {
+      rnfs_err(c, "bad read reply");
+      return -2;
+   }
+   pad = (4 - (dl & 3)) & 3;
+   if (     rnfs_rd_take(&s, dst, dl) != 0
+         || rnfs_rd_need(&s, &r, pad) != 0)
+      return -2;
+   r.p += pad;
+   if (rnfs_rd_rest(&s, &r) != 0)
+      return -2;
+   *got = dl;
+   return 1;
+
+rest:
+   if (rnfs_rd_rest(&s, &r) != 0)
+      return -2;
+   r.p = res;
+whole:
+   return rnfs_parse_read(c, &r, sslot[*slot], off + offs[*slot],
+         f->size, out + offs[*slot], lens[*slot], got, eof);
+}
+
 /* Fetch @len octets at @off into @out with pipelined READs; the
  * octets read (short at end of file), -1 on failure. */
 static int64_t rnfs_fetch_once(struct rnfs_ctx *c, struct rnfs_file *f,
@@ -2418,7 +3035,7 @@ static int64_t rnfs_fetch_once(struct rnfs_ctx *c, struct rnfs_file *f,
    uint32_t xids[RNFS_PIPELINE];
    size_t   offs[RNFS_PIPELINE], lens[RNFS_PIPELINE];
    unsigned sslot[RNFS_PIPELINE];       /* the session slot each READ is on */
-   unsigned inflight = 0, i, grace = 0, short_at = 0;
+   unsigned inflight = 0, grace = 0, short_at = 0;
    /* in a session no more READs than slots, each on its own */
    unsigned depth    = (c->version == 4 && c->have_session && c->slots < RNFS_PIPELINE)
       ? c->slots : RNFS_PIPELINE;
@@ -2457,23 +3074,19 @@ static int64_t rnfs_fetch_once(struct rnfs_ctx *c, struct rnfs_file *f,
       if (!inflight)
          break;
       {
-         struct xdr r;
-         uint32_t xid, reof = 0;
+         uint32_t reof = 0;
          size_t dl = 0;
          unsigned slot = RNFS_PIPELINE;
-         int pr;
-         if (rnfs_rpc_recv(c, c->fd, &xid, &r) != 0)
+         /* the data lands where it goes, not in c->rx */
+         int pr = rnfs_recv_read(c, f, off, out, xids, offs, lens, sslot,
+               inflight, &slot, &dl, &reof);
+         if (pr == -2)
          {
             rnfs_drop(c);                /* the link went: dial again */
             return -1;
          }
-         for (i = 0; i < inflight; i++)
-            if (xids[i] == xid)
-               slot = i;
          if (slot == RNFS_PIPELINE)
             continue;
-         pr = rnfs_parse_read(c, &r, sslot[slot], off + offs[slot], f->size,
-               out + offs[slot], lens[slot], &dl, &reof);
          if (pr == 2)
          {
             /* READ_PLUS refused: this chunk again, now as READ */
@@ -2801,18 +3414,26 @@ struct rnfs_dir *rnfs_opendir(struct rnfs_ctx *c, const char *path)
 {
    struct rnfs_dir *d = (struct rnfs_dir*)calloc(1, sizeof(*d));
    struct rnfs_stat st;
+   int walked;
+   c->error[0] = '\0';
    if (!d)
-      return NULL;
-   if ((c->version == 4 ? nfs4_walk(c, path, &d->fh, &st, 0, NULL, 0)
-                        : rnfs_walk(c, path, &d->fh, &st, 0, NULL, 0)) != 0 || !st.is_dir)
    {
-      if (!c->error[0] || st.is_dir == 0)
+      rnfs_err(c, "out of memory");
+      return NULL;
+   }
+   walked = c->version == 4 ? nfs4_walk(c, path, &d->fh, &st, 0, NULL, 0)
+                            : rnfs_walk(c, path, &d->fh, &st, 0, NULL, 0);
+   if (walked != 0 || !st.is_dir)
+   {
+      /* a failed walk has said why */
+      if (walked == 0 || !c->error[0])
          rnfs_err(c, "not a directory");
       free(d);
       return NULL;
    }
    if (!(d->buf = (uint8_t*)malloc(NFS3_MAX_IO)))
    {
+      rnfs_err(c, "out of memory");
       free(d);
       return NULL;
    }
@@ -2828,7 +3449,6 @@ static int rnfs_readdir_fill(struct rnfs_ctx *c, struct rnfs_dir *d)
    uint8_t args[NFS3_FHSIZE + 32];
    struct xdr x, reply;
    struct rnfs_stat st;
-   size_t n;
 
    for (;;)
    {
@@ -2851,18 +3471,11 @@ static int rnfs_readdir_fill(struct rnfs_ctx *c, struct rnfs_dir *d)
    }
    if (c->status != NFS3_OK)
    {
-      rnfs_err(c, "readdir failed");
+      rnfs_err_status(c, d->plain ? "READDIR" : "READDIRPLUS", NULL, 0, c->status);
       return -1;
    }
    xdr_get_post_op_attr(&reply, &st);
-   memcpy(d->cookieverf, reply.p, 8); reply.p += 8;
-   n = (size_t)(reply.end - reply.p);
-   if (n > NFS3_MAX_IO)
-      n = NFS3_MAX_IO;
-   memcpy(d->buf, reply.p, n);
-   d->buf_len = n;
-   d->buf_off = 0;
-   return 0;
+   return rnfs_readdir_take(d, &reply);
 }
 
 /* Attributes of one entry by LOOKUP, for the plain READDIR path. */
