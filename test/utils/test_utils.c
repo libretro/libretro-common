@@ -28,6 +28,11 @@
 #include <lrc_hash.h>
 #include <encodings/crc32.h>
 #include <streams/file_stream.h>
+#include <features/features_cpu.h>
+
+#ifdef __MACH__
+#include <unistd.h>
+#endif
 
 #define SUITE_NAME "hash"
 
@@ -134,6 +139,18 @@ START_TEST (test_crc32_file)
 }
 END_TEST
 
+#ifdef __MACH__
+START_TEST (test_cpu_perf_counter)
+{
+   retro_perf_tick_t first = cpu_features_get_perf_counter();
+
+   ck_assert(first != 0);
+   usleep(1000);
+   ck_assert(cpu_features_get_perf_counter() > first);
+}
+END_TEST
+#endif
+
 Suite *create_suite(void)
 {
    Suite *s = suite_create(SUITE_NAME);
@@ -142,6 +159,9 @@ Suite *create_suite(void)
    tcase_add_test(tc_core, test_md5);
    tcase_add_test(tc_core, test_crc32);
    tcase_add_test(tc_core, test_crc32_file);
+#ifdef __MACH__
+   tcase_add_test(tc_core, test_cpu_perf_counter);
+#endif
    suite_add_tcase(s, tc_core);
 
    return s;
