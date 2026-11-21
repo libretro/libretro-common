@@ -67,6 +67,32 @@ uint64_t memstream_get_ptr(memstream_t *stream)
    return stream->ptr;
 }
 
+int64_t memstream_view(memstream_t *stream, uint64_t len,
+      const uint8_t **ptr)
+{
+   uint64_t avail;
+   if (!stream || stream->ptr >= stream->size)
+      return 0;
+   avail = stream->size - stream->ptr;
+   if (len > avail)
+      len = avail;
+   *ptr         = stream->buf + stream->ptr;
+   stream->ptr += len;
+   if (stream->ptr > stream->max_ptr)
+      stream->max_ptr = stream->ptr;
+   return (int64_t)len;
+}
+
+void memstream_set_buffer(memstream_t *stream, uint8_t *buf, uint64_t size,
+      unsigned writing)
+{
+   stream->ptr     = 0;
+   stream->max_ptr = 0;
+   stream->writing = writing;
+   stream->buf     = buf;
+   stream->size    = size;
+}
+
 uint64_t memstream_get_size(memstream_t *stream)
 {
    return stream->size;
@@ -88,6 +114,21 @@ uint64_t memstream_read(memstream_t *stream, void *data, uint64_t bytes)
    if (stream->ptr > stream->max_ptr)
       stream->max_ptr  = stream->ptr;
    return bytes;
+}
+
+int64_t memstream_read_at(memstream_t *stream, void *data, uint64_t bytes,
+      int64_t offset)
+{
+   uint64_t avail;
+   if (!stream || offset < 0)
+      return -1;
+   if ((uint64_t)offset >= stream->size)
+      return 0;
+   avail = stream->size - (uint64_t)offset;
+   if (bytes > avail)
+      bytes = avail;
+   memcpy(data, stream->buf + offset, (size_t)bytes);
+   return (int64_t)bytes;
 }
 
 uint64_t memstream_write(memstream_t *stream,

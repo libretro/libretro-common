@@ -35,19 +35,19 @@
  * What it implements: AAC-LC (audio object type 2) raw access units,
  * channel configurations 1 through 7 and configuration 0 with an
  * embedded PCE (up to eight output channels, interleaved in element
- * transmission order), explicit as well as indexed sampling
+ * transmission order or WAVE order), HE-AAC SBR and parametric
+ * stereo, ADTS header
+ * parsing, explicit as well as indexed sampling
  * frequencies, M/S and intensity stereo, PNS, TNS, coupling channel
  * elements (dependently and independently switched, up to four
  * concurrent tags), in-stream PCE and DSE elements (skipped), and
  * both the s16 and f32 output paths from a shared float synthesis
  * pipeline.
  *
- * What it does not implement: other object types (Main, SSR, LTP,
- * HE-AAC's SBR/PS - configurations other than plain LC are refused
- * at open, as is the 960-sample frame variant), downmixing,
- * ADTS/LATM/LOAS framing (the caller supplies the
- * AudioSpecificConfig and raw access units, as rmp4 does), and
- * encoding. */
+ * What it does not implement: other object types (Main, SSR, LTP -
+ * refused at open), downmixing, LATM/LOAS framing and walking
+ * ADTS streams (the caller supplies the AudioSpecificConfig and raw
+ * access units, as rmp4 does), and encoding. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -187,6 +187,20 @@ static INLINE raac_v raac_v_set4(float a, float b, float c, float e)
 
 #define RAAC_FRAME     1024
 #define RAAC_MAX_CH    8
+
+/* WAVE speaker positions, in the order WAVEFORMATEXTENSIBLE lists its
+ * channel mask bits */
+#define RAAC_WAVE_FL   0
+#define RAAC_WAVE_FR   1
+#define RAAC_WAVE_FC   2
+#define RAAC_WAVE_LFE  3
+#define RAAC_WAVE_BL   4
+#define RAAC_WAVE_BR   5
+#define RAAC_WAVE_FLC  6
+#define RAAC_WAVE_FRC  7
+#define RAAC_WAVE_BC   8
+#define RAAC_WAVE_SL   9
+#define RAAC_WAVE_SR   10
 #define RAAC_MAX_SFB   51
 #define RAAC_MAX_WIN   8
 #define RAAC_MAX_CCE   4   /* concurrently active coupling tags      */
@@ -202,384 +216,8 @@ static INLINE raac_v raac_v_set4(float a, float b, float c, float e)
 #define RAAC_CB_INTENSITY  15
 #define RAAC_CB_NOISE      13
 
-static const uint16_t raac_hcb1_code[81] = {
-   0x07f8, 0x01f1, 0x07fd, 0x03f5, 0x0068, 0x03f0, 0x07f7, 0x01ec,
-   0x07f5, 0x03f1, 0x0072, 0x03f4, 0x0074, 0x0011, 0x0076, 0x01eb,
-   0x006c, 0x03f6, 0x07fc, 0x01e1, 0x07f1, 0x01f0, 0x0061, 0x01f6,
-   0x07f2, 0x01ea, 0x07fb, 0x01f2, 0x0069, 0x01ed, 0x0077, 0x0017,
-   0x006f, 0x01e6, 0x0064, 0x01e5, 0x0067, 0x0015, 0x0062, 0x0012,
-   0x0000, 0x0014, 0x0065, 0x0016, 0x006d, 0x01e9, 0x0063, 0x01e4,
-   0x006b, 0x0013, 0x0071, 0x01e3, 0x0070, 0x01f3, 0x07fe, 0x01e7,
-   0x07f3, 0x01ef, 0x0060, 0x01ee, 0x07f0, 0x01e2, 0x07fa, 0x03f3,
-   0x006a, 0x01e8, 0x0075, 0x0010, 0x0073, 0x01f4, 0x006e, 0x03f7,
-   0x07f6, 0x01e0, 0x07f9, 0x03f2, 0x0066, 0x01f5, 0x07ff, 0x01f7,
-   0x07f4
-};
-static const uint8_t raac_hcb1_bits[81] = {
-   11, 9, 11, 10, 7, 10, 11, 9, 11, 10, 7, 10, 7, 5, 7, 9,
-   7, 10, 11, 9, 11, 9, 7, 9, 11, 9, 11, 9, 7, 9, 7, 5,
-   7, 9, 7, 9, 7, 5, 7, 5, 1, 5, 7, 5, 7, 9, 7, 9,
-   7, 5, 7, 9, 7, 9, 11, 9, 11, 9, 7, 9, 11, 9, 11, 10,
-   7, 9, 7, 5, 7, 9, 7, 10, 11, 9, 11, 10, 7, 9, 11, 9,
-   11
-};
-static const uint16_t raac_hcb2_code[81] = {
-   0x01f3, 0x006f, 0x01fd, 0x00eb, 0x0023, 0x00ea, 0x01f7, 0x00e8,
-   0x01fa, 0x00f2, 0x002d, 0x0070, 0x0020, 0x0006, 0x002b, 0x006e,
-   0x0028, 0x00e9, 0x01f9, 0x0066, 0x00f8, 0x00e7, 0x001b, 0x00f1,
-   0x01f4, 0x006b, 0x01f5, 0x00ec, 0x002a, 0x006c, 0x002c, 0x000a,
-   0x0027, 0x0067, 0x001a, 0x00f5, 0x0024, 0x0008, 0x001f, 0x0009,
-   0x0000, 0x0007, 0x001d, 0x000b, 0x0030, 0x00ef, 0x001c, 0x0064,
-   0x001e, 0x000c, 0x0029, 0x00f3, 0x002f, 0x00f0, 0x01fc, 0x0071,
-   0x01f2, 0x00f4, 0x0021, 0x00e6, 0x00f7, 0x0068, 0x01f8, 0x00ee,
-   0x0022, 0x0065, 0x0031, 0x0002, 0x0026, 0x00ed, 0x0025, 0x006a,
-   0x01fb, 0x0072, 0x01fe, 0x0069, 0x002e, 0x00f6, 0x01ff, 0x006d,
-   0x01f6
-};
-static const uint8_t raac_hcb2_bits[81] = {
-   9, 7, 9, 8, 6, 8, 9, 8, 9, 8, 6, 7, 6, 5, 6, 7,
-   6, 8, 9, 7, 8, 8, 6, 8, 9, 7, 9, 8, 6, 7, 6, 5,
-   6, 7, 6, 8, 6, 5, 6, 5, 3, 5, 6, 5, 6, 8, 6, 7,
-   6, 5, 6, 8, 6, 8, 9, 7, 9, 8, 6, 8, 8, 7, 9, 8,
-   6, 7, 6, 4, 6, 8, 6, 7, 9, 7, 9, 7, 6, 8, 9, 7,
-   9
-};
-static const uint16_t raac_hcb3_code[81] = {
-   0x0000, 0x0009, 0x00ef, 0x000b, 0x0019, 0x00f0, 0x01eb, 0x01e6,
-   0x03f2, 0x000a, 0x0035, 0x01ef, 0x0034, 0x0037, 0x01e9, 0x01ed,
-   0x01e7, 0x03f3, 0x01ee, 0x03ed, 0x1ffa, 0x01ec, 0x01f2, 0x07f9,
-   0x07f8, 0x03f8, 0x0ff8, 0x0008, 0x0038, 0x03f6, 0x0036, 0x0075,
-   0x03f1, 0x03eb, 0x03ec, 0x0ff4, 0x0018, 0x0076, 0x07f4, 0x0039,
-   0x0074, 0x03ef, 0x01f3, 0x01f4, 0x07f6, 0x01e8, 0x03ea, 0x1ffc,
-   0x00f2, 0x01f1, 0x0ffb, 0x03f5, 0x07f3, 0x0ffc, 0x00ee, 0x03f7,
-   0x7ffe, 0x01f0, 0x07f5, 0x7ffd, 0x1ffb, 0x3ffa, 0xffff, 0x00f1,
-   0x03f0, 0x3ffc, 0x01ea, 0x03ee, 0x3ffb, 0x0ff6, 0x0ffa, 0x7ffc,
-   0x07f2, 0x0ff5, 0xfffe, 0x03f4, 0x07f7, 0x7ffb, 0x0ff7, 0x0ff9,
-   0x7ffa
-};
-static const uint8_t raac_hcb3_bits[81] = {
-   1, 4, 8, 4, 5, 8, 9, 9, 10, 4, 6, 9, 6, 6, 9, 9,
-   9, 10, 9, 10, 13, 9, 9, 11, 11, 10, 12, 4, 6, 10, 6, 7,
-   10, 10, 10, 12, 5, 7, 11, 6, 7, 10, 9, 9, 11, 9, 10, 13,
-   8, 9, 12, 10, 11, 12, 8, 10, 15, 9, 11, 15, 13, 14, 16, 8,
-   10, 14, 9, 10, 14, 12, 12, 15, 11, 12, 16, 10, 11, 15, 12, 12,
-   15
-};
-static const uint16_t raac_hcb4_code[81] = {
-   0x0007, 0x0016, 0x00f6, 0x0018, 0x0008, 0x00ef, 0x01ef, 0x00f3,
-   0x07f8, 0x0019, 0x0017, 0x00ed, 0x0015, 0x0001, 0x00e2, 0x00f0,
-   0x0070, 0x03f0, 0x01ee, 0x00f1, 0x07fa, 0x00ee, 0x00e4, 0x03f2,
-   0x07f6, 0x03ef, 0x07fd, 0x0005, 0x0014, 0x00f2, 0x0009, 0x0004,
-   0x00e5, 0x00f4, 0x00e8, 0x03f4, 0x0006, 0x0002, 0x00e7, 0x0003,
-   0x0000, 0x006b, 0x00e3, 0x0069, 0x01f3, 0x00eb, 0x00e6, 0x03f6,
-   0x006e, 0x006a, 0x01f4, 0x03ec, 0x01f0, 0x03f9, 0x00f5, 0x00ec,
-   0x07fb, 0x00ea, 0x006f, 0x03f7, 0x07f9, 0x03f3, 0x0fff, 0x00e9,
-   0x006d, 0x03f8, 0x006c, 0x0068, 0x01f5, 0x03ee, 0x01f2, 0x07f4,
-   0x07f7, 0x03f1, 0x0ffe, 0x03ed, 0x01f1, 0x07f5, 0x07fe, 0x03f5,
-   0x07fc
-};
-static const uint8_t raac_hcb4_bits[81] = {
-   4, 5, 8, 5, 4, 8, 9, 8, 11, 5, 5, 8, 5, 4, 8, 8,
-   7, 10, 9, 8, 11, 8, 8, 10, 11, 10, 11, 4, 5, 8, 4, 4,
-   8, 8, 8, 10, 4, 4, 8, 4, 4, 7, 8, 7, 9, 8, 8, 10,
-   7, 7, 9, 10, 9, 10, 8, 8, 11, 8, 7, 10, 11, 10, 12, 8,
-   7, 10, 7, 7, 9, 10, 9, 11, 11, 10, 12, 10, 9, 11, 11, 10,
-   11
-};
-static const uint16_t raac_hcb5_code[81] = {
-   0x1fff, 0x0ff7, 0x07f4, 0x07e8, 0x03f1, 0x07ee, 0x07f9, 0x0ff8,
-   0x1ffd, 0x0ffd, 0x07f1, 0x03e8, 0x01e8, 0x00f0, 0x01ec, 0x03ee,
-   0x07f2, 0x0ffa, 0x0ff4, 0x03ef, 0x01f2, 0x00e8, 0x0070, 0x00ec,
-   0x01f0, 0x03ea, 0x07f3, 0x07eb, 0x01eb, 0x00ea, 0x001a, 0x0008,
-   0x0019, 0x00ee, 0x01ef, 0x07ed, 0x03f0, 0x00f2, 0x0073, 0x000b,
-   0x0000, 0x000a, 0x0071, 0x00f3, 0x07e9, 0x07ef, 0x01ee, 0x00ef,
-   0x0018, 0x0009, 0x001b, 0x00eb, 0x01e9, 0x07ec, 0x07f6, 0x03eb,
-   0x01f3, 0x00ed, 0x0072, 0x00e9, 0x01f1, 0x03ed, 0x07f7, 0x0ff6,
-   0x07f0, 0x03e9, 0x01ed, 0x00f1, 0x01ea, 0x03ec, 0x07f8, 0x0ff9,
-   0x1ffc, 0x0ffc, 0x0ff5, 0x07ea, 0x03f3, 0x03f2, 0x07f5, 0x0ffb,
-   0x1ffe
-};
-static const uint8_t raac_hcb5_bits[81] = {
-   13, 12, 11, 11, 10, 11, 11, 12, 13, 12, 11, 10, 9, 8, 9, 10,
-   11, 12, 12, 10, 9, 8, 7, 8, 9, 10, 11, 11, 9, 8, 5, 4,
-   5, 8, 9, 11, 10, 8, 7, 4, 1, 4, 7, 8, 11, 11, 9, 8,
-   5, 4, 5, 8, 9, 11, 11, 10, 9, 8, 7, 8, 9, 10, 11, 12,
-   11, 10, 9, 8, 9, 10, 11, 12, 13, 12, 12, 11, 10, 10, 11, 12,
-   13
-};
-static const uint16_t raac_hcb6_code[81] = {
-   0x07fe, 0x03fd, 0x01f1, 0x01eb, 0x01f4, 0x01ea, 0x01f0, 0x03fc,
-   0x07fd, 0x03f6, 0x01e5, 0x00ea, 0x006c, 0x0071, 0x0068, 0x00f0,
-   0x01e6, 0x03f7, 0x01f3, 0x00ef, 0x0032, 0x0027, 0x0028, 0x0026,
-   0x0031, 0x00eb, 0x01f7, 0x01e8, 0x006f, 0x002e, 0x0008, 0x0004,
-   0x0006, 0x0029, 0x006b, 0x01ee, 0x01ef, 0x0072, 0x002d, 0x0002,
-   0x0000, 0x0003, 0x002f, 0x0073, 0x01fa, 0x01e7, 0x006e, 0x002b,
-   0x0007, 0x0001, 0x0005, 0x002c, 0x006d, 0x01ec, 0x01f9, 0x00ee,
-   0x0030, 0x0024, 0x002a, 0x0025, 0x0033, 0x00ec, 0x01f2, 0x03f8,
-   0x01e4, 0x00ed, 0x006a, 0x0070, 0x0069, 0x0074, 0x00f1, 0x03fa,
-   0x07ff, 0x03f9, 0x01f6, 0x01ed, 0x01f8, 0x01e9, 0x01f5, 0x03fb,
-   0x07fc
-};
-static const uint8_t raac_hcb6_bits[81] = {
-   11, 10, 9, 9, 9, 9, 9, 10, 11, 10, 9, 8, 7, 7, 7, 8,
-   9, 10, 9, 8, 6, 6, 6, 6, 6, 8, 9, 9, 7, 6, 4, 4,
-   4, 6, 7, 9, 9, 7, 6, 4, 4, 4, 6, 7, 9, 9, 7, 6,
-   4, 4, 4, 6, 7, 9, 9, 8, 6, 6, 6, 6, 6, 8, 9, 10,
-   9, 8, 7, 7, 7, 7, 8, 10, 11, 10, 9, 9, 9, 9, 9, 10,
-   11
-};
-static const uint16_t raac_hcb7_code[64] = {
-   0x0000, 0x0005, 0x0037, 0x0074, 0x00f2, 0x01eb, 0x03ed, 0x07f7,
-   0x0004, 0x000c, 0x0035, 0x0071, 0x00ec, 0x00ee, 0x01ee, 0x01f5,
-   0x0036, 0x0034, 0x0072, 0x00ea, 0x00f1, 0x01e9, 0x01f3, 0x03f5,
-   0x0073, 0x0070, 0x00eb, 0x00f0, 0x01f1, 0x01f0, 0x03ec, 0x03fa,
-   0x00f3, 0x00ed, 0x01e8, 0x01ef, 0x03ef, 0x03f1, 0x03f9, 0x07fb,
-   0x01ed, 0x00ef, 0x01ea, 0x01f2, 0x03f3, 0x03f8, 0x07f9, 0x07fc,
-   0x03ee, 0x01ec, 0x01f4, 0x03f4, 0x03f7, 0x07f8, 0x0ffd, 0x0ffe,
-   0x07f6, 0x03f0, 0x03f2, 0x03f6, 0x07fa, 0x07fd, 0x0ffc, 0x0fff
-};
-static const uint8_t raac_hcb7_bits[64] = {
-   1, 3, 6, 7, 8, 9, 10, 11, 3, 4, 6, 7, 8, 8, 9, 9,
-   6, 6, 7, 8, 8, 9, 9, 10, 7, 7, 8, 8, 9, 9, 10, 10,
-   8, 8, 9, 9, 10, 10, 10, 11, 9, 8, 9, 9, 10, 10, 11, 11,
-   10, 9, 9, 10, 10, 11, 12, 12, 11, 10, 10, 10, 11, 11, 12, 12
-};
-static const uint16_t raac_hcb8_code[64] = {
-   0x000e, 0x0005, 0x0010, 0x0030, 0x006f, 0x00f1, 0x01fa, 0x03fe,
-   0x0003, 0x0000, 0x0004, 0x0012, 0x002c, 0x006a, 0x0075, 0x00f8,
-   0x000f, 0x0002, 0x0006, 0x0014, 0x002e, 0x0069, 0x0072, 0x00f5,
-   0x002f, 0x0011, 0x0013, 0x002a, 0x0032, 0x006c, 0x00ec, 0x00fa,
-   0x0071, 0x002b, 0x002d, 0x0031, 0x006d, 0x0070, 0x00f2, 0x01f9,
-   0x00ef, 0x0068, 0x0033, 0x006b, 0x006e, 0x00ee, 0x00f9, 0x03fc,
-   0x01f8, 0x0074, 0x0073, 0x00ed, 0x00f0, 0x00f6, 0x01f6, 0x01fd,
-   0x03fd, 0x00f3, 0x00f4, 0x00f7, 0x01f7, 0x01fb, 0x01fc, 0x03ff
-};
-static const uint8_t raac_hcb8_bits[64] = {
-   5, 4, 5, 6, 7, 8, 9, 10, 4, 3, 4, 5, 6, 7, 7, 8,
-   5, 4, 4, 5, 6, 7, 7, 8, 6, 5, 5, 6, 6, 7, 8, 8,
-   7, 6, 6, 6, 7, 7, 8, 9, 8, 7, 6, 7, 7, 8, 8, 10,
-   9, 7, 7, 8, 8, 8, 9, 9, 10, 8, 8, 8, 9, 9, 9, 10
-};
-static const uint16_t raac_hcb9_code[169] = {
-   0x0000, 0x0005, 0x0037, 0x00e7, 0x01de, 0x03ce, 0x03d9, 0x07c8,
-   0x07cd, 0x0fc8, 0x0fdd, 0x1fe4, 0x1fec, 0x0004, 0x000c, 0x0035,
-   0x0072, 0x00ea, 0x00ed, 0x01e2, 0x03d1, 0x03d3, 0x03e0, 0x07d8,
-   0x0fcf, 0x0fd5, 0x0036, 0x0034, 0x0071, 0x00e8, 0x00ec, 0x01e1,
-   0x03cf, 0x03dd, 0x03db, 0x07d0, 0x0fc7, 0x0fd4, 0x0fe4, 0x00e6,
-   0x0070, 0x00e9, 0x01dd, 0x01e3, 0x03d2, 0x03dc, 0x07cc, 0x07ca,
-   0x07de, 0x0fd8, 0x0fea, 0x1fdb, 0x01df, 0x00eb, 0x01dc, 0x01e6,
-   0x03d5, 0x03de, 0x07cb, 0x07dd, 0x07dc, 0x0fcd, 0x0fe2, 0x0fe7,
-   0x1fe1, 0x03d0, 0x01e0, 0x01e4, 0x03d6, 0x07c5, 0x07d1, 0x07db,
-   0x0fd2, 0x07e0, 0x0fd9, 0x0feb, 0x1fe3, 0x1fe9, 0x07c4, 0x01e5,
-   0x03d7, 0x07c6, 0x07cf, 0x07da, 0x0fcb, 0x0fda, 0x0fe3, 0x0fe9,
-   0x1fe6, 0x1ff3, 0x1ff7, 0x07d3, 0x03d8, 0x03e1, 0x07d4, 0x07d9,
-   0x0fd3, 0x0fde, 0x1fdd, 0x1fd9, 0x1fe2, 0x1fea, 0x1ff1, 0x1ff6,
-   0x07d2, 0x03d4, 0x03da, 0x07c7, 0x07d7, 0x07e2, 0x0fce, 0x0fdb,
-   0x1fd8, 0x1fee, 0x3ff0, 0x1ff4, 0x3ff2, 0x07e1, 0x03df, 0x07c9,
-   0x07d6, 0x0fca, 0x0fd0, 0x0fe5, 0x0fe6, 0x1feb, 0x1fef, 0x3ff3,
-   0x3ff4, 0x3ff5, 0x0fe0, 0x07ce, 0x07d5, 0x0fc6, 0x0fd1, 0x0fe1,
-   0x1fe0, 0x1fe8, 0x1ff0, 0x3ff1, 0x3ff8, 0x3ff6, 0x7ffc, 0x0fe8,
-   0x07df, 0x0fc9, 0x0fd7, 0x0fdc, 0x1fdc, 0x1fdf, 0x1fed, 0x1ff5,
-   0x3ff9, 0x3ffb, 0x7ffd, 0x7ffe, 0x1fe7, 0x0fcc, 0x0fd6, 0x0fdf,
-   0x1fde, 0x1fda, 0x1fe5, 0x1ff2, 0x3ffa, 0x3ff7, 0x3ffc, 0x3ffd,
-   0x7fff
-};
-static const uint8_t raac_hcb9_bits[169] = {
-   1, 3, 6, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 3, 4, 6,
-   7, 8, 8, 9, 10, 10, 10, 11, 12, 12, 6, 6, 7, 8, 8, 9,
-   10, 10, 10, 11, 12, 12, 12, 8, 7, 8, 9, 9, 10, 10, 11, 11,
-   11, 12, 12, 13, 9, 8, 9, 9, 10, 10, 11, 11, 11, 12, 12, 12,
-   13, 10, 9, 9, 10, 11, 11, 11, 12, 11, 12, 12, 13, 13, 11, 9,
-   10, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 11, 10, 10, 11, 11,
-   12, 12, 13, 13, 13, 13, 13, 13, 11, 10, 10, 11, 11, 11, 12, 12,
-   13, 13, 14, 13, 14, 11, 10, 11, 11, 12, 12, 12, 12, 13, 13, 14,
-   14, 14, 12, 11, 11, 12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 12,
-   11, 12, 12, 12, 13, 13, 13, 13, 14, 14, 15, 15, 13, 12, 12, 12,
-   13, 13, 13, 13, 14, 14, 14, 14, 15
-};
-static const uint16_t raac_hcb10_code[169] = {
-   0x0022, 0x0008, 0x001d, 0x0026, 0x005f, 0x00d3, 0x01cf, 0x03d0,
-   0x03d7, 0x03ed, 0x07f0, 0x07f6, 0x0ffd, 0x0007, 0x0000, 0x0001,
-   0x0009, 0x0020, 0x0054, 0x0060, 0x00d5, 0x00dc, 0x01d4, 0x03cd,
-   0x03de, 0x07e7, 0x001c, 0x0002, 0x0006, 0x000c, 0x001e, 0x0028,
-   0x005b, 0x00cd, 0x00d9, 0x01ce, 0x01dc, 0x03d9, 0x03f1, 0x0025,
-   0x000b, 0x000a, 0x000d, 0x0024, 0x0057, 0x0061, 0x00cc, 0x00dd,
-   0x01cc, 0x01de, 0x03d3, 0x03e7, 0x005d, 0x0021, 0x001f, 0x0023,
-   0x0027, 0x0059, 0x0064, 0x00d8, 0x00df, 0x01d2, 0x01e2, 0x03dd,
-   0x03ee, 0x00d1, 0x0055, 0x0029, 0x0056, 0x0058, 0x0062, 0x00ce,
-   0x00e0, 0x00e2, 0x01da, 0x03d4, 0x03e3, 0x07eb, 0x01c9, 0x005e,
-   0x005a, 0x005c, 0x0063, 0x00ca, 0x00da, 0x01c7, 0x01ca, 0x01e0,
-   0x03db, 0x03e8, 0x07ec, 0x01e3, 0x00d2, 0x00cb, 0x00d0, 0x00d7,
-   0x00db, 0x01c6, 0x01d5, 0x01d8, 0x03ca, 0x03da, 0x07ea, 0x07f1,
-   0x01e1, 0x00d4, 0x00cf, 0x00d6, 0x00de, 0x00e1, 0x01d0, 0x01d6,
-   0x03d1, 0x03d5, 0x03f2, 0x07ee, 0x07fb, 0x03e9, 0x01cd, 0x01c8,
-   0x01cb, 0x01d1, 0x01d7, 0x01df, 0x03cf, 0x03e0, 0x03ef, 0x07e6,
-   0x07f8, 0x0ffa, 0x03eb, 0x01dd, 0x01d3, 0x01d9, 0x01db, 0x03d2,
-   0x03cc, 0x03dc, 0x03ea, 0x07ed, 0x07f3, 0x07f9, 0x0ff9, 0x07f2,
-   0x03ce, 0x01e4, 0x03cb, 0x03d8, 0x03d6, 0x03e2, 0x03e5, 0x07e8,
-   0x07f4, 0x07f5, 0x07f7, 0x0ffb, 0x07fa, 0x03ec, 0x03df, 0x03e1,
-   0x03e4, 0x03e6, 0x03f0, 0x07e9, 0x07ef, 0x0ff8, 0x0ffe, 0x0ffc,
-   0x0fff
-};
-static const uint8_t raac_hcb10_bits[169] = {
-   6, 5, 6, 6, 7, 8, 9, 10, 10, 10, 11, 11, 12, 5, 4, 4,
-   5, 6, 7, 7, 8, 8, 9, 10, 10, 11, 6, 4, 5, 5, 6, 6,
-   7, 8, 8, 9, 9, 10, 10, 6, 5, 5, 5, 6, 7, 7, 8, 8,
-   9, 9, 10, 10, 7, 6, 6, 6, 6, 7, 7, 8, 8, 9, 9, 10,
-   10, 8, 7, 6, 7, 7, 7, 8, 8, 8, 9, 10, 10, 11, 9, 7,
-   7, 7, 7, 8, 8, 9, 9, 9, 10, 10, 11, 9, 8, 8, 8, 8,
-   8, 9, 9, 9, 10, 10, 11, 11, 9, 8, 8, 8, 8, 8, 9, 9,
-   10, 10, 10, 11, 11, 10, 9, 9, 9, 9, 9, 9, 10, 10, 10, 11,
-   11, 12, 10, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 12, 11,
-   10, 9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 12, 11, 10, 10, 10,
-   10, 10, 10, 11, 11, 12, 12, 12, 12
-};
-static const uint16_t raac_hcb11_code[289] = {
-   0x0000, 0x0006, 0x0019, 0x003d, 0x009c, 0x00c6, 0x01a7, 0x0390,
-   0x03c2, 0x03df, 0x07e6, 0x07f3, 0x0ffb, 0x07ec, 0x0ffa, 0x0ffe,
-   0x038e, 0x0005, 0x0001, 0x0008, 0x0014, 0x0037, 0x0042, 0x0092,
-   0x00af, 0x0191, 0x01a5, 0x01b5, 0x039e, 0x03c0, 0x03a2, 0x03cd,
-   0x07d6, 0x00ae, 0x0017, 0x0007, 0x0009, 0x0018, 0x0039, 0x0040,
-   0x008e, 0x00a3, 0x00b8, 0x0199, 0x01ac, 0x01c1, 0x03b1, 0x0396,
-   0x03be, 0x03ca, 0x009d, 0x003c, 0x0015, 0x0016, 0x001a, 0x003b,
-   0x0044, 0x0091, 0x00a5, 0x00be, 0x0196, 0x01ae, 0x01b9, 0x03a1,
-   0x0391, 0x03a5, 0x03d5, 0x0094, 0x009a, 0x0036, 0x0038, 0x003a,
-   0x0041, 0x008c, 0x009b, 0x00b0, 0x00c3, 0x019e, 0x01ab, 0x01bc,
-   0x039f, 0x038f, 0x03a9, 0x03cf, 0x0093, 0x00bf, 0x003e, 0x003f,
-   0x0043, 0x0045, 0x009e, 0x00a7, 0x00b9, 0x0194, 0x01a2, 0x01ba,
-   0x01c3, 0x03a6, 0x03a7, 0x03bb, 0x03d4, 0x009f, 0x01a0, 0x008f,
-   0x008d, 0x0090, 0x0098, 0x00a6, 0x00b6, 0x00c4, 0x019f, 0x01af,
-   0x01bf, 0x0399, 0x03bf, 0x03b4, 0x03c9, 0x03e7, 0x00a8, 0x01b6,
-   0x00ab, 0x00a4, 0x00aa, 0x00b2, 0x00c2, 0x00c5, 0x0198, 0x01a4,
-   0x01b8, 0x038c, 0x03a4, 0x03c4, 0x03c6, 0x03dd, 0x03e8, 0x00ad,
-   0x03af, 0x0192, 0x00bd, 0x00bc, 0x018e, 0x0197, 0x019a, 0x01a3,
-   0x01b1, 0x038d, 0x0398, 0x03b7, 0x03d3, 0x03d1, 0x03db, 0x07dd,
-   0x00b4, 0x03de, 0x01a9, 0x019b, 0x019c, 0x01a1, 0x01aa, 0x01ad,
-   0x01b3, 0x038b, 0x03b2, 0x03b8, 0x03ce, 0x03e1, 0x03e0, 0x07d2,
-   0x07e5, 0x00b7, 0x07e3, 0x01bb, 0x01a8, 0x01a6, 0x01b0, 0x01b2,
-   0x01b7, 0x039b, 0x039a, 0x03ba, 0x03b5, 0x03d6, 0x07d7, 0x03e4,
-   0x07d8, 0x07ea, 0x00ba, 0x07e8, 0x03a0, 0x01bd, 0x01b4, 0x038a,
-   0x01c4, 0x0392, 0x03aa, 0x03b0, 0x03bc, 0x03d7, 0x07d4, 0x07dc,
-   0x07db, 0x07d5, 0x07f0, 0x00c1, 0x07fb, 0x03c8, 0x03a3, 0x0395,
-   0x039d, 0x03ac, 0x03ae, 0x03c5, 0x03d8, 0x03e2, 0x03e6, 0x07e4,
-   0x07e7, 0x07e0, 0x07e9, 0x07f7, 0x0190, 0x07f2, 0x0393, 0x01be,
-   0x01c0, 0x0394, 0x0397, 0x03ad, 0x03c3, 0x03c1, 0x03d2, 0x07da,
-   0x07d9, 0x07df, 0x07eb, 0x07f4, 0x07fa, 0x0195, 0x07f8, 0x03bd,
-   0x039c, 0x03ab, 0x03a8, 0x03b3, 0x03b9, 0x03d0, 0x03e3, 0x03e5,
-   0x07e2, 0x07de, 0x07ed, 0x07f1, 0x07f9, 0x07fc, 0x0193, 0x0ffd,
-   0x03dc, 0x03b6, 0x03c7, 0x03cc, 0x03cb, 0x03d9, 0x03da, 0x07d3,
-   0x07e1, 0x07ee, 0x07ef, 0x07f5, 0x07f6, 0x0ffc, 0x0fff, 0x019d,
-   0x01c2, 0x00b5, 0x00a1, 0x0096, 0x0097, 0x0095, 0x0099, 0x00a0,
-   0x00a2, 0x00ac, 0x00a9, 0x00b1, 0x00b3, 0x00bb, 0x00c0, 0x018f,
-   0x0004
-};
-static const uint8_t raac_hcb11_bits[289] = {
-   4, 5, 6, 7, 8, 8, 9, 10, 10, 10, 11, 11, 12, 11, 12, 12,
-   10, 5, 4, 5, 6, 7, 7, 8, 8, 9, 9, 9, 10, 10, 10, 10,
-   11, 8, 6, 5, 5, 6, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10,
-   10, 10, 8, 7, 6, 6, 6, 7, 7, 8, 8, 8, 9, 9, 9, 10,
-   10, 10, 10, 8, 8, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9,
-   10, 10, 10, 10, 8, 8, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9,
-   9, 10, 10, 10, 10, 8, 9, 8, 8, 8, 8, 8, 8, 8, 9, 9,
-   9, 10, 10, 10, 10, 10, 8, 9, 8, 8, 8, 8, 8, 8, 9, 9,
-   9, 10, 10, 10, 10, 10, 10, 8, 10, 9, 8, 8, 9, 9, 9, 9,
-   9, 10, 10, 10, 10, 10, 10, 11, 8, 10, 9, 9, 9, 9, 9, 9,
-   9, 10, 10, 10, 10, 10, 10, 11, 11, 8, 11, 9, 9, 9, 9, 9,
-   9, 10, 10, 10, 10, 10, 11, 10, 11, 11, 8, 11, 10, 9, 9, 10,
-   9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 8, 11, 10, 10, 10,
-   10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 9, 11, 10, 9,
-   9, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 9, 11, 10,
-   10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 9, 12,
-   10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 12, 12, 9,
-   9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9,
-   5
-};
-static const uint16_t raac_hcb_size[11] = {81,81,81,81,81,81,64,64,169,169,289};
-static const uint16_t *const raac_hcb_code[11] = {
-   raac_hcb1_code, raac_hcb2_code, raac_hcb3_code, raac_hcb4_code, raac_hcb5_code, raac_hcb6_code, raac_hcb7_code, raac_hcb8_code, raac_hcb9_code, raac_hcb10_code, raac_hcb11_code
-};
-static const uint8_t *const raac_hcb_bits[11] = {
-   raac_hcb1_bits, raac_hcb2_bits, raac_hcb3_bits, raac_hcb4_bits, raac_hcb5_bits, raac_hcb6_bits, raac_hcb7_bits, raac_hcb8_bits, raac_hcb9_bits, raac_hcb10_bits, raac_hcb11_bits
-};
-static const uint32_t raac_sf_code[121] = {
-   0x3ffe8, 0x3ffe6, 0x3ffe7, 0x3ffe5, 0x7fff5, 0x7fff1, 0x7ffed, 0x7fff6,
-   0x7ffee, 0x7ffef, 0x7fff0, 0x7fffc, 0x7fffd, 0x7ffff, 0x7fffe, 0x7fff7,
-   0x7fff8, 0x7fffb, 0x7fff9, 0x3ffe4, 0x7fffa, 0x3ffe3, 0x1ffef, 0x1fff0,
-   0x0fff5, 0x1ffee, 0x0fff2, 0x0fff3, 0x0fff4, 0x0fff1, 0x07ff6, 0x07ff7,
-   0x03ff9, 0x03ff5, 0x03ff7, 0x03ff3, 0x03ff6, 0x03ff2, 0x01ff7, 0x01ff5,
-   0x00ff9, 0x00ff7, 0x00ff6, 0x007f9, 0x00ff4, 0x007f8, 0x003f9, 0x003f7,
-   0x003f5, 0x001f8, 0x001f7, 0x000fa, 0x000f8, 0x000f6, 0x00079, 0x0003a,
-   0x00038, 0x0001a, 0x0000b, 0x00004, 0x00000, 0x0000a, 0x0000c, 0x0001b,
-   0x00039, 0x0003b, 0x00078, 0x0007a, 0x000f7, 0x000f9, 0x001f6, 0x001f9,
-   0x003f4, 0x003f6, 0x003f8, 0x007f5, 0x007f4, 0x007f6, 0x007f7, 0x00ff5,
-   0x00ff8, 0x01ff4, 0x01ff6, 0x01ff8, 0x03ff8, 0x03ff4, 0x0fff0, 0x07ff4,
-   0x0fff6, 0x07ff5, 0x3ffe2, 0x7ffd9, 0x7ffda, 0x7ffdb, 0x7ffdc, 0x7ffdd,
-   0x7ffde, 0x7ffd8, 0x7ffd2, 0x7ffd3, 0x7ffd4, 0x7ffd5, 0x7ffd6, 0x7fff2,
-   0x7ffdf, 0x7ffe7, 0x7ffe8, 0x7ffe9, 0x7ffea, 0x7ffeb, 0x7ffe6, 0x7ffe0,
-   0x7ffe1, 0x7ffe2, 0x7ffe3, 0x7ffe4, 0x7ffe5, 0x7ffd7, 0x7ffec, 0x7fff4,
-   0x7fff3
-};
-static const uint8_t raac_sf_bits[121] = {
-   18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
-   19, 19, 19, 18, 19, 18, 17, 17, 16, 17, 16, 16, 16, 16, 15, 15,
-   14, 14, 14, 14, 14, 14, 13, 13, 12, 12, 12, 11, 12, 11, 10, 10,
-   10, 9, 9, 8, 8, 8, 7, 6, 6, 5, 4, 3, 1, 4, 4, 5,
-   6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 10, 11, 11, 11, 11, 12,
-   12, 13, 13, 13, 14, 14, 16, 15, 16, 15, 18, 19, 19, 19, 19, 19,
-   19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
-   19, 19, 19, 19, 19, 19, 19, 19, 19
-};
-static const uint16_t raac_swb_offset_1024_16[44] = {
-   0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88,
-   100, 112, 124, 136, 148, 160, 172, 184, 196, 212, 228, 244,
-   260, 280, 300, 320, 344, 368, 396, 424, 456, 492, 532, 572,
-   616, 664, 716, 772, 832, 896, 960, 1024
-};
-static const uint16_t raac_swb_offset_1024_24[48] = {
-   0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44,
-   52, 60, 68, 76, 84, 92, 100, 108, 116, 124, 136, 148,
-   160, 172, 188, 204, 220, 240, 260, 284, 308, 336, 364, 396,
-   432, 468, 508, 552, 600, 652, 704, 768, 832, 896, 960, 1024
-};
-static const uint16_t raac_swb_offset_1024_32[52] = {
-   0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48,
-   56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160, 176,
-   196, 216, 240, 264, 292, 320, 352, 384, 416, 448, 480, 512,
-   544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896,
-   928, 960, 992, 1024
-};
-static const uint16_t raac_swb_offset_1024_48[50] = {
-   0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48,
-   56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160, 176,
-   196, 216, 240, 264, 292, 320, 352, 384, 416, 448, 480, 512,
-   544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896,
-   928, 1024
-};
-static const uint16_t raac_swb_offset_1024_64[48] = {
-   0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44,
-   48, 52, 56, 64, 72, 80, 88, 100, 112, 124, 140, 156,
-   172, 192, 216, 240, 268, 304, 344, 384, 424, 464, 504, 544,
-   584, 624, 664, 704, 744, 784, 824, 864, 904, 944, 984, 1024
-};
-static const uint16_t raac_swb_offset_1024_8[41] = {
-   0, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132,
-   144, 156, 172, 188, 204, 220, 236, 252, 268, 288, 308, 328,
-   348, 372, 396, 420, 448, 476, 508, 544, 580, 620, 664, 712,
-   764, 820, 880, 944, 1024
-};
-static const uint16_t raac_swb_offset_1024_96[42] = {
-   0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44,
-   48, 52, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-   156, 172, 188, 212, 240, 276, 320, 384, 448, 512, 576, 640,
-   704, 768, 832, 896, 960, 1024
-};
-static const uint16_t *const raac_swb_offset_1024[13] = {
-   raac_swb_offset_1024_96, raac_swb_offset_1024_96, raac_swb_offset_1024_64,
-   raac_swb_offset_1024_48, raac_swb_offset_1024_48, raac_swb_offset_1024_32,
-   raac_swb_offset_1024_24, raac_swb_offset_1024_24, raac_swb_offset_1024_16,
-   raac_swb_offset_1024_16, raac_swb_offset_1024_16, raac_swb_offset_1024_8,
-   raac_swb_offset_1024_8
-};
+#include "raac_tables.h"
+
 static const uint16_t raac_swb_offset_128_16[16] = {
    0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 60,
    72, 88, 108, 128
@@ -679,9 +317,6 @@ static const uint16_t *const raac_swb_offset_128[13] = {
    raac_swb_offset_128_16, raac_swb_offset_128_16, raac_swb_offset_128_8,
    raac_swb_offset_128_8
 };
-static const uint8_t raac_num_swb_1024[13] = {
-   41, 41, 47, 49, 49, 51, 47, 47, 43, 43, 43, 40, 40
-};
 static const uint8_t raac_num_swb_128[13] = {
    12, 12, 12, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15
 };
@@ -695,10 +330,6 @@ static const uint8_t raac_tns_max_bands_128[13] = {
    9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14
 };
 
-static const unsigned raac_sample_rates[13] = {
-   96000, 88200, 64000, 48000, 44100, 32000,
-   24000, 22050, 16000, 12000, 11025, 8000, 7350
-};
 
 /* ===== bit reader (MSB first) ===== */
 
@@ -1817,6 +1448,15 @@ struct raac
    unsigned out_rate;         /* rate reported to the caller */
    raac_qmf_ch *qmf;          /* one per output channel when sbr_mode */
    raac_sbr_scratch *sbx;     /* shared HF scratch, same lifetime    */
+   unsigned out_channels;     /* channels, or 2 for mono SBR, which
+                               * may carry parametric stereo        */
+   struct raac_ps_state   *ps;      /* PS state, tables and scratch,  */
+   struct raac_ps_tables  *pst;     /* allocated for mono SBR only    */
+   struct raac_ps_scratch *psx;
+   uint8_t  out_map[RAAC_MAX_CH];    /* output channel -> element
+                                      * channel, by the chosen order */
+   uint8_t  wave_map[RAAC_MAX_CH];   /* that map for WAVE order      */
+   int      has_wave_map;            /* the layout has a WAVE order  */
    int8_t   sbr_map[RAAC_MAX_CH];    /* this frame: SBR slot per
                                       * output channel, -1 if none  */
    int8_t   sbr_map_ch[RAAC_MAX_CH]; /* 0/1: which element channel  */
@@ -4984,6 +4624,1141 @@ static int raac_sbr_read_cpe(raac_t *a, raac_sbr *s, raac_bits *b)
  * turns SBR off for the element rather than failing the frame, as
  * reference decoders do. Synthesis is not yet wired up: this stage
  * carries the complete bitstream layer and band tables. */
+/* PS Huffman books (14496-3 Table 8.B), code and length per symbol */
+static const uint32_t raac_ps_iid_df1_code[61] =
+{
+   0x1feb4, 0x1feb5, 0x1fd76, 0x1fd77, 0x1fd74, 0x1fd75,
+   0x1fe8a, 0x1fe8b, 0x1fe88, 0x0fe80, 0x1feb6, 0x0fe82,
+   0x0feb8, 0x07f42, 0x07fae, 0x03faf, 0x01fd1, 0x01fe9,
+   0x00fe9, 0x007ea, 0x007fb, 0x003fb, 0x001fb, 0x001ff,
+   0x0007c, 0x0003c, 0x0001c, 0x0000c, 0x00000, 0x00001,
+   0x00001, 0x00002, 0x00001, 0x0000d, 0x0001d, 0x0003d,
+   0x0007d, 0x000fc, 0x001fc, 0x003fc, 0x003f4, 0x007eb,
+   0x00fea, 0x01fea, 0x01fd6, 0x03fd0, 0x07faf, 0x07f43,
+   0x0feb9, 0x0fe83, 0x1feb7, 0x0fe81, 0x1fe89, 0x1fe8e,
+   0x1fe8f, 0x1fe8c, 0x1fe8d, 0x1feb2, 0x1feb3, 0x1feb0,
+   0x1feb1
+};
+static const uint8_t raac_ps_iid_df1_bits[61] =
+{
+   18, 18, 18, 18, 18, 18, 18, 18, 18, 17, 18, 17,
+   17, 16, 16, 15, 14, 14, 13, 12, 12, 11, 10, 10,
+    8,  7,  6,  5,  4,  3,  1,  3,  4,  5,  6,  7,
+    8,  9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16,
+   17, 17, 18, 17, 18, 18, 18, 18, 18, 18, 18, 18,
+   18
+};
+static const uint32_t raac_ps_iid_dt1_code[61] =
+{
+   0x04ed4, 0x04ed5, 0x04ece, 0x04ecf, 0x04ecc, 0x04ed6,
+   0x04ed8, 0x04f46, 0x04f60, 0x02718, 0x02719, 0x02764,
+   0x02765, 0x0276d, 0x027b1, 0x013b7, 0x013d6, 0x009c7,
+   0x009e9, 0x009ed, 0x004ee, 0x004f7, 0x00278, 0x00139,
+   0x0009a, 0x0009f, 0x00020, 0x00011, 0x0000a, 0x00003,
+   0x00001, 0x00000, 0x0000b, 0x00012, 0x00021, 0x0004c,
+   0x0009b, 0x0013a, 0x00279, 0x00270, 0x004ef, 0x004e2,
+   0x009ea, 0x009d8, 0x013d7, 0x013d0, 0x027b2, 0x027a2,
+   0x0271a, 0x0271b, 0x04f66, 0x04f67, 0x04f61, 0x04f47,
+   0x04ed9, 0x04ed7, 0x04ecd, 0x04ed2, 0x04ed3, 0x04ed0,
+   0x04ed1
+};
+static const uint8_t raac_ps_iid_dt1_bits[61] =
+{
+   16, 16, 16, 16, 16, 16, 16, 16, 16, 15, 15, 15,
+   15, 15, 15, 14, 14, 13, 13, 13, 12, 12, 11, 10,
+    9,  9,  7,  6,  5,  3,  1,  2,  5,  6,  7,  8,
+    9, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15,
+   15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+   16
+};
+static const uint32_t raac_ps_iid_df0_code[29] =
+{
+   0x1fffb, 0x1fffc, 0x1fffd, 0x1fffa, 0x0fffc, 0x07ffc,
+   0x01ffd, 0x003fe, 0x001fe, 0x0007e, 0x0003c, 0x0001d,
+   0x0000d, 0x00005, 0x00000, 0x00004, 0x0000c, 0x0001c,
+   0x0003d, 0x0003e, 0x000fe, 0x007fe, 0x01ffc, 0x03ffc,
+   0x03ffd, 0x07ffd, 0x1fffe, 0x3fffe, 0x3ffff
+};
+static const uint8_t raac_ps_iid_df0_bits[29] =
+{
+   17, 17, 17, 17, 16, 15, 13, 10,  9,  7,  6,  5,
+    4,  3,  1,  3,  4,  5,  6,  6,  8, 11, 13, 14,
+   14, 15, 17, 18, 18
+};
+static const uint32_t raac_ps_iid_dt0_code[29] =
+{
+   0x7fff9, 0x7fffa, 0x7fffb, 0xffff8, 0xffff9, 0xffffa,
+   0x1fffd, 0x07ffe, 0x00ffe, 0x003fe, 0x000fe, 0x0003e,
+   0x0000e, 0x00002, 0x00000, 0x00006, 0x0001e, 0x0007e,
+   0x001fe, 0x007fe, 0x01ffe, 0x03ffe, 0x1fffc, 0x7fff8,
+   0xffffb, 0xffffc, 0xffffd, 0xffffe, 0xfffff
+};
+static const uint8_t raac_ps_iid_dt0_bits[29] =
+{
+   19, 19, 19, 20, 20, 20, 17, 15, 12, 10,  8,  6,
+    4,  2,  1,  3,  5,  7,  9, 11, 13, 14, 17, 19,
+   20, 20, 20, 20, 20
+};
+static const uint32_t raac_ps_icc_df_code[15] =
+{
+   0x03fff, 0x03ffe, 0x00ffe, 0x003fe, 0x0007e, 0x0001e,
+   0x00006, 0x00000, 0x00002, 0x0000e, 0x0003e, 0x000fe,
+   0x001fe, 0x007fe, 0x01ffe
+};
+static const uint8_t raac_ps_icc_df_bits[15] =
+{
+   14, 14, 12, 10,  7,  5,  3,  1,  2,  4,  6,  8,
+    9, 11, 13
+};
+static const uint32_t raac_ps_icc_dt_code[15] =
+{
+   0x03ffe, 0x01ffe, 0x007fe, 0x001fe, 0x0007e, 0x0001e,
+   0x00006, 0x00000, 0x00002, 0x0000e, 0x0003e, 0x000fe,
+   0x003fe, 0x00ffe, 0x03fff
+};
+static const uint8_t raac_ps_icc_dt_bits[15] =
+{
+   14, 13, 11,  9,  7,  5,  3,  1,  2,  4,  6,  8,
+   10, 12, 14
+};
+static const uint32_t raac_ps_ipd_df_code[8] =
+{
+   0x00001, 0x00000, 0x00006, 0x00004, 0x00002, 0x00003,
+   0x00005, 0x00007
+};
+static const uint8_t raac_ps_ipd_df_bits[8] =
+{
+    1,  3,  4,  4,  4,  4,  4,  4
+};
+static const uint32_t raac_ps_ipd_dt_code[8] =
+{
+   0x00001, 0x00002, 0x00002, 0x00003, 0x00002, 0x00000,
+   0x00003, 0x00003
+};
+static const uint8_t raac_ps_ipd_dt_bits[8] =
+{
+    1,  3,  4,  5,  5,  4,  4,  3
+};
+static const uint32_t raac_ps_opd_df_code[8] =
+{
+   0x00001, 0x00001, 0x00006, 0x00004, 0x0000f, 0x0000e,
+   0x00005, 0x00000
+};
+static const uint8_t raac_ps_opd_df_bits[8] =
+{
+    1,  3,  4,  4,  5,  5,  4,  3
+};
+static const uint32_t raac_ps_opd_dt_code[8] =
+{
+   0x00001, 0x00002, 0x00001, 0x00007, 0x00006, 0x00000,
+   0x00002, 0x00003
+};
+static const uint8_t raac_ps_opd_dt_bits[8] =
+{
+    1,  3,  4,  5,  5,  4,  4,  3
+};
+
+/* ===== HE-AAC v2 parametric stereo (ISO/IEC 14496-3 8.6.4) =====
+ *
+ * The mono SBR signal is split further into hybrid subbands (QMF bands
+ * 0-2, or 0-4 in 34-band mode, through 13-tap filters), decorrelated
+ * by fractional-delay all-pass chains, then mixed into left and right
+ * by per-band 2x2 matrices built from the transmitted intensity,
+ * coherence and phase differences, interpolated across envelopes. */
+
+#define RAAC_PS_MAX_ENV   5
+#define RAAC_PS_MAX_PAR   34
+#define RAAC_PS_MAX_PD    17
+#define RAAC_PS_MAX_SSB   91
+#define RAAC_PS_MAX_AP    50
+#define RAAC_PS_LINKS     3
+#define RAAC_PS_MAX_DELAY 14
+#define RAAC_PS_AP_DELAY  5
+
+static const raac_sbr_book raac_ps_books[10] =
+{
+   { raac_ps_iid_df1_code, raac_ps_iid_df1_bits, 61 },
+   { raac_ps_iid_dt1_code, raac_ps_iid_dt1_bits, 61 },
+   { raac_ps_iid_df0_code, raac_ps_iid_df0_bits, 29 },
+   { raac_ps_iid_dt0_code, raac_ps_iid_dt0_bits, 29 },
+   { raac_ps_icc_df_code,  raac_ps_icc_df_bits,  15 },
+   { raac_ps_icc_dt_code,  raac_ps_icc_dt_bits,  15 },
+   { raac_ps_ipd_df_code,  raac_ps_ipd_df_bits,   8 },
+   { raac_ps_ipd_dt_code,  raac_ps_ipd_dt_bits,   8 },
+   { raac_ps_opd_df_code,  raac_ps_opd_df_bits,   8 },
+   { raac_ps_opd_dt_code,  raac_ps_opd_dt_bits,   8 }
+};
+
+/* parameter count per iid/icc mode, and the ipd/opd count beside it */
+static const int8_t raac_ps_nr_par[6] = { 10, 20, 34, 10, 20, 34 };
+static const int8_t raac_ps_nr_pd[6]  = {  5, 11, 17,  5, 11, 17 };
+
+/* parameter band of each hybrid band (Tables 8.48 and 8.49) */
+static const int8_t raac_ps_k_to_i_20[71] =
+{
+    1,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 14,
+   15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18,
+   18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+   19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19
+};
+static const int8_t raac_ps_k_to_i_34[91] =
+{
+    0,  1,  2,  3,  4,  5,  6,  6,  7,  2,  1,  0, 10, 10,  4,  5,  6,  7,
+    8,  9, 10, 11, 12,  9, 14, 11, 12, 13, 14, 15, 16, 13, 16, 17, 18, 19,
+   20, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 26, 27, 27, 27, 28, 28, 28,
+   29, 29, 29, 30, 30, 30, 31, 31, 31, 31, 32, 32, 32, 32, 33, 33, 33, 33,
+   33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+   33
+};
+
+/* by 34-band mode: parameter bands, ipd/opd bands, hybrid bands, first
+ * band of the all-pass decay slope, all-pass bands, first band with the
+ * one-slot delay */
+static const int raac_ps_nr_par_bands[2]  = { 20, 34 };
+static const int raac_ps_nr_pd_bands[2]   = { 11, 17 };
+static const int raac_ps_nr_bands[2]      = { 71, 91 };
+static const int raac_ps_decay_cutoff[2]  = { 10, 32 };
+static const int raac_ps_nr_ap_bands[2]   = { 30, 50 };
+static const int raac_ps_short_delay[2]   = { 42, 62 };
+
+/* constant tables, built at open */
+typedef struct raac_ps_tables
+{
+   float pd_re[512], pd_im[512];       /* smoothed phase, by the last
+                                         * three phase indices          */
+   float HA[46][8][4], HB[46][8][4];   /* mixing matrices, by iid, icc */
+   float f20_0_8[8][13][2];
+   float f34_0_12[12][13][2];
+   float f34_1_8[8][13][2];
+   float f34_2_4[4][13][2];
+   float q_fract[2][50][3][2];         /* all-pass link phases          */
+   float phi_fract[2][50][2];
+} raac_ps_tables;
+
+typedef struct raac_ps_state
+{
+   /* bitstream state */
+   int    start;
+   int    enable_iid, iid_quant, nr_iid_par, nr_ipdopd_par;
+   int    enable_icc, icc_mode, nr_icc_par;
+   int    enable_ext, enable_ipdopd;
+   int    num_env, num_env_old;
+   int    border[RAAC_PS_MAX_ENV + 1];
+   int8_t iid_par[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t icc_par[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t ipd_par[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t opd_par[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int    is34, is34_old;
+   /* processing state */
+   float  in_buf[5][44][2];
+   float  delay[RAAC_PS_MAX_SSB][32 + RAAC_PS_MAX_DELAY][2];
+   float  ap_delay[RAAC_PS_MAX_AP][RAAC_PS_LINKS][32 + RAAC_PS_AP_DELAY][2];
+   float  peak_decay_nrg[RAAC_PS_MAX_PAR];
+   float  power_smooth[RAAC_PS_MAX_PAR];
+   float  peak_decay_diff_smooth[RAAC_PS_MAX_PAR];
+   float  H[4][2][RAAC_PS_MAX_ENV + 1][RAAC_PS_MAX_PAR];
+   int8_t opd_hist[RAAC_PS_MAX_PAR];
+   int8_t ipd_hist[RAAC_PS_MAX_PAR];
+} raac_ps;
+
+/* frame-local scratch */
+typedef struct raac_ps_scratch
+{
+   float L[RAAC_PS_MAX_SSB][32][2];
+   float R[RAAC_PS_MAX_SSB][32][2];
+   float power[RAAC_PS_MAX_PAR][32];
+   float gain[RAAC_PS_MAX_PAR][32];
+   float XR[2][38][64];
+} raac_ps_scratch;
+
+static void raac_ps_make_filter(float (*f)[13][2], const float *proto,
+      int bands)
+{
+   int q, n;
+   for (q = 0; q < bands; q++)
+      for (n = 0; n < 13; n++)
+      {
+         double theta = 2.0 * M_PI * (q + 0.5) * (n - 6) / bands;
+         float  g     = proto[n < 7 ? n : 12 - n];
+         f[q][n][0]   = g * (float)cos(theta);
+         f[q][n][1]   = g * (float)-sin(theta);
+      }
+}
+
+static void raac_ps_tables_init(raac_ps_tables *t)
+{
+   /* hybrid filter prototypes, first half (they are symmetric) */
+   static const float g0_8[7]  = {
+      0.00746082949812f, 0.02270420949825f, 0.04546865930473f,
+      0.07266113929591f, 0.09885108575264f, 0.11793710567217f, 0.125f };
+   static const float g0_12[7] = {
+      0.04081179924692f, 0.03812810994926f, 0.05144908135699f,
+      0.06399831151592f, 0.07428313801106f, 0.08100347892914f,
+      0.08333333333333f };
+   static const float g1_8[7]  = {
+      0.01565675600122f, 0.03752716391991f, 0.05417891378782f,
+      0.08417044116767f, 0.10307344158036f, 0.12222452249753f, 0.125f };
+   static const float g2_4[7]  = {
+      -0.05908211155639f, -0.04871498374946f, 0.0f, 0.07778723915851f,
+      0.16486303567403f, 0.23279856662996f, 0.25f };
+   /* iid dequantised, default steps then fine steps (Table 8.25) */
+   static const double iid_dq[46] = {
+      0.05623413251903, 0.12589254117942, 0.19952623149689,
+      0.31622776601684, 0.44668359215096, 0.63095734448019,
+      0.79432823472428, 1, 1.25892541179417, 1.58489319246111,
+      2.23872113856834, 3.16227766016838, 5.01187233627272,
+      7.94328234724282, 17.7827941003892,
+      0.00316227766017, 0.00562341325190, 0.01, 0.01778279410039,
+      0.03162277660168, 0.05623413251903, 0.07943282347243,
+      0.11220184543020, 0.15848931924611, 0.22387211385683,
+      0.31622776601684, 0.39810717055350, 0.50118723362727,
+      0.63095734448019, 0.79432823472428, 1, 1.25892541179417,
+      1.58489319246111, 1.99526231496888, 2.51188643150958,
+      3.16227766016838, 4.46683592150963, 6.30957344480193,
+      8.91250938133745, 12.5892541179417, 17.7827941003892,
+      31.6227766016838, 56.2341325190349, 100, 177.827941003892,
+      316.227766016837 };
+   static const float icc_dq[8] = {
+      1, 0.937f, 0.84118f, 0.60092f, 0.36764f, 0, -0.589f, -1 };
+   static const float acos_icc_dq[8] = {
+      0, 0.35685527f, 0.57133466f, 0.92614472f, 1.1943263f,
+      (float)(M_PI / 2), 2.2006171f, (float)M_PI };
+   static const int8_t f_center_20[10] = {
+      -3, -1, 1, 3, 5, 7, 10, 14, 18, 22 };
+   static const int8_t f_center_34[32] = {
+        2,  6, 10, 14,  18, 22, 26, 30, 34, -10, -6, -2, 51, 57, 15, 21,
+       27, 33, 39, 45,  54, 66, 78, 42, 102, 66, 78, 90, 102, 114, 126, 90 };
+   static const float frac_links[3] = { 0.43f, 0.75f, 0.347f };
+   static const float pd_cos[8] = {
+      1, 0.70710678f, 0, -0.70710678f, -1, -0.70710678f, 0, 0.70710678f };
+   static const float pd_sin[8] = {
+      0, 0.70710678f, 1, 0.70710678f, 0, -0.70710678f, -1, -0.70710678f };
+   int i, j, k, m;
+
+   for (i = 0; i < 8; i++)
+      for (j = 0; j < 8; j++)
+         for (k = 0; k < 8; k++)
+         {
+            float re  = 0.25f * pd_cos[i] + 0.5f * pd_cos[j] + pd_cos[k];
+            float im  = 0.25f * pd_sin[i] + 0.5f * pd_sin[j] + pd_sin[k];
+            float mag = (float)(1.0 / sqrt((double)re * re + (double)im * im));
+            t->pd_re[i * 64 + j * 8 + k] = re * mag;
+            t->pd_im[i * 64 + j * 8 + k] = im * mag;
+         }
+
+   for (i = 0; i < 46; i++)
+   {
+      float c  = (float)iid_dq[i];
+      float c1 = (float)sqrt(2.0) / (float)sqrt(1.0f + c * c);
+      float c2 = c * c1;
+      for (j = 0; j < 8; j++)
+      {
+         /* mixing procedure R_a (icc modes 0-2) */
+         float alpha = 0.5f * acos_icc_dq[j];
+         float beta  = alpha * (c1 - c2) * 0.70710678f;
+         float rho, gamma, mu;
+         t->HA[i][j][0] = c2 * (float)cos(beta + alpha);
+         t->HA[i][j][1] = c1 * (float)cos(beta - alpha);
+         t->HA[i][j][2] = c2 * (float)sin(beta + alpha);
+         t->HA[i][j][3] = c1 * (float)sin(beta - alpha);
+         /* and R_b (icc modes 3-5) */
+         rho   = icc_dq[j] > 0.05f ? icc_dq[j] : 0.05f;
+         alpha = 0.5f * (float)atan2(2.0f * c * rho, c * c - 1.0f);
+         mu    = c + 1.0f / c;
+         mu    = (float)sqrt(1 + (4 * rho * rho - 4) / (mu * mu));
+         gamma = (float)atan(sqrt((1.0f - mu) / (1.0f + mu)));
+         if (alpha < 0)
+            alpha += (float)(M_PI / 2);
+         t->HB[i][j][0] =  1.41421356f * (float)cos(alpha) * (float)cos(gamma);
+         t->HB[i][j][1] =  1.41421356f * (float)sin(alpha) * (float)cos(gamma);
+         t->HB[i][j][2] = -1.41421356f * (float)sin(alpha) * (float)sin(gamma);
+         t->HB[i][j][3] =  1.41421356f * (float)cos(alpha) * (float)sin(gamma);
+      }
+   }
+
+   for (j = 0; j < 2; j++)
+      for (k = 0; k < raac_ps_nr_ap_bands[j]; k++)
+      {
+         double fc, theta;
+         if (!j)
+            fc = k < 10 ? f_center_20[k] * 0.125 : k - 6.5;
+         else
+            fc = k < 32 ? f_center_34[k] / 24.0 : k - 26.5;
+         for (m = 0; m < RAAC_PS_LINKS; m++)
+         {
+            theta = -M_PI * frac_links[m] * fc;
+            t->q_fract[j][k][m][0] = (float)cos(theta);
+            t->q_fract[j][k][m][1] = (float)sin(theta);
+         }
+         theta = -M_PI * 0.39 * fc;
+         t->phi_fract[j][k][0] = (float)cos(theta);
+         t->phi_fract[j][k][1] = (float)sin(theta);
+      }
+
+   raac_ps_make_filter(t->f20_0_8,  g0_8,   8);
+   raac_ps_make_filter(t->f34_0_12, g0_12, 12);
+   raac_ps_make_filter(t->f34_1_8,  g1_8,   8);
+   raac_ps_make_filter(t->f34_2_4,  g2_4,   4);
+}
+
+/* One envelope of parameters, delta coded across frequency or, with
+ * dt, against the envelope before. Returns -1 on a value out of range. */
+static int raac_ps_read_par(raac_bits *b, raac_ps *ps,
+      int8_t (*par)[RAAC_PS_MAX_PAR], int num, int book, int offset,
+      int e, int dt, int mask, int max_abs)
+{
+   int i, v = 0;
+   int e_prev = e ? e - 1 : ps->num_env_old - 1;
+   if (e_prev < 0)
+      e_prev = 0;
+   for (i = 0; i < num; i++)
+   {
+      int sym = raac_sbr_huff(b, &raac_ps_books[book]);
+      if (sym < 0)
+         return -1;
+      if (dt)
+         v = par[e_prev][i] + sym + offset;
+      else
+         v += sym + offset;
+      if (mask)
+         v &= mask;
+      par[e][i] = (int8_t)v;
+      if (!mask && (v < -max_abs || v > max_abs))
+         return -1;
+   }
+   return 0;
+}
+
+static void raac_ps_clear_par(raac_ps *ps)
+{
+   memset(ps->iid_par, 0, sizeof(ps->iid_par));
+   memset(ps->icc_par, 0, sizeof(ps->icc_par));
+   memset(ps->ipd_par, 0, sizeof(ps->ipd_par));
+   memset(ps->opd_par, 0, sizeof(ps->opd_par));
+}
+
+/* ps_data (14496-3 Table 8.1). Returns the bits it took, never more
+ * than bits_left; on an error it takes them all and stops PS until the
+ * next header. */
+static int raac_ps_read(raac_ps *ps, raac_bits *b, int bits_left)
+{
+   static const int8_t num_env_tab[2][4] = { { 0, 1, 2, 4 },
+                                              { 1, 2, 3, 4 } };
+   size_t start_pos = b->pos;
+   int    e, header, used;
+
+   header = (int)raac_getbits(b, 1);
+   if (header)
+   {
+      ps->enable_iid = (int)raac_getbits(b, 1);
+      if (ps->enable_iid)
+      {
+         int mode = (int)raac_getbits(b, 3);
+         if (mode > 5)
+            goto err;
+         ps->nr_iid_par    = raac_ps_nr_par[mode];
+         ps->iid_quant     = mode > 2;
+         ps->nr_ipdopd_par = raac_ps_nr_pd[mode];
+      }
+      ps->enable_icc = (int)raac_getbits(b, 1);
+      if (ps->enable_icc)
+      {
+         ps->icc_mode = (int)raac_getbits(b, 3);
+         if (ps->icc_mode > 5)
+            goto err;
+         ps->nr_icc_par = raac_ps_nr_par[ps->icc_mode];
+      }
+      ps->enable_ext = (int)raac_getbits(b, 1);
+   }
+
+   {
+      int frame_class = (int)raac_getbits(b, 1);
+      ps->num_env_old = ps->num_env;
+      ps->num_env     = num_env_tab[frame_class][raac_getbits(b, 2)];
+      ps->border[0]   = -1;
+      if (frame_class)
+      {
+         for (e = 1; e <= ps->num_env; e++)
+         {
+            ps->border[e] = (int)raac_getbits(b, 5);
+            if (ps->border[e] < ps->border[e - 1])
+               goto err;
+         }
+      }
+      else
+      {
+         int sh = ps->num_env == 4 ? 2 : ps->num_env == 2 ? 1 : 0;
+         for (e = 1; e <= ps->num_env; e++)
+            ps->border[e] = (e * 32 >> sh) - 1;
+      }
+   }
+
+   if (ps->enable_iid)
+   {
+      for (e = 0; e < ps->num_env; e++)
+      {
+         int dt = (int)raac_getbits(b, 1);
+         if (raac_ps_read_par(b, ps, ps->iid_par, ps->nr_iid_par,
+               ps->iid_quant ? dt : 2 + dt, ps->iid_quant ? -30 : -14,
+               e, dt, 0, 7 + 8 * ps->iid_quant) < 0)
+            goto err;
+      }
+   }
+   else
+      memset(ps->iid_par, 0, sizeof(ps->iid_par));
+
+   if (ps->enable_icc)
+   {
+      for (e = 0; e < ps->num_env; e++)
+      {
+         int dt = (int)raac_getbits(b, 1);
+         if (raac_ps_read_par(b, ps, ps->icc_par, ps->nr_icc_par, 4 + dt,
+               -7, e, dt, 0, 7) < 0)
+            goto err;
+         for (used = 0; used < ps->nr_icc_par; used++)
+            if (ps->icc_par[e][used] < 0)
+               goto err;
+      }
+   }
+   else
+      memset(ps->icc_par, 0, sizeof(ps->icc_par));
+
+   if (ps->enable_ext)
+   {
+      int cnt = (int)raac_getbits(b, 4);
+      if (cnt == 15)
+         cnt += (int)raac_getbits(b, 8);
+      cnt *= 8;
+      while (cnt > 7)
+      {
+         int    id = (int)raac_getbits(b, 2);
+         size_t at = b->pos;
+         if (id == 0)
+         {
+            /* ps_extension: ipd/opd */
+            ps->enable_ipdopd = (int)raac_getbits(b, 1);
+            if (ps->enable_ipdopd)
+               for (e = 0; e < ps->num_env; e++)
+               {
+                  int dt = (int)raac_getbits(b, 1);
+                  if (raac_ps_read_par(b, ps, ps->ipd_par, ps->nr_ipdopd_par,
+                        6 + dt, 0, e, dt, 7, 0) < 0)
+                     goto err;
+                  dt = (int)raac_getbits(b, 1);
+                  if (raac_ps_read_par(b, ps, ps->opd_par, ps->nr_ipdopd_par,
+                        8 + dt, 0, e, dt, 7, 0) < 0)
+                     goto err;
+               }
+            raac_getbits(b, 1);   /* reserved_ps */
+         }
+         cnt -= 2 + (int)(b->pos - at);
+      }
+      if (cnt < 0)
+         goto err;
+      b->pos += (size_t)cnt;
+   }
+
+   /* the last envelope ends at the frame end; when it does not, one
+    * more envelope repeats the last parameters up to it */
+   if (!ps->num_env || ps->border[ps->num_env] < 31)
+   {
+      int src = ps->num_env ? ps->num_env - 1 : ps->num_env_old - 1;
+      if (src >= 0 && src != ps->num_env)
+      {
+         memcpy(ps->iid_par[ps->num_env], ps->iid_par[src],
+               sizeof(ps->iid_par[0]));
+         memcpy(ps->icc_par[ps->num_env], ps->icc_par[src],
+               sizeof(ps->icc_par[0]));
+         memcpy(ps->ipd_par[ps->num_env], ps->ipd_par[src],
+               sizeof(ps->ipd_par[0]));
+         memcpy(ps->opd_par[ps->num_env], ps->opd_par[src],
+               sizeof(ps->opd_par[0]));
+      }
+      /* a previous frame's envelope may be of the other iid resolution */
+      for (e = 0; e < ps->nr_iid_par; e++)
+      {
+         int v = ps->iid_par[ps->num_env][e];
+         if (ps->enable_iid && (v < -7 - 8 * ps->iid_quant
+                  || v > 7 + 8 * ps->iid_quant))
+            goto err;
+      }
+      ps->num_env++;
+      ps->border[ps->num_env] = 31;
+   }
+
+   ps->is34_old = ps->is34;
+   if (ps->enable_iid || ps->enable_icc)
+      ps->is34 = (ps->enable_iid && ps->nr_iid_par == 34)
+              || (ps->enable_icc && ps->nr_icc_par == 34);
+
+   if (!ps->enable_ipdopd)
+   {
+      memset(ps->ipd_par, 0, sizeof(ps->ipd_par));
+      memset(ps->opd_par, 0, sizeof(ps->opd_par));
+   }
+   if (header)
+      ps->start = 1;
+
+   if (b->err)
+      goto err;
+   used = (int)(b->pos - start_pos);
+   if (used <= bits_left)
+      return used;
+err:
+   ps->start = 0;
+   b->err    = 0;
+   b->pos    = start_pos + (size_t)bits_left;
+   raac_ps_clear_par(ps);
+   return bits_left;
+}
+
+/* out[i] = sum over the 13 taps of filter * in, for each of n bands
+ * of filter, stored stride bands apart */
+static void raac_ps_hybrid_cx(float (*out)[2], const float (*in)[2],
+      const float (*f)[13][2], int stride, int n)
+{
+   int q, j;
+   for (q = 0; q < n; q++)
+   {
+      float re = 0.0f, im = 0.0f;
+      for (j = 0; j < 13; j++)
+      {
+         re += f[q][j][0] * in[j][0] - f[q][j][1] * in[j][1];
+         im += f[q][j][0] * in[j][1] + f[q][j][1] * in[j][0];
+      }
+      out[q * stride][0] = re;
+      out[q * stride][1] = im;
+   }
+}
+
+/* two real-filtered halves of a band, the upper first when reverse */
+static void raac_ps_hybrid2(const float (*in)[2], float (*out)[32][2],
+      int reverse)
+{
+   static const float g1[7] = { 0.0f, 0.01899487526049f, 0.0f,
+      -0.07293139167538f, 0.0f, 0.30596630545168f, 0.5f };
+   int i, j;
+   for (i = 0; i < 32; i++, in++)
+   {
+      float re_in = g1[6] * in[6][0], im_in = g1[6] * in[6][1];
+      float re_op = 0.0f, im_op = 0.0f;
+      for (j = 1; j < 6; j += 2)
+      {
+         re_op += g1[j] * (in[j][0] + in[12 - j][0]);
+         im_op += g1[j] * (in[j][1] + in[12 - j][1]);
+      }
+      out[ reverse][i][0] = re_in + re_op;
+      out[ reverse][i][1] = im_in + im_op;
+      out[!reverse][i][0] = re_in - re_op;
+      out[!reverse][i][1] = im_in - im_op;
+   }
+}
+
+static void raac_ps_hybrid_analysis(raac_ps *ps, const raac_ps_tables *t,
+      float (*out)[32][2], float X[2][38][64])
+{
+   int i, j, k;
+   for (i = 0; i < 5; i++)
+      for (j = 0; j < 38; j++)
+      {
+         ps->in_buf[i][j + 6][0] = X[0][j][i];
+         ps->in_buf[i][j + 6][1] = X[1][j][i];
+      }
+   if (ps->is34)
+   {
+      for (i = 0; i < 32; i++)
+      {
+         raac_ps_hybrid_cx(&out[ 0][i], (const float (*)[2])ps->in_buf[0] + i,
+               t->f34_0_12, 32, 12);
+         raac_ps_hybrid_cx(&out[12][i], (const float (*)[2])ps->in_buf[1] + i,
+               t->f34_1_8, 32, 8);
+         raac_ps_hybrid_cx(&out[20][i], (const float (*)[2])ps->in_buf[2] + i,
+               t->f34_2_4, 32, 4);
+         raac_ps_hybrid_cx(&out[24][i], (const float (*)[2])ps->in_buf[3] + i,
+               t->f34_2_4, 32, 4);
+         raac_ps_hybrid_cx(&out[28][i], (const float (*)[2])ps->in_buf[4] + i,
+               t->f34_2_4, 32, 4);
+      }
+      k = 27;
+   }
+   else
+   {
+      for (i = 0; i < 32; i++)
+      {
+         float tmp[8][2];
+         raac_ps_hybrid_cx(tmp, (const float (*)[2])ps->in_buf[0] + i,
+               t->f20_0_8, 1, 8);
+         out[0][i][0] = tmp[6][0];
+         out[0][i][1] = tmp[6][1];
+         out[1][i][0] = tmp[7][0];
+         out[1][i][1] = tmp[7][1];
+         out[2][i][0] = tmp[0][0];
+         out[2][i][1] = tmp[0][1];
+         out[3][i][0] = tmp[1][0];
+         out[3][i][1] = tmp[1][1];
+         out[4][i][0] = tmp[2][0] + tmp[5][0];
+         out[4][i][1] = tmp[2][1] + tmp[5][1];
+         out[5][i][0] = tmp[3][0] + tmp[4][0];
+         out[5][i][1] = tmp[3][1] + tmp[4][1];
+      }
+      raac_ps_hybrid2((const float (*)[2])ps->in_buf[1], out + 6, 1);
+      raac_ps_hybrid2((const float (*)[2])ps->in_buf[2], out + 8, 0);
+      k = 7;
+   }
+   /* the remaining QMF bands pass through */
+   for (i = ps->is34 ? 5 : 3; i < 64; i++)
+      for (j = 0; j < 32; j++)
+      {
+         out[k + i][j][0] = X[0][j][i];
+         out[k + i][j][1] = X[1][j][i];
+      }
+   for (i = 0; i < 5; i++)
+      memcpy(ps->in_buf[i], ps->in_buf[i] + 32, 6 * sizeof(ps->in_buf[i][0]));
+}
+
+static void raac_ps_hybrid_synthesis(float X[2][38][64], float (*in)[32][2],
+      int is34)
+{
+   int i, n, k;
+   for (n = 0; n < 32; n++)
+   {
+      for (k = 0; k < 5; k++)
+      {
+         X[0][n][k] = 0.0f;
+         X[1][n][k] = 0.0f;
+      }
+      if (is34)
+      {
+         static const int8_t first[6] = { 0, 12, 20, 24, 28, 32 };
+         for (k = 0; k < 5; k++)
+            for (i = first[k]; i < first[k + 1]; i++)
+            {
+               X[0][n][k] += in[i][n][0];
+               X[1][n][k] += in[i][n][1];
+            }
+      }
+      else
+      {
+         static const int8_t first[4] = { 0, 6, 8, 10 };
+         for (k = 0; k < 3; k++)
+            for (i = first[k]; i < first[k + 1]; i++)
+            {
+               X[0][n][k] += in[i][n][0];
+               X[1][n][k] += in[i][n][1];
+            }
+      }
+   }
+   for (k = is34 ? 5 : 3; k < 64; k++)
+      for (n = 0; n < 32; n++)
+      {
+         X[0][n][k] = in[k + (is34 ? 27 : 7)][n][0];
+         X[1][n][k] = in[k + (is34 ? 27 : 7)][n][1];
+      }
+}
+
+/* the decorrelated signal d from s: transient-attenuated all-pass
+ * chains in the low bands, plain delays above (8.6.4.5) */
+static void raac_ps_decorrelate(raac_ps *ps, const raac_ps_tables *t,
+      raac_ps_scratch *sx, float (*out)[32][2], float (*s)[32][2])
+{
+   static const float a[RAAC_PS_LINKS] = {
+      0.65143905753106f, 0.56471812200776f, 0.48954165955695f };
+   const int     is34   = ps->is34;
+   const int8_t *k_to_i = is34 ? raac_ps_k_to_i_34 : raac_ps_k_to_i_20;
+   int i, k, m, n;
+
+   memset(sx->power, 0, sizeof(sx->power));
+   if (is34 != ps->is34_old)
+   {
+      memset(ps->peak_decay_nrg,         0, sizeof(ps->peak_decay_nrg));
+      memset(ps->power_smooth,           0, sizeof(ps->power_smooth));
+      memset(ps->peak_decay_diff_smooth, 0, sizeof(ps->peak_decay_diff_smooth));
+      memset(ps->delay,                  0, sizeof(ps->delay));
+      memset(ps->ap_delay,               0, sizeof(ps->ap_delay));
+   }
+
+   for (k = 0; k < raac_ps_nr_bands[is34]; k++)
+   {
+      float *p = sx->power[k_to_i[k]];
+      for (n = 0; n < 32; n++)
+         p[n] += s[k][n][0] * s[k][n][0] + s[k][n][1] * s[k][n][1];
+   }
+
+   /* transient detection */
+   for (i = 0; i < raac_ps_nr_par_bands[is34]; i++)
+      for (n = 0; n < 32; n++)
+      {
+         float decayed = 0.76592833836465f * ps->peak_decay_nrg[i];
+         float denom;
+         ps->peak_decay_nrg[i] = decayed > sx->power[i][n]
+                               ? decayed : sx->power[i][n];
+         ps->power_smooth[i] += 0.25f * (sx->power[i][n]
+               - ps->power_smooth[i]);
+         ps->peak_decay_diff_smooth[i] += 0.25f * (ps->peak_decay_nrg[i]
+               - sx->power[i][n] - ps->peak_decay_diff_smooth[i]);
+         denom = 1.5f * ps->peak_decay_diff_smooth[i];
+         sx->gain[i][n] = denom > ps->power_smooth[i]
+                        ? ps->power_smooth[i] / denom : 1.0f;
+      }
+
+   for (k = 0; k < raac_ps_nr_bands[is34]; k++)
+   {
+      float (*d)[2] = ps->delay[k];
+      memmove(d, d + 32, RAAC_PS_MAX_DELAY * sizeof(d[0]));
+      memcpy(d + RAAC_PS_MAX_DELAY, s[k], 32 * sizeof(d[0]));
+   }
+
+   for (k = 0; k < raac_ps_nr_ap_bands[is34]; k++)
+   {
+      const float *gain = sx->gain[k_to_i[k]];
+      const float *phi  = t->phi_fract[is34][k];
+      const float (*q)[2] = (const float (*)[2])t->q_fract[is34][k];
+      float (*d)[2]       = ps->delay[k] + RAAC_PS_MAX_DELAY - 2;
+      float slope = 1.0f - 0.05f * (float)(k - raac_ps_decay_cutoff[is34]);
+      float ag[RAAC_PS_LINKS];
+      if (slope < 0.0f)
+         slope = 0.0f;
+      if (slope > 1.0f)
+         slope = 1.0f;
+      for (m = 0; m < RAAC_PS_LINKS; m++)
+      {
+         ag[m] = a[m] * slope;
+         memmove(ps->ap_delay[k][m], ps->ap_delay[k][m] + 32,
+               RAAC_PS_AP_DELAY * sizeof(ps->ap_delay[k][m][0]));
+      }
+      for (n = 0; n < 32; n++)
+      {
+         float in_re = d[n][0] * phi[0] - d[n][1] * phi[1];
+         float in_im = d[n][0] * phi[1] + d[n][1] * phi[0];
+         for (m = 0; m < RAAC_PS_LINKS; m++)
+         {
+            float (*ap)[2] = ps->ap_delay[k][m];
+            float lre = ap[n + 2 - m][0], lim = ap[n + 2 - m][1];
+            float apd_re = in_re, apd_im = in_im;
+            float a_re = ag[m] * in_re, a_im = ag[m] * in_im;
+            in_re = lre * q[m][0] - lim * q[m][1] - a_re;
+            in_im = lre * q[m][1] + lim * q[m][0] - a_im;
+            ap[n + 5][0] = apd_re + ag[m] * in_re;
+            ap[n + 5][1] = apd_im + ag[m] * in_im;
+         }
+         out[k][n][0] = gain[n] * in_re;
+         out[k][n][1] = gain[n] * in_im;
+      }
+   }
+   for (; k < raac_ps_nr_bands[is34]; k++)
+   {
+      const float *gain = sx->gain[k_to_i[k]];
+      int          lag  = k < raac_ps_short_delay[is34] ? 14 : 1;
+      float (*d)[2]     = ps->delay[k] + RAAC_PS_MAX_DELAY - lag;
+      for (n = 0; n < 32; n++)
+      {
+         out[k][n][0] = gain[n] * d[n][0];
+         out[k][n][1] = gain[n] * d[n][1];
+      }
+   }
+}
+
+/* parameters to the 20 or 34 band resolution (Tables 8.46 and 8.47) */
+static void raac_ps_map_34_to_20(int8_t *o, const int8_t *p, int full)
+{
+   o[ 0] = (int8_t)((2 * p[ 0] + p[ 1]) / 3);
+   o[ 1] = (int8_t)((p[ 1] + 2 * p[ 2]) / 3);
+   o[ 2] = (int8_t)((2 * p[ 3] + p[ 4]) / 3);
+   o[ 3] = (int8_t)((p[ 4] + 2 * p[ 5]) / 3);
+   o[ 4] = (int8_t)((p[ 6] + p[ 7]) / 2);
+   o[ 5] = (int8_t)((p[ 8] + p[ 9]) / 2);
+   o[ 6] = p[10];
+   o[ 7] = p[11];
+   o[ 8] = (int8_t)((p[12] + p[13]) / 2);
+   o[ 9] = (int8_t)((p[14] + p[15]) / 2);
+   o[10] = p[16];
+   if (full)
+   {
+      o[11] = p[17];
+      o[12] = p[18];
+      o[13] = p[19];
+      o[14] = (int8_t)((p[20] + p[21]) / 2);
+      o[15] = (int8_t)((p[22] + p[23]) / 2);
+      o[16] = (int8_t)((p[24] + p[25]) / 2);
+      o[17] = (int8_t)((p[26] + p[27]) / 2);
+      o[18] = (int8_t)((p[28] + p[29] + p[30] + p[31]) / 4);
+      o[19] = (int8_t)((p[32] + p[33]) / 2);
+   }
+}
+
+static void raac_ps_map_10_to_20(int8_t *o, const int8_t *p, int full)
+{
+   int b = full ? 9 : 4;
+   if (!full)
+      o[10] = 0;
+   for (; b >= 0; b--)
+      o[2 * b + 1] = o[2 * b] = p[b];
+}
+
+/* 34-band position of each 20-band parameter, and of each 10-band one */
+static const int8_t raac_ps_20_of_34[34] = {
+    0, -1,  1,  2, -2,  3,  4,  4,  5,  5,  6,  7,  8,  8,  9,  9, 10,
+   11, 12, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 18, 18, 19, 19 };
+static const int8_t raac_ps_10_of_34[34] = {
+    0,  0,  0,  1,  1,  1,  2,  2,  2,  2,  3,  3,  4,  4,  4,  4,  5,
+    5,  6,  6,  7,  7,  7,  7,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9 };
+
+static void raac_ps_map_to_34(int8_t *o, const int8_t *p, int from20,
+      int full)
+{
+   int b, n = full ? 34 : 17;
+   for (b = 0; b < n; b++)
+   {
+      if (!from20)
+         o[b] = p[raac_ps_10_of_34[b]];
+      else if (raac_ps_20_of_34[b] == -1)
+         o[b] = (int8_t)((p[0] + p[1]) / 2);
+      else if (raac_ps_20_of_34[b] == -2)
+         o[b] = (int8_t)((p[2] + p[3]) / 2);
+      else
+         o[b] = p[raac_ps_20_of_34[b]];
+   }
+   if (!full)
+      o[16] = from20 ? p[10] : 0;
+}
+
+/* a mixing value carried from 20 to 34 bands and back, in place */
+static void raac_ps_val_20_to_34(float *p)
+{
+   float v[20];
+   int   b;
+   memcpy(v, p, sizeof(v));
+   for (b = 0; b < 34; b++)
+   {
+      int s = raac_ps_20_of_34[b];
+      p[b] = s == -1 ? 0.5f * (v[0] + v[1])
+           : s == -2 ? 0.5f * (v[2] + v[3]) : v[s];
+   }
+}
+
+static void raac_ps_val_34_to_20(float *p)
+{
+   p[ 0] = (2 * p[ 0] + p[ 1]) * 0.33333333f;
+   p[ 1] = (p[ 1] + 2 * p[ 2]) * 0.33333333f;
+   p[ 2] = (2 * p[ 3] + p[ 4]) * 0.33333333f;
+   p[ 3] = (p[ 4] + 2 * p[ 5]) * 0.33333333f;
+   p[ 4] = 0.5f * (p[ 6] + p[ 7]);
+   p[ 5] = 0.5f * (p[ 8] + p[ 9]);
+   p[ 6] = p[10];
+   p[ 7] = p[11];
+   p[ 8] = 0.5f * (p[12] + p[13]);
+   p[ 9] = 0.5f * (p[14] + p[15]);
+   p[10] = p[16];
+   p[11] = p[17];
+   p[12] = p[18];
+   p[13] = p[19];
+   p[14] = 0.5f * (p[20] + p[21]);
+   p[15] = 0.5f * (p[22] + p[23]);
+   p[16] = 0.5f * (p[24] + p[25]);
+   p[17] = 0.5f * (p[26] + p[27]);
+   p[18] = (p[28] + p[29] + p[30] + p[31]) * 0.25f;
+   p[19] = 0.5f * (p[32] + p[33]);
+}
+
+/* the envelopes' parameters at the processing resolution: mapped into
+ * buf, or used as they are when they already match */
+static int8_t (*raac_ps_remap(int8_t (*buf)[RAAC_PS_MAX_PAR],
+      int8_t (*par)[RAAC_PS_MAX_PAR], int num_par, int num_env, int is34,
+      int full))[RAAC_PS_MAX_PAR]
+{
+   int e;
+   if (is34)
+   {
+      if (num_par == 34 || num_par == 17)
+         return par;
+      for (e = 0; e < num_env; e++)
+         raac_ps_map_to_34(buf[e], par[e], num_par == 20 || num_par == 11,
+               full);
+   }
+   else
+   {
+      if (num_par == 20 || num_par == 11)
+         return par;
+      for (e = 0; e < num_env; e++)
+      {
+         if (num_par == 34 || num_par == 17)
+            raac_ps_map_34_to_20(buf[e], par[e], full);
+         else
+            raac_ps_map_10_to_20(buf[e], par[e], full);
+      }
+   }
+   return buf;
+}
+
+/* mix s (in l) and the decorrelated d (in r) into left and right
+ * (8.6.4.6), the matrices interpolated linearly across each envelope */
+static void raac_ps_stereo(raac_ps *ps, const raac_ps_tables *t,
+      float (*l)[32][2], float (*r)[32][2])
+{
+   int8_t iid_buf[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t icc_buf[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t ipd_buf[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t opd_buf[RAAC_PS_MAX_ENV][RAAC_PS_MAX_PAR];
+   int8_t (*iid)[RAAC_PS_MAX_PAR], (*icc)[RAAC_PS_MAX_PAR];
+   int8_t (*ipd)[RAAC_PS_MAX_PAR] = ps->ipd_par;
+   int8_t (*opd)[RAAC_PS_MAX_PAR] = ps->opd_par;
+   const int     is34   = ps->is34;
+   const int8_t *k_to_i = is34 ? raac_ps_k_to_i_34 : raac_ps_k_to_i_20;
+   const float (*lut)[8][4] = (const float (*)[8][4])
+         (ps->icc_mode < 3 ? t->HA : t->HB);
+   int e, b, k, j, h;
+
+   /* the previous frame's last matrices start this one */
+   if (ps->num_env_old)
+      for (h = 0; h < 4; h++)
+         for (j = 0; j < 2; j++)
+            memcpy(ps->H[h][j][0], ps->H[h][j][ps->num_env_old],
+                  sizeof(ps->H[h][j][0]));
+
+   iid = raac_ps_remap(iid_buf, ps->iid_par, ps->nr_iid_par, ps->num_env,
+         is34, 1);
+   icc = raac_ps_remap(icc_buf, ps->icc_par, ps->nr_icc_par, ps->num_env,
+         is34, 1);
+   if (ps->enable_ipdopd)
+   {
+      ipd = raac_ps_remap(ipd_buf, ps->ipd_par, ps->nr_ipdopd_par,
+            ps->num_env, is34, 0);
+      opd = raac_ps_remap(opd_buf, ps->opd_par, ps->nr_ipdopd_par,
+            ps->num_env, is34, 0);
+   }
+   if (is34 != ps->is34_old)
+   {
+      for (h = 0; h < 4; h++)
+         for (j = 0; j < 2; j++)
+         {
+            if (is34)
+               raac_ps_val_20_to_34(ps->H[h][j][0]);
+            else
+               raac_ps_val_34_to_20(ps->H[h][j][0]);
+         }
+      memset(ps->ipd_hist, 0, sizeof(ps->ipd_hist));
+      memset(ps->opd_hist, 0, sizeof(ps->opd_hist));
+   }
+
+   for (e = 0; e < ps->num_env; e++)
+   {
+      int   start = ps->border[e], stop = ps->border[e + 1];
+      float width = 1.0f / (float)(stop - start ? stop - start : 1);
+
+      for (b = 0; b < raac_ps_nr_par_bands[is34]; b++)
+      {
+         const float *m = lut[iid[e][b] + 7 + 23 * ps->iid_quant][icc[e][b]];
+         float hr[4];
+         hr[0] = m[0];
+         hr[1] = m[1];
+         hr[2] = m[2];
+         hr[3] = m[3];
+         if (ps->enable_ipdopd && b < raac_ps_nr_pd_bands[is34])
+         {
+            int   oi = ps->opd_hist[b] * 8 + opd[e][b];
+            int   ii = ps->ipd_hist[b] * 8 + ipd[e][b];
+            float ore = t->pd_re[oi], oim = t->pd_im[oi];
+            float ire = t->pd_re[ii], iim = t->pd_im[ii];
+            float adj_re = ore * ire + oim * iim;
+            float adj_im = oim * ire - ore * iim;
+            ps->opd_hist[b] = (int8_t)(oi & 0x3F);
+            ps->ipd_hist[b] = (int8_t)(ii & 0x3F);
+            ps->H[0][1][e + 1][b] = hr[0] * oim;
+            ps->H[1][1][e + 1][b] = hr[1] * adj_im;
+            ps->H[2][1][e + 1][b] = hr[2] * oim;
+            ps->H[3][1][e + 1][b] = hr[3] * adj_im;
+            hr[0] *= ore;
+            hr[1] *= adj_re;
+            hr[2] *= ore;
+            hr[3] *= adj_re;
+         }
+         for (h = 0; h < 4; h++)
+            ps->H[h][0][e + 1][b] = hr[h];
+      }
+
+      if (stop == start)
+         continue;
+      for (k = 0; k < raac_ps_nr_bands[is34]; k++)
+      {
+         float hc[2][4], hs[2][4];
+         float (*lk)[2] = l[k] + 1 + start;
+         float (*rk)[2] = r[k] + 1 + start;
+         int   n;
+         b = k_to_i[k];
+         for (h = 0; h < 4; h++)
+         {
+            hc[0][h] = ps->H[h][0][e][b];
+            hs[0][h] = (ps->H[h][0][e + 1][b] - hc[0][h]) * width;
+         }
+         if (ps->enable_ipdopd)
+         {
+            /* the bands the hybrid filters mirror take the phase
+             * the other way round */
+            float sign = ((is34 && k >= 9 && k <= 13) || (!is34 && k <= 1))
+                       ? -1.0f : 1.0f;
+            for (h = 0; h < 4; h++)
+            {
+               hc[1][h] = sign * ps->H[h][1][e][b];
+               hs[1][h] = (ps->H[h][1][e + 1][b] - hc[1][h]) * width;
+            }
+            for (n = 0; n < stop - start; n++)
+            {
+               float lre = lk[n][0], lim = lk[n][1];
+               float rre = rk[n][0], rim = rk[n][1];
+               for (h = 0; h < 4; h++)
+               {
+                  hc[0][h] += hs[0][h];
+                  hc[1][h] += hs[1][h];
+               }
+               lk[n][0] = hc[0][0] * lre + hc[0][2] * rre
+                        - hc[1][0] * lim - hc[1][2] * rim;
+               lk[n][1] = hc[0][0] * lim + hc[0][2] * rim
+                        + hc[1][0] * lre + hc[1][2] * rre;
+               rk[n][0] = hc[0][1] * lre + hc[0][3] * rre
+                        - hc[1][1] * lim - hc[1][3] * rim;
+               rk[n][1] = hc[0][1] * lim + hc[0][3] * rim
+                        + hc[1][1] * lre + hc[1][3] * rre;
+            }
+         }
+         else
+            for (n = 0; n < stop - start; n++)
+            {
+               float lre = lk[n][0], lim = lk[n][1];
+               float rre = rk[n][0], rim = rk[n][1];
+               for (h = 0; h < 4; h++)
+                  hc[0][h] += hs[0][h];
+               lk[n][0] = hc[0][0] * lre + hc[0][2] * rre;
+               lk[n][1] = hc[0][0] * lim + hc[0][2] * rim;
+               rk[n][0] = hc[0][1] * lre + hc[0][3] * rre;
+               rk[n][1] = hc[0][1] * lim + hc[0][3] * rim;
+            }
+      }
+   }
+}
+
+/* X (the mono synthesis matrix) becomes the left channel's, XR the
+ * right's; top is the first QMF band above the signal */
+static void raac_ps_apply(raac_ps *ps, const raac_ps_tables *t,
+      raac_ps_scratch *sx, float X[2][38][64], float XR[2][38][64], int top)
+{
+   const int is34 = ps->is34;
+   top += raac_ps_nr_bands[is34] - 64;
+   if (top < 0)
+      top = 0;
+   if (top < raac_ps_nr_bands[is34])
+      memset(ps->delay + top, 0,
+            (size_t)(raac_ps_nr_bands[is34] - top) * sizeof(ps->delay[0]));
+   if (top < raac_ps_nr_ap_bands[is34])
+      memset(ps->ap_delay + top, 0,
+            (size_t)(raac_ps_nr_ap_bands[is34] - top) * sizeof(ps->ap_delay[0]));
+
+   raac_ps_hybrid_analysis(ps, t, sx->L, X);
+   raac_ps_decorrelate(ps, t, sx, sx->R, sx->L);
+   raac_ps_stereo(ps, t, sx->L, sx->R);
+   raac_ps_hybrid_synthesis(X, sx->L, is34);
+   raac_ps_hybrid_synthesis(XR, sx->R, is34);
+}
+
 static void raac_sbr_extension(raac_t *a, raac_sbr *s, raac_bits *b,
       int crc, size_t cnt)
 {
@@ -5036,10 +5811,22 @@ static void raac_sbr_extension(raac_t *a, raac_sbr *s, raac_bits *b,
 #endif
       if (raac_getbits(b, 1))  /* bs_extended_data                  */
       {
-         unsigned left = raac_getbits(b, 4);
-         if (left == 15)
-            left += raac_getbits(b, 8);
-         b->pos += (size_t)left * 8;   /* PS and fill: skipped       */
+         int    bits = (int)raac_getbits(b, 4);
+         size_t end;
+         if (bits == 15)
+            bits += (int)raac_getbits(b, 8);
+         bits *= 8;
+         end   = b->pos + (size_t)bits;
+         while (bits > 7)
+         {
+            int id = (int)raac_getbits(b, 2);
+            bits  -= 2;
+            if (id == 2 && a->ps && !s->is_cpe)  /* EXTENSION_ID_PS */
+               bits -= raac_ps_read(a->ps, b, bits);
+            else
+               break;              /* fill */
+         }
+         b->pos = end;
       }
       if (b->err || b->pos > limit)
          raac_sbr_turnoff(s);
@@ -5068,10 +5855,12 @@ static void raac_couple_all(raac_t *a, int point, int is_cpe, int tag,
  * relative to the start of the enclosing structure - the ASC or the
  * raw_data_block - and the bit reader's buffer begins there in both
  * callers, so aligning the raw position is correct. */
-static int raac_pce(raac_bits *b, int *elems, int *channels)
+static int raac_pce(raac_bits *b, int *elems, int *channels,
+      uint8_t *pos)
 {
    int nfront, nside, nback, nlfe, nassoc, ncc;
    int i, n_elems, n_ch;
+   int fsce = 0, fcpe = 0, bcpe = 0, bsce = 0, scpe = 0;
    raac_getbits(b, 4);           /* element_instance_tag       */
    raac_getbits(b, 2);           /* object_type                */
    raac_getbits(b, 4);           /* sampling_frequency_index   */
@@ -5088,13 +5877,57 @@ static int raac_pce(raac_bits *b, int *elems, int *channels)
    if (raac_getbits(b, 1))       /* matrix_mixdown_idx_present */
       raac_getbits(b, 3);        /* idx + pseudo_surround      */
    n_elems = nfront + nside + nback + nlfe;
-   n_ch    = nlfe;
+   n_ch = 0;
    for (i = 0; i < nfront + nside + nback; i++)
    {
-      /* element_is_cpe + element_tag_select */
-      n_ch += raac_getbits(b, 1) ? 2 : 1;
+      /* element_is_cpe + element_tag_select; the speaker each channel
+       * stands for follows from the group and the element's place in
+       * it, as WAVE positions (raac_wave_pos), 0xFF where none fits */
+      int     cpe = (int)raac_getbits(b, 1);
+      uint8_t p0  = 0xFF, p1 = 0xFF;
       raac_getbits(b, 4);
+      if (i < nfront)
+      {
+         if (!cpe)
+            p0 = fsce++ ? 0xFF : RAAC_WAVE_FC;
+         else if (fcpe++ == 0)
+         {
+            p0 = RAAC_WAVE_FL;
+            p1 = RAAC_WAVE_FR;
+         }
+         else if (fcpe == 2)
+         {
+            p0 = RAAC_WAVE_FLC;
+            p1 = RAAC_WAVE_FRC;
+         }
+      }
+      else if (i < nfront + nside)
+      {
+         if (cpe && scpe++ == 0)
+         {
+            p0 = RAAC_WAVE_SL;
+            p1 = RAAC_WAVE_SR;
+         }
+      }
+      else if (!cpe)
+         p0 = bsce++ ? 0xFF : RAAC_WAVE_BC;
+      else if (bcpe++ == 0)
+      {
+         p0 = RAAC_WAVE_BL;
+         p1 = RAAC_WAVE_BR;
+      }
+      if (pos && n_ch < RAAC_MAX_CH)
+         pos[n_ch] = p0;
+      if (pos && cpe && n_ch + 1 < RAAC_MAX_CH)
+         pos[n_ch + 1] = p1;
+      n_ch += cpe ? 2 : 1;
    }
+   for (i = 0; i < nlfe; i++)
+   {
+      if (pos && n_ch + i < RAAC_MAX_CH)
+         pos[n_ch + i] = i ? 0xFF : RAAC_WAVE_LFE;
+   }
+   n_ch += nlfe;
    for (i = 0; i < nlfe; i++)
       raac_getbits(b, 4);        /* lfe_element_tag_select     */
    for (i = 0; i < nassoc; i++)
@@ -5123,6 +5956,44 @@ static int raac_pce(raac_bits *b, int *elems, int *channels)
  * 6 adds an LFE (5.1), 7 is SCE+3CPE+LFE (7.1, eight channels) */
 static const uint8_t raac_chcfg_channels[8] = { 0, 1, 2, 3, 4, 5, 6, 8 };
 
+/* WAVE speaker positions per channelConfiguration, in element
+ * transmission order. 7 follows the common reading of its second
+ * and third CPE as the side and back pairs. */
+static const uint8_t raac_chcfg_pos[8][RAAC_MAX_CH] = {
+   { 0 },
+   { RAAC_WAVE_FC },
+   { RAAC_WAVE_FL, RAAC_WAVE_FR },
+   { RAAC_WAVE_FC, RAAC_WAVE_FL, RAAC_WAVE_FR },
+   { RAAC_WAVE_FC, RAAC_WAVE_FL, RAAC_WAVE_FR, RAAC_WAVE_BC },
+   { RAAC_WAVE_FC, RAAC_WAVE_FL, RAAC_WAVE_FR, RAAC_WAVE_BL,
+     RAAC_WAVE_BR },
+   { RAAC_WAVE_FC, RAAC_WAVE_FL, RAAC_WAVE_FR, RAAC_WAVE_BL,
+     RAAC_WAVE_BR, RAAC_WAVE_LFE },
+   { RAAC_WAVE_FC, RAAC_WAVE_FL, RAAC_WAVE_FR, RAAC_WAVE_SL,
+     RAAC_WAVE_SR, RAAC_WAVE_BL, RAAC_WAVE_BR, RAAC_WAVE_LFE }
+};
+
+/* The WAVE order of channels at speaker positions pos: by position,
+ * the order WAVEFORMATEXTENSIBLE lists its speaker bits. Returns 0,
+ * or -1 when a channel has no position or two share one. */
+static int raac_make_wave_map(uint8_t *map, const uint8_t *pos,
+      unsigned channels)
+{
+   unsigned i, j, n = 0;
+   unsigned used = 0;
+   for (i = 0; i < channels; i++)
+   {
+      if (pos[i] > RAAC_WAVE_SR || (used & (1u << pos[i])))
+         return -1;
+      used |= 1u << pos[i];
+   }
+   for (j = 0; j <= RAAC_WAVE_SR; j++)
+      for (i = 0; i < channels; i++)
+         if (pos[i] == j)
+            map[n++] = (uint8_t)i;
+   return 0;
+}
+
 /* Map an explicitly coded sampling frequency onto the sampling
  * frequency index whose scalefactor band tables apply, per the
  * ranges of ISO/IEC 14496-3 Table 4.55. */
@@ -5147,10 +6018,12 @@ raac_t *raac_open(const uint8_t *asc, size_t asc_size)
    raac_bits b;
    unsigned  aot, sfi, chcfg, freq, channels, frame_960;
    unsigned  sbr_explicit, ext_freq;
+   uint8_t   pos[RAAC_MAX_CH];
    int       i;
 
    if (!asc || asc_size < 2)
       return NULL;
+   memset(pos, 0xFF, sizeof(pos));
    raac_bits_init(&b, asc, asc_size);
    aot = raac_getbits(&b, 5);
    if (aot == 31)
@@ -5165,9 +6038,7 @@ raac_t *raac_open(const uint8_t *asc, size_t asc_size)
    if (aot == 5 || aot == 29)
    {
       /* hierarchical HE-AAC signaling: the first rate is the core
-       * codec's, the extension rate is the SBR output. An AOT-29
-       * (HE-AAC v2) stream opens as v1: the parametric-stereo
-       * payload is skipped and the SBR mono output is decoded. */
+       * codec's, the extension rate is the SBR output */
       unsigned ext_sfi = raac_getbits(&b, 4);
       if (ext_sfi == 15)
          ext_freq = raac_getbits(&b, 24);
@@ -5206,14 +6077,17 @@ raac_t *raac_open(const uint8_t *asc, size_t asc_size)
        * channels sequentially, so any coupling-free layout that fits
        * is decodable */
       int elems = 0, nch = 0;
-      if (raac_pce(&b, &elems, &nch) < 0)
+      if (raac_pce(&b, &elems, &nch, pos) < 0)
          return NULL;
       if (nch < 1 || nch > RAAC_MAX_CH)
          return NULL;
       channels = (unsigned)nch;
    }
    else
+   {
       channels = raac_chcfg_channels[chcfg];
+      memcpy(pos, raac_chcfg_pos[chcfg], sizeof(pos));
+   }
    if (b.err)
       return NULL;
 
@@ -5249,6 +6123,9 @@ raac_t *raac_open(const uint8_t *asc, size_t asc_size)
    a->channels    = channels;
    a->frame_len   = frame_960 ? 960 : 1024;
    a->noise_state = 0x1f2e3d4cu;
+   for (i = 0; i < RAAC_MAX_CH; i++)
+      a->out_map[i] = (uint8_t)i;
+   a->has_wave_map = raac_make_wave_map(a->wave_map, pos, channels) == 0;
 
    /* output-rate contract, fixed for the life of the instance:
     * - explicit SBR signaling at twice the core rate turns the
@@ -5274,16 +6151,30 @@ raac_t *raac_open(const uint8_t *asc, size_t asc_size)
    }
    else if (!frame_960 && freq >= 16000 && freq <= 24000)
       a->sbr_mode = 1;
+   a->out_channels = channels;
    if (a->sbr_mode)
    {
-      a->out_rate = freq * 2;
-      a->qmf = (raac_qmf_ch*)calloc(channels, sizeof(raac_qmf_ch));
-      a->sbx = (raac_sbr_scratch*)calloc(1, sizeof(raac_sbr_scratch));
-      if (!a->qmf || !a->sbx)
+      /* mono SBR may carry parametric stereo, so it is decoded to two
+       * channels throughout, the same signal in both without it */
+      if (channels == 1)
       {
-         free(a->qmf);
-         free(a->sbx);
-         free(a);
+         a->out_channels = 2;
+         a->ps  = (raac_ps*)calloc(1, sizeof(raac_ps));
+         a->pst = (raac_ps_tables*)malloc(sizeof(raac_ps_tables));
+         a->psx = (raac_ps_scratch*)malloc(sizeof(raac_ps_scratch));
+         if (a->pst)
+            raac_ps_tables_init(a->pst);
+         a->wave_map[0]  = 0;
+         a->wave_map[1]  = 1;
+         a->has_wave_map = 1;
+      }
+      a->out_rate = freq * 2;
+      a->qmf = (raac_qmf_ch*)calloc(a->out_channels, sizeof(raac_qmf_ch));
+      a->sbx = (raac_sbr_scratch*)calloc(1, sizeof(raac_sbr_scratch));
+      if (!a->qmf || !a->sbx
+            || (channels == 1 && (!a->ps || !a->pst || !a->psx)))
+      {
+         raac_close(a);
          return NULL;
       }
    }
@@ -5335,13 +6226,55 @@ raac_t *raac_open(const uint8_t *asc, size_t asc_size)
    return a;
 }
 
-unsigned raac_channels(const raac_t *a)    { return a ? a->channels : 0; }
+unsigned raac_channels(const raac_t *a)    { return a ? a->out_channels : 0; }
 unsigned raac_frame_len(const raac_t *a)
 {
    return a ? (a->frame_len << (a->sbr_mode ? 1 : 0)) : 0;
 }
 unsigned raac_sample_rate(const raac_t *a) { return a ? a->out_rate : 0; }
 size_t raac_last_size(const raac_t *a) { return a ? a->used : 0; }
+
+int raac_set_channel_order(raac_t *a, enum raac_channel_order order)
+{
+   unsigned i;
+   if (!a)
+      return -1;
+   if (order == RAAC_ORDER_WAVE)
+   {
+      if (!a->has_wave_map)
+         return -1;
+      memcpy(a->out_map, a->wave_map, sizeof(a->out_map));
+      return 0;
+   }
+   for (i = 0; i < RAAC_MAX_CH; i++)
+      a->out_map[i] = (uint8_t)i;
+   return 0;
+}
+
+int raac_adts_parse(const uint8_t *buf, size_t size, raac_adts_t *h)
+{
+   unsigned profile, sfi, chcfg;
+   if (!buf || !h || size < 7)
+      return -1;
+   /* syncword 0xFFF, MPEG-4 or -2 id, layer 0 */
+   if (buf[0] != 0xFF || (buf[1] & 0xF6) != 0xF0)
+      return -1;
+   profile = (buf[2] >> 6) & 3;   /* audio object type - 1 */
+   sfi     = (buf[2] >> 2) & 15;
+   chcfg   = ((unsigned)(buf[2] & 1) << 2) | (buf[3] >> 6);
+   if (sfi > 12)
+      return -1;
+   h->header_size = (buf[1] & 1) ? 7 : 9;   /* CRC when absent bit is 0 */
+   h->frame_size  = ((unsigned)(buf[3] & 3) << 11)
+                  | ((unsigned)buf[4] << 3)
+                  | ((unsigned)buf[5] >> 5);
+   h->raw_blocks  = (unsigned)(buf[6] & 3) + 1;
+   if (h->frame_size <= h->header_size)
+      return -1;
+   h->asc[0] = (uint8_t)(((profile + 1) << 3) | (sfi >> 1));
+   h->asc[1] = (uint8_t)(((sfi & 1) << 7) | (chcfg << 3));
+   return 0;
+}
 
 /* Shared worker: parse and synthesise one access unit into per-channel
  * float PCM in full-scale (+-32768) units. Both public entry points
@@ -5457,7 +6390,7 @@ static int raac_decode_frame(raac_t *a, const uint8_t *pkt, size_t size,
             break;
          }
          case 5:  /* PCE: parse to keep bit position, contents unused */
-            if (raac_pce(&b, NULL, NULL) < 0)
+            if (raac_pce(&b, NULL, NULL, NULL) < 0)
                return -1;
             break;
          case 6:  /* FIL: SBR extension payloads route to the SBR
@@ -5584,6 +6517,41 @@ static int raac_decode_frame(raac_t *a, const uint8_t *pkt, size_t size,
  * output slot i synthesises X_low slot i+2 against the eight-slot
  * history, a six-slot latency, so frames decoded before and after
  * SBR data first appears in a stream splice without a seam. */
+/* Mono SBR to two channels: the whole synthesis matrix, through
+ * parametric stereo when the stream has started it, else copied. */
+static void raac_upsample_ps(raac_t *a, int full)
+{
+   raac_sbr_scratch *sx = a->sbx;
+   float (*XR)[38][64]  = a->psx->XR;
+   int s, k, top = 32;
+   if (!full)
+   {
+      memset(sx->X, 0, sizeof(sx->X));
+      for (k = 0; k < 32; k++)
+         for (s = 0; s < 38; s++)
+         {
+            sx->X[0][s][k] = sx->X_low[k][s + 2][0];
+            sx->X[1][s][k] = sx->X_low[k][s + 2][1];
+         }
+   }
+   else if (a->sbr_map[0] >= 0)
+   {
+      const raac_sbr *sb = &a->sbr[a->sbr_map[0]];
+      top = sb->kx[1] + sb->m[1];
+   }
+   if (a->ps->start)
+      raac_ps_apply(a->ps, a->pst, a->psx, sx->X, XR, top);
+   else
+      memcpy(XR, sx->X, sizeof(sx->X));
+   for (s = 0; s < 32; s++)
+   {
+      raac_qmf_synthesis_slot(a, &a->qmf[0], sx->X[0][s], sx->X[1][s],
+            a->qmf[0].out + s * 64);
+      raac_qmf_synthesis_slot(a, &a->qmf[1], XR[0][s], XR[1][s],
+            a->qmf[1].out + s * 64);
+   }
+}
+
 static int raac_upsample_frame(raac_t *a)
 {
    unsigned ch;
@@ -5631,6 +6599,11 @@ static int raac_upsample_frame(raac_t *a)
             }
          }
       }
+      if (a->ps && ch == 0)
+      {
+         raac_upsample_ps(a, full);
+         continue;
+      }
       for (s = 0; s < 32; s++)
       {
          float Xr[64], Xi[64];
@@ -5677,7 +6650,7 @@ void raac_copy_s16(const raac_t *a, size_t first, size_t count,
    if (!a)
       return;
 #ifdef RAAC_HAVE_S16
-   if (a->channels == 2)
+   if (a->out_channels == 2)
    {
       const float *l = (a->sbr_mode ? a->qmf[0].out : a->pcm[0]) + first;
       const float *r = (a->sbr_mode ? a->qmf[1].out : a->pcm[1]) + first;
@@ -5691,7 +6664,7 @@ void raac_copy_s16(const raac_t *a, size_t first, size_t count,
       first += n;
       count -= n;
    }
-   else if (a->channels == 1)
+   else if (a->out_channels == 1)
    {
       const float *p = (a->sbr_mode ? a->qmf[0].out : a->pcm[0]) + first;
       size_t       n = count & ~(size_t)7;
@@ -5702,11 +6675,13 @@ void raac_copy_s16(const raac_t *a, size_t first, size_t count,
       count -= n;
    }
 #endif
-   for (ch = 0; ch < a->channels; ch++)
+   for (ch = 0; ch < a->out_channels; ch++)
    {
-      const float *p = (a->sbr_mode ? a->qmf[ch].out : a->pcm[ch]) + first;
+      unsigned     src = a->out_map[ch];
+      const float *p = (a->sbr_mode ? a->qmf[src].out : a->pcm[src])
+                     + first;
       int16_t     *o = out + ch;
-      for (i = 0; i < count; i++, o += a->channels)
+      for (i = 0; i < count; i++, o += a->out_channels)
       {
          /* one rounding, clamped in the float domain: casting an
           * out-of-range or non-finite float to int is undefined, and
@@ -5730,7 +6705,7 @@ void raac_copy_f32(const raac_t *a, size_t first, size_t count,
    unsigned ch;
    if (!a)
       return;
-   if (a->channels == 2)
+   if (a->out_channels == 2)
    {
       const float *l = (a->sbr_mode ? a->qmf[0].out : a->pcm[0]) + first;
       const float *r = (a->sbr_mode ? a->qmf[1].out : a->pcm[1]) + first;
@@ -5747,7 +6722,7 @@ void raac_copy_f32(const raac_t *a, size_t first, size_t count,
       first += n;
       count -= n;
    }
-   else if (a->channels == 1)
+   else if (a->out_channels == 1)
    {
       const float *p = (a->sbr_mode ? a->qmf[0].out : a->pcm[0]) + first;
       raac_v       k = RAAC_SET1(1.0f / 32768.0f);
@@ -5758,11 +6733,13 @@ void raac_copy_f32(const raac_t *a, size_t first, size_t count,
       first += n;
       count -= n;
    }
-   for (ch = 0; ch < a->channels; ch++)
+   for (ch = 0; ch < a->out_channels; ch++)
    {
-      const float *p = (a->sbr_mode ? a->qmf[ch].out : a->pcm[ch]) + first;
+      unsigned     src = a->out_map[ch];
+      const float *p = (a->sbr_mode ? a->qmf[src].out : a->pcm[src])
+                     + first;
       for (i = 0; i < count; i++)
-         out[i * a->channels + ch] = p[i] * (1.0f / 32768.0f);
+         out[i * a->out_channels + ch] = p[i] * (1.0f / 32768.0f);
    }
 }
 
@@ -5798,7 +6775,9 @@ void raac_reset(raac_t *a)
    memset(a->cce, 0, sizeof(a->cce));
    memset(a->sbr, 0, sizeof(a->sbr));
    if (a->qmf)
-      memset(a->qmf, 0, sizeof(raac_qmf_ch) * a->channels);
+      memset(a->qmf, 0, sizeof(raac_qmf_ch) * a->out_channels);
+   if (a->ps)
+      memset(a->ps, 0, sizeof(*a->ps));
    /* reseed the PNS generator so a rewound stream decodes exactly as a
     * fresh one */
    a->noise_state = 0x1f2e3d4cu;
@@ -5812,7 +6791,8 @@ void raac_reset(raac_t *a)
 static size_t raac_state_body(const raac_t *a)
 {
    return sizeof(raac_ch) * a->channels + sizeof(a->cce) + sizeof(a->sbr)
-        + (a->qmf ? sizeof(raac_qmf_ch) * a->channels : 0)
+        + (a->qmf ? sizeof(raac_qmf_ch) * a->out_channels : 0)
+        + (a->ps ? sizeof(*a->ps) : 0)
         + sizeof(a->noise_state);
 }
 
@@ -5822,7 +6802,7 @@ static void raac_state_hdr(const raac_t *a, uint32_t *h)
 {
    h[0] = 0x53414152u;   /* "RAAS" */
    h[1] = (uint32_t)raac_state_body(a);
-   h[2] = a->channels;
+   h[2] = a->channels | ((uint32_t)a->out_channels << 8);
    h[3] = a->sample_rate;
    h[4] = a->frame_len | ((uint32_t)a->sbr_mode << 16);
    h[5] = (uint32_t)(sizeof(raac_ch) ^ (sizeof(raac_sbr) << 16));
@@ -5852,8 +6832,13 @@ void raac_save_state(const raac_t *a, void *data)
    p += sizeof(a->sbr);
    if (a->qmf)
    {
-      memcpy(p, a->qmf, sizeof(raac_qmf_ch) * a->channels);
-      p += sizeof(raac_qmf_ch) * a->channels;
+      memcpy(p, a->qmf, sizeof(raac_qmf_ch) * a->out_channels);
+      p += sizeof(raac_qmf_ch) * a->out_channels;
+   }
+   if (a->ps)
+   {
+      memcpy(p, a->ps, sizeof(*a->ps));
+      p += sizeof(*a->ps);
    }
    memcpy(p, &a->noise_state, sizeof(a->noise_state));
 }
@@ -5876,8 +6861,13 @@ int raac_load_state(raac_t *a, const void *data, size_t size)
    p += sizeof(a->sbr);
    if (a->qmf)
    {
-      memcpy(a->qmf, p, sizeof(raac_qmf_ch) * a->channels);
-      p += sizeof(raac_qmf_ch) * a->channels;
+      memcpy(a->qmf, p, sizeof(raac_qmf_ch) * a->out_channels);
+      p += sizeof(raac_qmf_ch) * a->out_channels;
+   }
+   if (a->ps)
+   {
+      memcpy(a->ps, p, sizeof(*a->ps));
+      p += sizeof(*a->ps);
    }
    memcpy(&a->noise_state, p, sizeof(a->noise_state));
    return 0;
@@ -5885,8 +6875,13 @@ int raac_load_state(raac_t *a, const void *data, size_t size)
 
 void raac_close(raac_t *a)
 {
+   if (!a)
+      return;
    free(a->qmf);
    free(a->sbx);
+   free(a->ps);
+   free(a->pst);
+   free(a->psx);
    free(a);
 }
 

@@ -66,6 +66,8 @@ typedef struct intfstream_info
 
 void *intfstream_init(intfstream_info_t *info);
 
+/* Points an open memory stream at @info's buffer, from its start, as
+ * if it had been opened on it; false for any other kind of stream. */
 bool intfstream_resize(intfstream_internal_t *intf,
       intfstream_info_t *info);
 
@@ -74,6 +76,20 @@ bool intfstream_open(intfstream_internal_t *intf,
 
 int64_t intfstream_read(intfstream_internal_t *intf,
       void *s, uint64_t len);
+
+/**
+ * intfstream_read_at:
+ *
+ * Up to @len bytes from @offset, the stream's position left where it
+ * was. Returns the bytes read (0 at the end), or -1 on failure or for
+ * an rzip stream, which cannot seek. Files (where filestream_read_at
+ * reads at offsets) and memory streams are read without touching the
+ * stream at all, and so from several threads at once; a CHD track, or
+ * a file without positional reads, is sought, read and sought back, so
+ * only by the thread that owns the stream.
+ */
+int64_t intfstream_read_at(intfstream_internal_t *intf,
+      void *s, uint64_t len, int64_t offset);
 
 int64_t intfstream_write(intfstream_internal_t *intf,
       const void *s, uint64_t len);

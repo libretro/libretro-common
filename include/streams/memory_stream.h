@@ -38,6 +38,16 @@ void memstream_close(memstream_t *stream);
 
 uint64_t memstream_read(memstream_t *stream, void *data, uint64_t bytes);
 
+/**
+ * memstream_read_at:
+ *
+ * Up to @bytes from @offset, the stream's position left where it was.
+ * Returns the bytes copied, 0 at or past the end, -1 for a negative
+ * offset. Safe from any number of threads while nothing writes.
+ */
+int64_t memstream_read_at(memstream_t *stream, void *data, uint64_t bytes,
+      int64_t offset);
+
 uint64_t memstream_write(memstream_t *stream, const void *data, uint64_t bytes);
 
 int memstream_getc(memstream_t *stream);
@@ -55,6 +65,24 @@ void memstream_rewind(memstream_t *stream);
 int64_t memstream_seek(memstream_t *stream, int64_t offset, int whence);
 
 uint64_t memstream_get_ptr(memstream_t *stream);
+
+/**
+ * memstream_view:
+ *
+ * Up to @len bytes at the position, lent in place through @ptr, and
+ * the position past them. Returns the bytes lent, 0 at the end.
+ */
+int64_t memstream_view(memstream_t *stream, uint64_t len,
+      const uint8_t **ptr);
+
+/**
+ * memstream_set_buffer:
+ *
+ * Points the stream at @size bytes at @buf, from their start, as
+ * memstream_open() would a new one.
+ */
+void memstream_set_buffer(memstream_t *stream, uint8_t *buf, uint64_t size,
+      unsigned writing);
 
 RETRO_END_DECLS
 

@@ -20,27 +20,37 @@
  * THE SOFTWARE.
  */
 #include <formats/rflv_mux.h>
+#include <formats/rav1_sequence.h>
 #include <stdlib.h>
 #include <string.h>
 
 enum flv_output
 {
-   FLV_HEADER, FLV_VIDEO_CONFIG, FLV_AUDIO_CONFIG, FLV_MEDIA, FLV_IDLE
+   FLV_HEADER, FLV_COLOR, FLV_VIDEO_CONFIG, FLV_AUDIO_CONFIG, FLV_MEDIA, FLV_IDLE
 };
+
+enum flv_codec { FLV_AVC, FLV_HEVC, FLV_AV1 };
 
 struct rflv_mux
 {
    uint64_t last[2], input_dts;
    rflv_span_t spans[3];
    uint8_t *config;
+   uint8_t *converted;
+   uint8_t *metadata;
+   rav1_sequence_t *av1_sequence;
+   rav1_config_t av1_config;
    const uint8_t *input;
    size_t avcc_size, asc_size, limit, size, offset, span_count;
+   size_t converted_size;
+   size_t metadata_size;
    uint32_t timestamp;
    int32_t composition;
    unsigned timescale[2], track;
    enum flv_output output;
-   uint8_t prefix[16], suffix[4];
+   uint8_t prefix[19], suffix[4];
    bool pending, scanning, failed, finished, seen[2], keyframe, vcl, idr;
+   bool annexb, hevc, av1;
 };
 
 static void flv_uint(uint8_t *out, uint32_t value, unsigned count)
@@ -90,6 +100,42 @@ static bool flv_avcc(const uint8_t *data, size_t size)
    return flv_sets(data, size, &pos, count, 13) && pos == size;
 }
 
+static bool flv_hvcc(const uint8_t *data, size_t size)
+{
+   size_t at = 23;
+   unsigned arrays, count, type, length, present = 0;
+   if (!data || size < 23 || size > 65536 || data[0] != 1
+         || (data[13] & 0xf0) != 0xf0 || (data[15] & 0xfc) != 0xfc
+         || (data[16] & 0xfc) != 0xfc || (data[17] & 0xf8) != 0xf8
+         || (data[18] & 0xf8) != 0xf8
+         || (data[21] & 3) != 3 || !data[22])
+      return false;
+   for (arrays = data[22]; arrays; arrays--)
+   {
+      if (size - at < 3 || (data[at] & 0x40))
+         return false;
+      type = data[at++] & 63;
+      count = ((unsigned)data[at] << 8) | data[at + 1];
+      at += 2;
+      if (!count)
+         return false;
+      while (count--)
+      {
+         if (size - at < 2)
+            return false;
+         length = ((unsigned)data[at] << 8) | data[at + 1];
+         at += 2;
+         if (length < 2 || length > size - at || (data[at] & 0x80)
+               || ((data[at] >> 1) & 63) != type || !(data[at + 1] & 7))
+            return false;
+         at += length;
+      }
+      if (type >= 32 && type <= 34)
+         present |= 1u << (type - 32);
+   }
+   return at == size && present == 7;
+}
+
 static unsigned flv_bits(const uint8_t *data, size_t size, unsigned *pos, unsigned count)
 {
    unsigned i, value = 0;
@@ -123,7 +169,7 @@ static bool flv_asc(const uint8_t *data, size_t size)
 static void flv_tag(rflv_mux_t *m, unsigned track, const void *data,
       size_t size, uint32_t timestamp, int32_t composition, bool keyframe, bool config)
 {
-   unsigned bytes = track == 1 ? 5 : 2;
+   unsigned bytes = track == 1 ? (m->hevc && !config && composition ? 8 : 5) : 2;
    memset(m->prefix, 0, sizeof(m->prefix));
    m->prefix[0] = track == 1 ? 9 : 8;
    flv_uint(m->prefix + 1, (uint32_t)size + bytes, 3);
@@ -131,7 +177,15 @@ static void flv_tag(rflv_mux_t *m, unsigned track, const void *data,
    m->prefix[7] = (uint8_t)(timestamp >> 24);
    m->prefix[11] = track == 1 ? (keyframe ? 0x17 : 0x27) : 0xaf;
    m->prefix[12] = config ? 0 : 1;
-   if (track == 1)
+   if (track == 1 && (m->hevc || m->av1))
+   {
+      m->prefix[11] = (uint8_t)(0x80 | (keyframe ? 0x10 : 0x20)
+            | (config ? 0 : m->av1 || composition ? 1 : 3));
+      memcpy(m->prefix + 12, m->av1 ? "av01" : "hvc1", 4);
+      if (bytes == 8)
+         flv_uint(m->prefix + 16, (uint32_t)composition, 3);
+   }
+   else if (track == 1)
       flv_uint(m->prefix + 13, (uint32_t)composition, 3);
    flv_uint(m->suffix, (uint32_t)size + bytes + 11, 4);
    m->spans[0].data = m->prefix;
@@ -144,11 +198,16 @@ static void flv_tag(rflv_mux_t *m, unsigned track, const void *data,
    m->pending = true;
 }
 
-rflv_mux_t *rflv_mux_new(const rflv_config_t *c)
+static rflv_mux_t *flv_new(const rflv_config_t *c, enum flv_codec codec)
 {
    rflv_mux_t *m;
-   if (!c || (!c->avcc && !c->asc) || !c->max_packet_size || c->max_packet_size > 0xfffffa
-         || (c->avcc ? !c->video_timescale || !flv_avcc((const uint8_t*)c->avcc, c->avcc_size)
+   bool hevc = codec == FLV_HEVC, av1 = codec == FLV_AV1;
+   if (!c || (!c->avcc && !c->asc) || ((hevc || av1) && !c->avcc)
+         || !c->max_packet_size || c->max_packet_size > (hevc ? 0xfffff7u : 0xfffffau)
+         || (c->avcc ? !c->video_timescale
+            || !(av1 ? c->avcc_size >= 4 && c->avcc_size <= 65536
+               : hevc ? flv_hvcc((const uint8_t*)c->avcc, c->avcc_size)
+               : flv_avcc((const uint8_t*)c->avcc, c->avcc_size))
             : c->avcc_size || c->video_timescale)
          || (c->asc ? !c->audio_timescale || !flv_asc((const uint8_t*)c->asc, c->asc_size)
             : c->asc_size || c->audio_timescale))
@@ -171,12 +230,529 @@ rflv_mux_t *rflv_mux_new(const rflv_config_t *c)
    m->timescale[0] = c->video_timescale;
    m->timescale[1] = c->audio_timescale;
    m->limit = c->max_packet_size;
+   m->hevc = hevc;
+   m->av1 = av1;
+   if (av1)
+   {
+      m->av1_sequence = (rav1_sequence_t*)malloc(sizeof(*m->av1_sequence));
+      if (!m->av1_sequence || !rav1_config_parse(&m->av1_config, m->config, m->avcc_size)
+            || !rav1_config_sequence(m->av1_sequence, &m->av1_config))
+      {
+         rflv_mux_free(m);
+         return NULL;
+      }
+   }
    memcpy(m->prefix, "FLV\1\0\0\0\0\11\0\0\0\0", 13);
    m->prefix[4] = (c->avcc ? 1 : 0) | (c->asc ? 4 : 0);
    m->spans[0].data = m->prefix;
    m->spans[0].size = 13;
    m->span_count = 1;
    m->pending = true;
+   return m;
+}
+
+rflv_mux_t *rflv_mux_new(const rflv_config_t *c)
+{
+   return flv_new(c, FLV_AVC);
+}
+
+rflv_mux_t *rflv_mux_new_hevc(const rflv_config_t *c)
+{
+   return flv_new(c, FLV_HEVC);
+}
+
+rflv_mux_t *rflv_mux_new_av1(const rflv_config_t *c)
+{
+   return flv_new(c, FLV_AV1);
+}
+
+rflv_mux_t *rflv_mux_new_av1_obu(const rflv_config_t *c)
+{
+   rav1_obu_t obu, sequence;
+   rav1_sequence_t *info;
+   rflv_config_t config;
+   rflv_mux_t *m = NULL;
+   uint8_t *data;
+   size_t at = 0, used;
+   int result;
+   if (!c || !c->avcc || !c->avcc_size || c->avcc_size > 65532)
+      return NULL;
+   memset(&sequence, 0, sizeof(sequence));
+   while ((result = rav1_obu_next(&obu, (const uint8_t*)c->avcc, c->avcc_size, &at, false)) > 0)
+   {
+      if (obu.type == 1)
+      {
+         if (sequence.data)
+            return NULL;
+         sequence = obu;
+      }
+      else if (obu.type != 2 && obu.type != 5 && obu.type != 15)
+         return NULL;
+   }
+   if (result < 0 || !sequence.data)
+      return NULL;
+   info = (rav1_sequence_t*)malloc(sizeof(*info));
+   if (!info)
+      return NULL;
+   if (!rav1_sequence_parse(info, sequence.payload, sequence.payload_size))
+   {
+      free(info);
+      return NULL;
+   }
+   data = (uint8_t*)malloc(c->avcc_size + 4);
+   if (data)
+   {
+      data[0] = 0x81;
+      data[1] = (uint8_t)((info->profile << 5) | info->operating_points[0].level);
+      data[2] = (uint8_t)((info->operating_points[0].tier << 7)
+            | ((info->bit_depth > 8) << 6) | ((info->bit_depth == 12) << 5)
+            | (info->monochrome << 4) | (info->subsampling_x << 3)
+            | (info->subsampling_y << 2) | info->chroma_sample_position);
+      data[3] = 0;
+      memcpy(data + 4, sequence.data, sequence.size);
+      used = sequence.size + 4;
+      at = 0;
+      while (rav1_obu_next(&obu, (const uint8_t*)c->avcc, c->avcc_size, &at, false) > 0)
+         if (obu.type == 5)
+         {
+            memcpy(data + used, obu.data, obu.size);
+            used += obu.size;
+         }
+      config = *c;
+      config.avcc = data;
+      config.avcc_size = used;
+      m = rflv_mux_new_av1(&config);
+      free(data);
+   }
+   free(info);
+   return m;
+}
+
+struct flv_metadata_writer
+{
+   uint8_t *data;
+   size_t used;
+   bool failed;
+};
+
+static void flv_metadata_bytes(struct flv_metadata_writer *w,
+      const void *data, size_t size)
+{
+   if (w->failed || size > 512 - w->used)
+   {
+      w->failed = true;
+      return;
+   }
+   memcpy(w->data + w->used, data, size);
+   w->used += size;
+}
+
+static void flv_metadata_name(struct flv_metadata_writer *w,
+      const char *name, bool property)
+{
+   uint8_t header[3];
+   size_t size = strlen(name);
+   header[0] = 2;
+   header[1] = (uint8_t)(size >> 8);
+   header[2] = (uint8_t)size;
+   flv_metadata_bytes(w, header + (property ? 1 : 0), property ? 2 : 3);
+   flv_metadata_bytes(w, name, size);
+}
+
+static void flv_metadata_object(struct flv_metadata_writer *w, const char *name)
+{
+   static const uint8_t marker = 3;
+   flv_metadata_name(w, name, true);
+   flv_metadata_bytes(w, &marker, 1);
+}
+
+static void flv_metadata_end(struct flv_metadata_writer *w)
+{
+   static const uint8_t end[] = {0, 0, 9};
+   flv_metadata_bytes(w, end, sizeof(end));
+}
+
+/* Encode the nonnegative rational as binary64 without host float assumptions. */
+static void flv_metadata_number(struct flv_metadata_writer *w, const char *name,
+      uint32_t numerator, unsigned denominator)
+{
+   uint64_t n = numerator, d = denominator, fraction = 0, bits = 0, remainder;
+   int exponent = 0;
+   unsigned i;
+   if (n)
+   {
+      while (n < d)
+      {
+         n <<= 1;
+         exponent--;
+      }
+      while (n >= d * 2)
+      {
+         d <<= 1;
+         exponent++;
+      }
+      remainder = n - d;
+      for (i = 0; i < 52; i++)
+      {
+         remainder <<= 1;
+         fraction <<= 1;
+         if (remainder >= d)
+         {
+            remainder -= d;
+            fraction++;
+         }
+      }
+      if (remainder * 2 > d || (remainder * 2 == d && (fraction & 1)))
+         fraction++;
+      if (fraction == ((uint64_t)1 << 52))
+      {
+         fraction = 0;
+         exponent++;
+      }
+      bits = ((uint64_t)(exponent + 1023) << 52) | fraction;
+   }
+   flv_metadata_name(w, name, true);
+   if (w->failed || 512 - w->used < 9)
+   {
+      w->failed = true;
+      return;
+   }
+   w->data[w->used++] = 0;
+   for (i = 0; i < 8; i++)
+      w->data[w->used++] = (uint8_t)(bits >> (56 - i * 8));
+}
+
+bool rflv_mux_set_color(rflv_mux_t *m, const video_color_metadata_t *c,
+      unsigned depth)
+{
+   static const char *const xy[] =
+   { "redX", "redY", "greenX", "greenY", "blueX", "blueY", "whitePointX", "whitePointY" };
+   struct flv_metadata_writer w;
+   static const uint8_t object = 3;
+   unsigned i;
+   if (!m || !c || (!m->hevc && !m->av1) || m->failed || m->metadata
+         || m->output != FLV_HEADER || !m->pending
+         || (depth != 8 && depth != 10 && depth != 12)
+         || (m->hevc && (depth != 8u + (m->config[17] & 7)
+               || ((m->config[16] & 3) && depth != 8u + (m->config[18] & 7))))
+         || (m->av1 && (depth != m->av1_sequence->bit_depth
+               || (c->primaries && c->primaries != m->av1_sequence->color_primaries)
+               || (c->transfer && c->transfer != m->av1_sequence->transfer_characteristics)
+               || (c->matrix && c->matrix != m->av1_sequence->matrix_coefficients)
+               || (c->range && c->range != m->av1_sequence->color_range + 1)))
+         || c->primaries > 255 || c->transfer > 255 || c->matrix > 255
+         || c->range > 2 || c->max_cll > 10000 || c->max_fall > 10000
+         || (c->max_cll && c->max_fall > c->max_cll))
+      return false;
+   if (c->mastering.present)
+   {
+      if (c->mastering.present != VIDEO_MASTERING_DISPLAY_COMPLETE
+            || c->mastering.luminance_max < 50000 || c->mastering.luminance_max > 100000000
+            || !c->mastering.luminance_min || c->mastering.luminance_min > 50000)
+         return false;
+      for (i = 0; i < 8; i++)
+         if (c->mastering.chromaticity[i] < 5
+               || c->mastering.chromaticity[i] > (i & 1 ? 42000 : 37000))
+            return false;
+   }
+   w.data = (uint8_t*)malloc(512);
+   if (!w.data)
+      return false;
+   w.used = 0;
+   w.failed = false;
+   flv_metadata_name(&w, "colorInfo", false);
+   flv_metadata_bytes(&w, &object, 1);
+   flv_metadata_object(&w, "colorConfig");
+   flv_metadata_number(&w, "bitDepth", depth, 1);
+   if (c->primaries)
+      flv_metadata_number(&w, "colorPrimaries", c->primaries, 1);
+   if (c->transfer)
+      flv_metadata_number(&w, "transferCharacteristics", c->transfer, 1);
+   if (c->matrix)
+      flv_metadata_number(&w, "matrixCoefficients", c->matrix, 1);
+   flv_metadata_end(&w);
+   if (c->max_cll || c->max_fall)
+   {
+      flv_metadata_object(&w, "hdrCll");
+      if (c->max_cll)
+         flv_metadata_number(&w, "maxCLL", c->max_cll, 1);
+      if (c->max_fall)
+         flv_metadata_number(&w, "maxFall", c->max_fall, 1);
+      flv_metadata_end(&w);
+   }
+   if (c->mastering.present)
+   {
+      flv_metadata_object(&w, "hdrMdcv");
+      for (i = 0; i < 8; i++)
+         flv_metadata_number(&w, xy[i], (c->mastering.chromaticity[i] + 2u) / 5, 10000);
+      flv_metadata_number(&w, "maxLuminance", c->mastering.luminance_max, 10000);
+      flv_metadata_number(&w, "minLuminance", c->mastering.luminance_min, 10000);
+      flv_metadata_end(&w);
+   }
+   flv_metadata_end(&w);
+   if (w.failed)
+   {
+      free(w.data);
+      return false;
+   }
+   m->metadata = w.data;
+   m->metadata_size = w.used;
+   return true;
+}
+
+static bool flv_annexb(const uint8_t *data, size_t size, size_t *offset,
+      const uint8_t **nal, size_t *length)
+{
+   size_t start = *offset, at, zeros = 0, end;
+   while (start < size && !data[start])
+      start++;
+   if (start - *offset < 2 || start == size || data[start] != 1)
+      return false;
+   start++;
+   end = size;
+   for (at = start; at < size; at++)
+   {
+      if (!data[at])
+         zeros++;
+      else
+      {
+         if (data[at] == 1 && zeros >= 2)
+         {
+            end = at - zeros;
+            break;
+         }
+         zeros = 0;
+      }
+   }
+   *offset = at < size ? end : size;
+   if (at == size)
+      end -= zeros;
+   if (end <= start)
+      return false;
+   *nal = data + start;
+   *length = end - start;
+   return true;
+}
+
+struct flv_rbsp
+{
+   const uint8_t *data;
+   size_t size, at;
+   unsigned byte, left, zeros;
+   bool failed;
+};
+
+static unsigned flv_rbsp_bits(struct flv_rbsp *b, unsigned count)
+{
+   unsigned value = 0, next;
+   while (count--)
+   {
+      if (!b->left)
+      {
+         if (b->at == b->size)
+            goto failed;
+         next = b->data[b->at++];
+         if (b->zeros == 2 && next == 3)
+         {
+            if (b->at == b->size || b->data[b->at] > 3)
+               goto failed;
+            b->zeros = 0;
+            next = b->data[b->at++];
+         }
+         b->zeros = next ? 0 : b->zeros < 2 ? b->zeros + 1 : 2;
+         b->byte = next;
+         b->left = 8;
+      }
+      value = (value << 1) | ((b->byte >> --b->left) & 1);
+   }
+   return value;
+failed:
+   b->failed = true;
+   return 0;
+}
+
+static unsigned flv_rbsp_ue(struct flv_rbsp *b)
+{
+   unsigned zeros = 0;
+   while (!b->failed && !flv_rbsp_bits(b, 1))
+      if (++zeros == 32)
+         b->failed = true;
+   if (b->failed)
+      return ~0u;
+   return ((1u << zeros) - 1) + flv_rbsp_bits(b, zeros);
+}
+
+static bool flv_hevc_info(const uint8_t *sps, size_t size, uint8_t *header)
+{
+   struct flv_rbsp b;
+   unsigned layers, nested, flags = 0, i, j, chroma, luma, chroma_depth;
+   memset(&b, 0, sizeof(b));
+   b.data = sps + 2;
+   b.size = size - 2;
+   flv_rbsp_bits(&b, 4);
+   layers = flv_rbsp_bits(&b, 3);
+   nested = flv_rbsp_bits(&b, 1);
+   if (layers > 6)
+      return false;
+   for (i = 1; i <= 12; i++)
+      header[i] = (uint8_t)flv_rbsp_bits(&b, 8);
+   for (i = 0; i < layers; i++)
+      flags |= flv_rbsp_bits(&b, 2) << (i * 2);
+   if (layers)
+      for (i = layers; i < 8; i++)
+         if (flv_rbsp_bits(&b, 2))
+            return false;
+   for (i = 0; i < layers; i++)
+   {
+      if (flags & (2u << (i * 2)))
+         for (j = 0; j < 11; j++)
+            flv_rbsp_bits(&b, 8);
+      if (flags & (1u << (i * 2)))
+         flv_rbsp_bits(&b, 8);
+   }
+   if (flv_rbsp_ue(&b) > 15)
+      return false;
+   chroma = flv_rbsp_ue(&b);
+   if (chroma > 3)
+      return false;
+   if (chroma == 3)
+      flv_rbsp_bits(&b, 1);
+   if (!flv_rbsp_ue(&b) || !flv_rbsp_ue(&b))
+      return false;
+   if (flv_rbsp_bits(&b, 1))
+      for (i = 0; i < 4; i++)
+         flv_rbsp_ue(&b);
+   luma = flv_rbsp_ue(&b);
+   chroma_depth = flv_rbsp_ue(&b);
+   if (b.failed || luma > 6 || chroma_depth > 6)
+      return false;
+   header[0] = 1;
+   header[13] = 0xf0;
+   header[15] = 0xfc;
+   header[16] = (uint8_t)(0xfc | chroma);
+   header[17] = (uint8_t)(0xf8 | luma);
+   header[18] = (uint8_t)(0xf8 | chroma_depth);
+   header[21] = (uint8_t)(((layers + 1) << 3) | (nested << 2) | 3);
+   header[22] = 3;
+   return true;
+}
+
+rflv_mux_t *rflv_mux_new_hevc_annexb(const rflv_config_t *c)
+{
+   const uint8_t *sets[3] = {NULL, NULL, NULL}, *nal;
+   size_t lengths[3] = {0, 0, 0}, at = 0, size, total = 38;
+   unsigned type, i;
+   uint8_t *hvcc;
+   rflv_config_t config;
+   rflv_mux_t *m;
+   if (!c || !c->avcc || !c->avcc_size || c->avcc_size > 65536
+         || !c->max_packet_size || c->max_packet_size > 0xfffff7)
+      return NULL;
+   while (at < c->avcc_size)
+   {
+      if (!flv_annexb((const uint8_t*)c->avcc, c->avcc_size, &at, &nal, &size)
+            || size < 3 || size > 65535 || (nal[0] & 0x81) || nal[1] != 1)
+         return NULL;
+      type = (nal[0] >> 1) & 63;
+      if (type < 32 || type > 34 || sets[type - 32] || size > 65536 - total)
+         return NULL;
+      sets[type - 32] = nal;
+      lengths[type - 32] = size;
+      total += size;
+   }
+   if (!sets[0] || !sets[1] || !sets[2])
+      return NULL;
+   hvcc = (uint8_t*)calloc(1, total);
+   if (!hvcc)
+      return NULL;
+   if (!flv_hevc_info(sets[1], lengths[1], hvcc))
+   {
+      free(hvcc);
+      return NULL;
+   }
+   at = 23;
+   for (i = 0; i < 3; i++)
+   {
+      hvcc[at++] = (uint8_t)(0xa0 + i);
+      flv_uint(hvcc + at, 1, 2);
+      flv_uint(hvcc + at + 2, (uint32_t)lengths[i], 2);
+      memcpy(hvcc + at + 4, sets[i], lengths[i]);
+      at += lengths[i] + 4;
+   }
+   config = *c;
+   config.avcc = hvcc;
+   config.avcc_size = total;
+   m = rflv_mux_new_hevc(&config);
+   free(hvcc);
+   if (!m)
+      return NULL;
+   m->converted = (uint8_t*)malloc(m->limit);
+   if (!m->converted)
+   {
+      rflv_mux_free(m);
+      return NULL;
+   }
+   return m;
+}
+
+rflv_mux_t *rflv_mux_new_annexb(const rflv_config_t *c)
+{
+   rflv_config_t config;
+   rflv_mux_t *m;
+   const uint8_t *nal, *sps = NULL, *pps = NULL;
+   uint8_t *avcc;
+   size_t offset = 0, size, sps_size = 0, pps_size = 0;
+   if (!c || !c->avcc || !c->avcc_size || c->avcc_size > 65536
+         || !c->max_packet_size || c->max_packet_size > 0xfffffa)
+      return NULL;
+   while (offset < c->avcc_size)
+   {
+      unsigned type;
+      if (!flv_annexb((const uint8_t*)c->avcc, c->avcc_size, &offset, &nal, &size)
+            || size > 65535 || (nal[0] & 0x80))
+         return NULL;
+      type = nal[0] & 31;
+      if (type == 7 && !sps && size >= 4)
+      {
+         sps = nal;
+         sps_size = size;
+      }
+      else if (type == 8 && !pps)
+      {
+         pps = nal;
+         pps_size = size;
+      }
+      else
+         return NULL;
+   }
+   if (!sps || !pps || sps_size + pps_size > 65536 - 11)
+      return NULL;
+   size = sps_size + pps_size + 11;
+   avcc = (uint8_t*)malloc(size);
+   if (!avcc)
+      return NULL;
+   avcc[0] = 1;
+   memcpy(avcc + 1, sps + 1, 3);
+   avcc[4] = 255;
+   avcc[5] = 225;
+   flv_uint(avcc + 6, (uint32_t)sps_size, 2);
+   memcpy(avcc + 8, sps, sps_size);
+   avcc[8 + sps_size] = 1;
+   flv_uint(avcc + 9 + sps_size, (uint32_t)pps_size, 2);
+   memcpy(avcc + 11 + sps_size, pps, pps_size);
+   config = *c;
+   config.avcc = avcc;
+   config.avcc_size = size;
+   m = rflv_mux_new(&config);
+   free(avcc);
+   if (!m)
+      return NULL;
+   m->converted = (uint8_t*)malloc(m->limit);
+   if (!m->converted)
+   {
+      rflv_mux_free(m);
+      return NULL;
+   }
    return m;
 }
 
@@ -209,6 +785,7 @@ int rflv_mux_push(rflv_mux_t *m, unsigned track, const void *data,
       return RFLV_ERROR;
    composition = (int64_t)pts_ms - dts_ms;
    if ((track == 1 && (composition < -0x800000 || composition > 0x7fffff
+               || (m->av1 && pts != dts)
                || (!m->seen[0] && !keyframe))) || (track == 2 && pts != dts))
       return RFLV_ERROR;
    m->track = track;
@@ -220,6 +797,8 @@ int rflv_mux_push(rflv_mux_t *m, unsigned track, const void *data,
    m->composition = (int32_t)composition;
    m->keyframe = keyframe;
    m->vcl = m->idr = false;
+   m->annexb = false;
+   m->converted_size = 0;
    m->output = FLV_MEDIA;
    m->scanning = track == 1;
    if (track == 2)
@@ -227,8 +806,22 @@ int rflv_mux_push(rflv_mux_t *m, unsigned track, const void *data,
    return RFLV_PROGRESS;
 }
 
+int rflv_mux_push_annexb(rflv_mux_t *m, const void *data, size_t size,
+      uint64_t dts, uint64_t pts, bool keyframe)
+{
+   int result;
+   if (!m || !m->converted)
+      return RFLV_ERROR;
+   result = rflv_mux_push(m, 1, data, size, dts, pts, keyframe);
+   if (result == RFLV_PROGRESS)
+      m->annexb = true;
+   return result;
+}
+
 int rflv_mux_step(rflv_mux_t *m)
 {
+   const uint8_t *nal;
+   size_t size;
    uint32_t length;
    unsigned type;
    if (!m || m->failed)
@@ -244,22 +837,70 @@ int rflv_mux_step(rflv_mux_t *m)
       if (!m->vcl || (!m->seen[0] && !m->idr))
          goto failed;
       m->scanning = false;
-      flv_tag(m, 1, m->input, m->size, m->timestamp, m->composition, m->keyframe, false);
+      flv_tag(m, 1, m->annexb ? m->converted : m->input,
+            m->annexb ? m->converted_size : m->size,
+            m->timestamp, m->composition, m->keyframe, false);
       return RFLV_PACKET;
    }
-   if (m->size - m->offset < 4)
+   if (m->av1)
+   {
+      rav1_obu_t obu;
+      if (rav1_obu_next(&obu, m->input, m->size, &m->offset, false) != 1
+            || !obu.type || (obu.type >= 8 && obu.type != 15)
+            || obu.spatial_id)
+         goto failed;
+      if (obu.type == 1 && (obu.payload_size != m->av1_config.sequence.payload_size
+               || memcmp(obu.payload, m->av1_config.sequence.payload, obu.payload_size)))
+         goto failed;
+      if (obu.type == 3 || obu.type == 6)
+      {
+         if (!obu.payload_size)
+            goto failed;
+         m->vcl = true;
+         m->idr = m->idr || m->av1_sequence->reduced_still_picture_header
+            || (obu.payload[0] & 0xe0) == 0;
+      }
+      return RFLV_PROGRESS;
+   }
+   if (m->annexb)
+   {
+      if (!flv_annexb(m->input, m->size, &m->offset, &nal, &size)
+            || m->limit - m->converted_size < 4
+            || size > m->limit - m->converted_size - 4)
+         goto failed;
+      flv_uint(m->converted + m->converted_size, (uint32_t)size, 4);
+      memcpy(m->converted + m->converted_size + 4, nal, size);
+      m->converted_size += size + 4;
+   }
+   else
+   {
+      if (m->size - m->offset < 4)
+         goto failed;
+      length = ((uint32_t)m->input[m->offset] << 24) | ((uint32_t)m->input[m->offset + 1] << 16)
+         | ((uint32_t)m->input[m->offset + 2] << 8) | m->input[m->offset + 3];
+      m->offset += 4;
+      if (!length || length > m->size - m->offset)
+         goto failed;
+      nal = m->input + m->offset;
+      size = length;
+      m->offset += length;
+   }
+   if (nal[0] & 0x80)
       goto failed;
-   length = ((uint32_t)m->input[m->offset] << 24) | ((uint32_t)m->input[m->offset + 1] << 16)
-      | ((uint32_t)m->input[m->offset + 2] << 8) | m->input[m->offset + 3];
-   m->offset += 4;
-   if (!length || length > m->size - m->offset || (m->input[m->offset] & 0x80))
-      goto failed;
-   type = m->input[m->offset] & 31;
+   if (m->hevc)
+   {
+      if (size < 2 || !(nal[1] & 7))
+         goto failed;
+      type = (nal[0] >> 1) & 63;
+      m->vcl = m->vcl || type <= 31;
+      m->idr = m->idr || (type >= 16 && type <= 23);
+      return RFLV_PROGRESS;
+   }
+   type = nal[0] & 31;
    if (!type || type >= 24)
       goto failed;
    m->vcl = m->vcl || type <= 5;
    m->idr = m->idr || type == 5;
-   m->offset += length;
    return RFLV_PROGRESS;
 failed:
    m->failed = true;
@@ -277,12 +918,31 @@ bool rflv_mux_get(rflv_mux_t *m, const rflv_span_t **spans, size_t *count)
    return true;
 }
 
+bool rflv_mux_get_tag(rflv_mux_t *m, rflv_tag_t *tag)
+{
+   if (!m || !tag || !m->pending || m->output == FLV_HEADER)
+      return false;
+   tag->spans[0].data = m->prefix + 11;
+   tag->spans[0].size = m->spans[0].size - 11;
+   tag->spans[1] = m->spans[1];
+   tag->timestamp = m->timestamp;
+   tag->type = m->prefix[0];
+   return true;
+}
+
 bool rflv_mux_release(rflv_mux_t *m)
 {
    if (!m || !m->pending)
       return false;
    m->pending = false;
-   if (m->output == FLV_HEADER && m->avcc_size)
+   if (m->output == FLV_HEADER && m->metadata)
+   {
+      m->output = FLV_COLOR;
+      flv_tag(m, 1, m->metadata, m->metadata_size, 0, 0, true, true);
+      /* Information-frame flags preserve existing demuxer interoperability. */
+      m->prefix[11] = 0xd4;
+   }
+   else if ((m->output == FLV_HEADER || m->output == FLV_COLOR) && m->avcc_size)
    {
       m->output = FLV_VIDEO_CONFIG;
       flv_tag(m, 1, m->config, m->avcc_size, 0, 0, true, true);
@@ -319,5 +979,8 @@ void rflv_mux_free(rflv_mux_t *m)
    if (!m)
       return;
    free(m->config);
+   free(m->converted);
+   free(m->metadata);
+   free(m->av1_sequence);
    free(m);
 }

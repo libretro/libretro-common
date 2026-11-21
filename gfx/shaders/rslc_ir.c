@@ -34,6 +34,8 @@
 
 #include "rslc_share.h"
 
+#include <gfx/shaders/spirv_words.h>
+
 #define RSLC_INTERN_INITIAL 256u /* slots; power of two */
 
 /* Allocator wrappers */
@@ -427,9 +429,13 @@ static const char *const rslc_keywords[] = {
    "samplerCubeArray", "isamplerCubeArray", "usamplerCubeArray",
    "sampler1DShadow", "sampler2DShadow", "sampler2DArrayShadow",
    "samplerCubeShadow", "samplerCubeArrayShadow",
+   "sampler2DMS", "isampler2DMS", "usampler2DMS",
    "image2D", "iimage2D", "uimage2D", "image2DArray", "iimage2DArray", "uimage2DArray",
-   "subpassInput",
-   "buffer", "readonly", "writeonly", "coherent", "restrict", "volatile", "shared"
+   "image2DMS", "iimage2DMS", "uimage2DMS",
+   "subpassInput", "subpassInputMS",
+   "double",
+   "buffer", "readonly", "writeonly", "coherent", "restrict", "volatile", "shared",
+   "pervertexEXT"
 #endif
 };
 
@@ -619,15 +625,33 @@ void rslc_ctx_close(struct rslc_ctx *c)
 
 /* IR */
 
+/* Types are interned: found by what they are in a hash of them, not by
+ * a walk of every type made (which was a few percent of a compile's
+ * time for a long stage). A struct is never found this way. */
+#define RSLC_TYPE_HASH 128
+
+static unsigned rslc_type_bucket(enum rslc_tkind kind, enum rslc_base base,
+      unsigned rows, unsigned cols, const struct rslc_type *elem,
+      uint32_t array_len)
+{
+   uint32_t h = (uint32_t)kind * 0x9e3779b1u;
+   h ^= ((uint32_t)base << 16) ^ (rows << 8) ^ cols;
+   h ^= (uint32_t)((size_t)elem >> 4) * 0x85ebca6bu;
+   h ^= array_len * 0xc2b2ae35u;
+   h ^= h >> 15;
+   return (unsigned)(h & (RSLC_TYPE_HASH - 1));
+}
+
 static struct rslc_type *rslc_type_find(struct rslc_ctx *c, enum rslc_tkind kind,
       enum rslc_base base, unsigned rows, unsigned cols,
       const struct rslc_type *elem, uint32_t array_len)
 {
    struct rslc_type *t;
-   for (t = c->type_chain; t; t = t->next)
+   if (kind == RSLC_TY_STRUCT || !c->type_hash)
+      return NULL;
+   for (t = c->type_hash[rslc_type_bucket(kind, base, rows, cols, elem, array_len)]; t; t = t->hnext)
       if (t->kind == kind && t->base == base && t->rows == rows
-            && t->cols == cols && t->elem == elem && t->array_len == array_len
-            && t->kind != RSLC_TY_STRUCT)
+            && t->cols == cols && t->elem == elem && t->array_len == array_len)
          return t;
    return NULL;
 }
@@ -636,7 +660,15 @@ static struct rslc_type *rslc_type_add(struct rslc_ctx *c, enum rslc_tkind kind,
       enum rslc_base base, unsigned rows, unsigned cols,
       const struct rslc_type *elem, uint32_t array_len)
 {
-   struct rslc_type *t = (struct rslc_type*)rslc_arena_zalloc(c, sizeof(*t));
+   struct rslc_type *t;
+   if (!c->type_hash)
+   {
+      c->type_hash = (struct rslc_type**)rslc_arena_zalloc(c,
+            RSLC_TYPE_HASH * sizeof(*c->type_hash));
+      if (!c->type_hash)
+         return NULL;
+   }
+   t = (struct rslc_type*)rslc_arena_zalloc(c, sizeof(*t));
    if (!t)
       return NULL;
    t->kind      = (uint8_t)kind;
@@ -648,6 +680,12 @@ static struct rslc_type *rslc_type_add(struct rslc_ctx *c, enum rslc_tkind kind,
    t->id        = ++c->ntypes;
    t->next      = c->type_chain;
    c->type_chain = t;
+   if (kind != RSLC_TY_STRUCT)
+   {
+      struct rslc_type **bucket = &c->type_hash[rslc_type_bucket(kind, base, rows, cols, elem, array_len)];
+      t->hnext = *bucket;
+      *bucket  = t;
+   }
    return t;
 }
 
@@ -984,6 +1022,8 @@ uint32_t rslc_layout_field_offset(const struct rslc_type *t, uint32_t field,
       uint32_t fa, fs, fst;
       rslc_layout_of(t->fields[i].type, std140, &fa, &fs, &fst);
       off = (off + fa - 1) / fa * fa;
+      if (t->fields[i].offset_p1)
+         off = t->fields[i].offset_p1 - 1;
       if (i == field)
          return off;
       off += fs;
@@ -995,14 +1035,9 @@ uint32_t rslc_layout_field_offset(const struct rslc_type *t, uint32_t field,
 /* SPIR-V emitter                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Word buffers for the module's sections; concatenated at the end in
- * the order the spec requires. */
-struct rslc_wbuf
-{
-   uint32_t *v;
-   uint32_t  n;
-   uint32_t  cap;
-};
+/* Word buffers for the module's sections (gfx/shaders/spirv_words.h);
+ * joined at the end in the order the spec requires. */
+#define rslc_wbuf spirv_words_buf
 
 enum spv_section
 {
@@ -1016,10 +1051,10 @@ enum spv_section
 };
 
 /* SPIR-V enumerants used here. */
-#define SPV_MAGIC            0x07230203u
 #define SPV_VERSION_1_0      0x00010000u
 #define SPV_CAP_SHADER       1
 #define SPV_CAP_IMAGEQUERY   50
+#define SPV_CAP_STORAGEIMAGEEXTENDED 49
 #define SPV_CAP_SAMPLEDBUFFER 46
 #define SPV_CAP_SAMPLED1D    43
 #define SPV_CAP_SAMPLEDCUBEARRAY 45
@@ -1062,6 +1097,7 @@ enum spv_section
 #define SPV_DEC_ARRAYSTRIDE  6
 #define SPV_DEC_MATRIXSTRIDE 7
 #define SPV_DEC_BUILTIN      11
+#define SPV_DEC_SPECID       1
 #define SPV_DEC_NOPERSPECTIVE 13
 #define SPV_DEC_FLAT         14
 #define SPV_DEC_CENTROID     16
@@ -1088,6 +1124,7 @@ enum spv_section
 #define SPV_BI_LAYER         9
 #define SPV_BI_NUMWORKGROUPS 24
 #define SPV_BI_WORKGROUPID   26
+#define SPV_BI_WORKGROUPSIZE 25
 #define SPV_BI_LOCALINVOCATIONID 27
 #define SPV_BI_GLOBALINVOCATIONID 28
 #define SPV_BI_LOCALINVOCATIONINDEX 29
@@ -1107,6 +1144,8 @@ enum spv_op
    SpvOpTypePointer = 32, SpvOpTypeFunction = 33,
    SpvOpConstantTrue = 41, SpvOpConstantFalse = 42, SpvOpConstant = 43,
    SpvOpConstantComposite = 44,
+   SpvOpSpecConstantTrue = 48, SpvOpSpecConstantFalse = 49, SpvOpSpecConstant = 50,
+   SpvOpSpecConstantComposite = 51,
    SpvOpFunction = 54, SpvOpFunctionParameter = 55, SpvOpFunctionEnd = 56,
    SpvOpFunctionCall = 57, SpvOpVariable = 59, SpvOpLoad = 61, SpvOpStore = 62, SpvOpCopyMemory = 63,
    SpvOpAccessChain = 65, SpvOpInBoundsAccessChain = 66, SpvOpDecorate = 71, SpvOpMemberDecorate = 72,
@@ -1208,6 +1247,12 @@ struct spv_const
    uint32_t id;
 };
 
+struct spv_vconst
+{
+   uint32_t type, id;
+   uint32_t c[4];
+};
+
 struct spv_var
 {
    uint32_t id;        /* the OpVariable, or the constant for a folded const */
@@ -1215,6 +1260,7 @@ struct spv_var
    uint32_t tid;       /* type id of the variable's value */
    uint8_t  sc;        /* storage class */
    bool     is_const;  /* id is a constant value, not a pointer */
+   bool     byval;     /* a const in parameter: id is its value */
    bool     in_block;  /* RSLC_ST_MEMBER / BLOCK: id is the block variable */
 };
 
@@ -1228,12 +1274,17 @@ struct spv_ctl
 struct spv_emit
 {
    struct rslc_ctx     *c;
+   struct spirv_words   words;        /* the sections' memory: the arena */
    struct rslc_wbuf     sec[SPV_SEC_COUNT];
    struct spv_tinfo    *tinfo;        /* by type id */
    struct spv_var      *vars;         /* by var id */
    uint32_t            *func_ids;     /* by func id */
    uint32_t            *func_types;
    struct spv_const    *consts;
+   struct spv_vconst   *vconsts;   /* constant vectors made, by type and components */
+   uint32_t             nvconsts, vconsts_cap;
+   struct spv_const    *xptrs;     /* pointer types to types outside tinfo: type, class, id */
+   uint32_t             nxptrs, xptrs_cap;
    struct rslc_wbuf     entry_iface;  /* interface ids for OpEntryPoint */
    struct rslc_wbuf     func_vars;    /* OpVariable Function words, hoisted */
    struct rslc_wbuf     fntypes;      /* interned OpTypeFunction: id, n, words[n] */
@@ -1250,6 +1301,9 @@ struct spv_emit
    uint32_t             cur_label;    /* current block's label, 0 = terminated */
    uint32_t             entry_label;
    bool                 need_imagequery;
+   bool                 need_storageimageextended;
+   bool                 need_storageimagemultisample;
+   bool                 need_storageimagewritewithoutformat;
    bool                 need_inputattachment;
    bool                 need_groupnonuniform;
    bool                 need_groupnonuniformarith;
@@ -1260,25 +1314,26 @@ struct spv_emit
    bool                 need_geometry;   /* a pixel stage reading gl_Layer */
    bool                 need_clipdistance;
    bool                 writes_fragdepth;   /* the entry point declares DepthReplacing */
+   bool                 need_float64;       /* Float64 */
+   bool                 need_barycentric;   /* FragmentBarycentricKHR, with its extension */
+   bool                 writes_stencilref;  /* and StencilRefReplacingEXT, with its extension */
    bool                 need_culldistance;
    bool                 in_main;
 };
 
+/* A buffer's storage grown from the arena, the words it held copied
+ * over: the arena frees nothing until the compile is done. */
+static void *spv_grow(void *user, void *old, size_t old_bytes, size_t new_bytes)
+{
+   void *nv = rslc_arena_alloc((struct rslc_ctx*)user, new_bytes);
+   if (nv && old_bytes)
+      memcpy(nv, old, old_bytes);
+   return nv;
+}
+
 static bool spv_w(struct spv_emit *e, struct rslc_wbuf *b, uint32_t w)
 {
-   if (b->n == b->cap)
-   {
-      uint32_t  ncap = b->cap ? b->cap * 2 : 256;
-      uint32_t *nv   = (uint32_t*)rslc_arena_alloc(e->c, ncap * sizeof(*nv));
-      if (!nv)
-         return false;
-      if (b->n)
-         memcpy(nv, b->v, b->n * sizeof(*nv));
-      b->v   = nv;
-      b->cap = ncap;
-   }
-   b->v[b->n++] = w;
-   return true;
+   return spirv_words_put(&e->words, b, w);
 }
 
 /* Emits an instruction: opcode, then the given words.  n includes
@@ -1286,14 +1341,7 @@ static bool spv_w(struct spv_emit *e, struct rslc_wbuf *b, uint32_t w)
 static bool spv_inst(struct spv_emit *e, enum spv_section s, enum spv_op op,
       const uint32_t *words, uint32_t n)
 {
-   struct rslc_wbuf *b = &e->sec[s];
-   uint32_t i;
-   if (!spv_w(e, b, ((n + 1) << 16) | (uint32_t)op))
-      return false;
-   for (i = 0; i < n; i++)
-      if (!spv_w(e, b, words[i]))
-         return false;
-   return true;
+   return spirv_words_op(&e->words, &e->sec[s], (uint32_t)op, words, n);
 }
 
 static bool spv_inst1(struct spv_emit *e, enum spv_section s, enum spv_op op, uint32_t a)
@@ -1331,32 +1379,8 @@ static uint32_t spv_id(struct spv_emit *e)
 static bool spv_inst_str(struct spv_emit *e, enum spv_section s, enum spv_op op,
       const uint32_t *pre, uint32_t npre, const char *str, const uint32_t *post, uint32_t npost)
 {
-   uint32_t len    = (uint32_t)strlen(str);
-   uint32_t nwords = len / 4 + 1;
-   uint32_t i;
-   struct rslc_wbuf *b = &e->sec[s];
-   if (!spv_w(e, b, ((npre + nwords + npost + 1) << 16) | (uint32_t)op))
-      return false;
-   for (i = 0; i < npre; i++)
-      if (!spv_w(e, b, pre[i]))
-         return false;
-   for (i = 0; i < nwords; i++)
-   {
-      uint32_t w = 0;
-      uint32_t k;
-      for (k = 0; k < 4; k++)
-      {
-         uint32_t idx = i * 4 + k;
-         if (idx < len)
-            w |= (uint32_t)(uint8_t)str[idx] << (8 * k);
-      }
-      if (!spv_w(e, b, w))
-         return false;
-   }
-   for (i = 0; i < npost; i++)
-      if (!spv_w(e, b, post[i]))
-         return false;
-   return true;
+   return spirv_words_op_str(&e->words, &e->sec[s], (uint32_t)op,
+         pre, npre, str, post, npost);
 }
 
 static bool spv_name(struct spv_emit *e, uint32_t id, const char *name)
@@ -1551,6 +1575,11 @@ static uint32_t spv_type(struct spv_emit *e, const struct rslc_type *t)
                if (!spv_inst3(e, SPV_SEC_TYPES, SpvOpTypeInt, id, 32, 0))
                   return 0;
                break;
+            case RSLC_BASE_DOUBLE:
+               if (!spv_inst2(e, SPV_SEC_TYPES, SpvOpTypeFloat, id, 64))
+                  return 0;
+               e->need_float64 = true;
+               break;
             default:
                if (!spv_inst2(e, SPV_SEC_TYPES, SpvOpTypeFloat, id, 32))
                   return 0;
@@ -1623,7 +1652,7 @@ static uint32_t spv_type(struct spv_emit *e, const struct rslc_type *t)
          w[0] = img; w[1] = s; w[2] = (uint32_t)t->rows - 1;
          w[3] = (t->cols & RSLC_SX_SHADOW) ? 1 : 0;
          w[4] = (t->cols & RSLC_SX_ARRAY) ? 1 : 0;
-         w[5] = 0; w[6] = 1; w[7] = 0;
+         w[5] = (t->cols & RSLC_SX_MS) ? 1 : 0; w[6] = 1; w[7] = 0;
          if (t->rows == RSLC_SDIM_1D)
             e->need_sampled1d = true;
          if (t->rows == RSLC_SDIM_CUBE && (t->cols & RSLC_SX_ARRAY))
@@ -1637,6 +1666,7 @@ static uint32_t spv_type(struct spv_emit *e, const struct rslc_type *t)
       }
       case RSLC_TY_IMAGE2D:
       case RSLC_TY_IMAGE2DARRAY:
+      case RSLC_TY_IMAGE2DMS:
       {
          /* a storage image: Sampled 2, its format from the layout (cols) */
          uint32_t s = spv_type(e, rslc_type_basic(e->c, RSLC_TY_SCALAR, (enum rslc_base)t->base, 1, 1));
@@ -1644,7 +1674,14 @@ static uint32_t spv_type(struct spv_emit *e, const struct rslc_type *t)
             return 0;
          ti = &e->tinfo[t->id];
          w[0] = id; w[1] = s; w[2] = 1 /* 2D */; w[3] = 0;
-         w[4] = t->kind == RSLC_TY_IMAGE2DARRAY; w[5] = 0; w[6] = 2; w[7] = t->cols;
+         w[4] = t->kind == RSLC_TY_IMAGE2DARRAY; w[5] = t->kind == RSLC_TY_IMAGE2DMS;
+         w[6] = 2; w[7] = t->cols;
+         if (!t->cols)
+            e->need_storageimagewritewithoutformat = true;
+         else if (!RSLC_IMGFMT_IS_BASE(t->cols))
+            e->need_storageimageextended = true;
+         if (t->kind == RSLC_TY_IMAGE2DMS)
+            e->need_storageimagemultisample = true;
          if (!spv_inst(e, SPV_SEC_TYPES, SpvOpTypeImage, w, 8))
             return 0;
          ti->img = id;
@@ -1657,7 +1694,7 @@ static uint32_t spv_type(struct spv_emit *e, const struct rslc_type *t)
          if (!s)
             return 0;
          ti = &e->tinfo[t->id];
-         w[0] = id; w[1] = s; w[2] = 6; w[3] = 0; w[4] = 0; w[5] = 0; w[6] = 2; w[7] = 0;
+         w[0] = id; w[1] = s; w[2] = 6; w[3] = 0; w[4] = 0; w[5] = t->cols == 2; w[6] = 2; w[7] = 0;
          if (!spv_inst(e, SPV_SEC_TYPES, SpvOpTypeImage, w, 8))
             return 0;
          ti->img = id;
@@ -1722,16 +1759,49 @@ static uint32_t spv_ptr(struct spv_emit *e, uint32_t tid, unsigned sc)
             return 0;
          return e->tinfo[i].ptr[sc];
       }
-   /* A laid-out type or an ad-hoc one: make a fresh pointer type. */
+   /* A laid-out type or an ad-hoc one: one pointer type for each it is
+    * asked of, kept by the type's id and the storage class. */
+   for (i = 0; i < e->nxptrs; i++)
+      if (e->xptrs[i].type == tid && e->xptrs[i].bits == sc)
+         return e->xptrs[i].id;
    {
       uint32_t p = spv_id(e);
       if (!spv_inst3(e, SPV_SEC_TYPES, SpvOpTypePointer, p, sc, tid))
          return 0;
+      if (e->nxptrs == e->xptrs_cap)
+      {
+         uint32_t          ncap = e->xptrs_cap ? e->xptrs_cap * 2 : 32;
+         struct spv_const *nv   = (struct spv_const*)rslc_arena_alloc(e->c, ncap * sizeof(*nv));
+         if (!nv)
+            return 0;
+         if (e->nxptrs)
+            memcpy(nv, e->xptrs, e->nxptrs * sizeof(*nv));
+         e->xptrs     = nv;
+         e->xptrs_cap = ncap;
+      }
+      e->xptrs[e->nxptrs].type = tid;
+      e->xptrs[e->nxptrs].bits = sc;
+      e->xptrs[e->nxptrs].id   = p;
+      e->nxptrs++;
       return p;
    }
 }
 
-/* Function parameters are pointers; samplers point at the uniform. */
+/* A const in parameter is never written: it is handed over as its
+ * value, with no variable made and stored for it at the call and no
+ * load in the function (as glslang does). Opaque types stay pointers. */
+static bool spv_param_byval(const struct rslc_var *v)
+{
+   if (v->storage != RSLC_ST_PARAM || v->dir != RSLC_DIR_IN || !(v->quals & RSLC_VQ_PRECISE))
+      return false;
+#ifdef RSLC_EXTENDED
+   if (RSLC_TY_IS_IMAGE(v->type->kind) || v->type->kind == RSLC_TY_SUBPASSINPUT)
+      return false;
+#endif
+   return !RSLC_TY_IS_SAMPLER(v->type->kind);
+}
+
+/* The other function parameters are pointers; samplers point at the uniform. */
 static unsigned spv_param_sc(const struct rslc_type *t)
 {
 #ifdef RSLC_EXTENDED
@@ -1848,11 +1918,38 @@ static uint32_t spv_const_composite(struct spv_emit *e, const struct rslc_type *
    }
    else
       return 0;
+   /* a vector made before is that one again */
+   if (t->kind == RSLC_TY_VEC)
+   {
+      uint32_t i;
+      for (i = 0; i < e->nvconsts; i++)
+         if (e->vconsts[i].type == tid && !memcmp(e->vconsts[i].c, words + 2, n * sizeof(uint32_t)))
+            return e->vconsts[i].id;
+   }
    id = spv_id(e);
    words[0] = tid;
    words[1] = id;
    if (!spv_inst(e, SPV_SEC_TYPES, SpvOpConstantComposite, words, 2 + n))
       return 0;
+   if (t->kind == RSLC_TY_VEC)
+   {
+      if (e->nvconsts == e->vconsts_cap)
+      {
+         uint32_t           ncap = e->vconsts_cap ? e->vconsts_cap * 2 : 32;
+         struct spv_vconst *nv   = (struct spv_vconst*)rslc_arena_alloc(e->c, ncap * sizeof(*nv));
+         if (!nv)
+            return 0;
+         if (e->nvconsts)
+            memcpy(nv, e->vconsts, e->nvconsts * sizeof(*nv));
+         e->vconsts     = nv;
+         e->vconsts_cap = ncap;
+      }
+      e->vconsts[e->nvconsts].type = tid;
+      e->vconsts[e->nvconsts].id   = id;
+      memset(e->vconsts[e->nvconsts].c, 0, sizeof(e->vconsts[e->nvconsts].c));
+      memcpy(e->vconsts[e->nvconsts].c, words + 2, n * sizeof(uint32_t));
+      e->nvconsts++;
+   }
    return id;
 }
 
@@ -1926,6 +2023,32 @@ static uint32_t spv_const_var(struct spv_emit *e, const struct rslc_var *v)
    struct spv_var *sv = &e->vars[v->id];
    if (sv->id)
       return sv->id;
+#ifdef RSLC_EXTENDED
+   if (v->spec)
+   {
+      /* a specialization constant: its default, the id it is set by, and
+       * never shared with a constant of the same value */
+      struct rslc_cval cv;
+      uint32_t         tid = spv_type(e, v->type);
+      uint32_t         id;
+      if (!tid || !rslc_const_eval(e->c, v->init, &cv))
+         return 0;
+      id = spv_id(e);
+      if (v->type->base == RSLC_BASE_BOOL)
+      {
+         if (!spv_inst2(e, SPV_SEC_TYPES, cv.v[0] ? SpvOpSpecConstantTrue : SpvOpSpecConstantFalse, tid, id))
+            return 0;
+      }
+      else if (!spv_inst3(e, SPV_SEC_TYPES, SpvOpSpecConstant, tid, id, cv.v[0]))
+         return 0;
+      if (!spv_decorate1(e, id, SPV_DEC_SPECID, v->spec - 1u))
+         return 0;
+      if (v->name && !spv_name(e, id, v->name->str))
+         return 0;
+      sv->id = id;
+      return id;
+   }
+#endif
    sv->id = spv_const_node(e, v->init);
    if (sv->id && v->name && v->type->kind != RSLC_TY_SCALAR && !spv_name(e, sv->id, v->name->str))
       return 0;
@@ -1972,16 +2095,17 @@ static bool spv_fn_inst(struct spv_emit *e, enum spv_op op, const uint32_t *w, u
 static uint32_t spv_fn_result(struct spv_emit *e, enum spv_op op, uint32_t tid,
       const uint32_t *ops, uint32_t nops, uint8_t prec)
 {
-   uint32_t i, id;
-   struct rslc_wbuf *b = &e->sec[SPV_SEC_FUNCS];
+   uint32_t id;
+   uint32_t *p;
    if (!spv_ensure_block(e))
       return 0;
    id = spv_id(e);
-   if (!spv_w(e, b, ((nops + 3) << 16) | (uint32_t)op) || !spv_w(e, b, tid) || !spv_w(e, b, id))
+   if (!(p = spirv_words_op_at(&e->words, &e->sec[SPV_SEC_FUNCS], (uint32_t)op, nops + 2)))
       return 0;
-   for (i = 0; i < nops; i++)
-      if (!spv_w(e, b, ops[i]))
-         return 0;
+   p[0] = tid;
+   p[1] = id;
+   if (nops)
+      memcpy(p + 2, ops, nops * sizeof(*ops));
    if (prec == RSLC_PREC_LOW || prec == RSLC_PREC_MEDIUM)
       if (!spv_decorate(e, id, SPV_DEC_RELAXEDPRECISION))
          return 0;
@@ -2073,10 +2197,13 @@ static uint32_t spv_convert(struct spv_emit *e, uint32_t v, const struct rslc_ty
       return 0;
    if (from->base == to->base)
       return v;
-   if (to->base == RSLC_BASE_FLOAT)
+   /* float to double and back */
+   if (RSLC_BASE_IS_REAL(to->base) && RSLC_BASE_IS_REAL(from->base))
+      return spv_r1(e, (enum spv_op)115 /* OpFConvert */, tid, v, prec);
+   if (RSLC_BASE_IS_REAL(to->base))
       return spv_r1(e, from->base == RSLC_BASE_INT ? SpvOpConvertSToF
             : from->base == RSLC_BASE_UINT ? SpvOpConvertUToF : SpvOpSelect, tid, v, prec);
-   if (from->base == RSLC_BASE_FLOAT)
+   if (RSLC_BASE_IS_REAL(from->base))
       return spv_r1(e, to->base == RSLC_BASE_INT ? SpvOpConvertFToS : SpvOpConvertFToU, tid, v, prec);
    if ((from->base == RSLC_BASE_INT && to->base == RSLC_BASE_UINT)
          || (from->base == RSLC_BASE_UINT && to->base == RSLC_BASE_INT))
@@ -2171,7 +2298,7 @@ static uint32_t spv_mat_columnwise(struct spv_emit *e, enum spv_op op, const str
 
 static enum spv_op spv_binop(const struct rslc_type *t, uint16_t op)
 {
-   bool f = t->base == RSLC_BASE_FLOAT;
+   bool f = RSLC_BASE_IS_REAL(t->base);
    bool s = t->base == RSLC_BASE_INT;
    switch (op)
    {
@@ -2341,10 +2468,52 @@ static uint32_t spv_temp_of(struct spv_emit *e, uint32_t val, const struct rslc_
    return tmp;
 }
 
+/* The steps from a variable to the part of it an lvalue names, kept
+ * until the whole expression is walked so that they go out as one
+ * access chain: a[i].b.c is one instruction and one pointer type, not
+ * three of each. */
+#define SPV_CHAIN_MAX 12
+struct spv_chain
+{
+   uint32_t idx[SPV_CHAIN_MAX];
+   unsigned n;
+   uint32_t tid;   /* what the last step points at */
+};
+
+/* The chain so far, from root; nothing kept after it. */
+static uint32_t spv_chain_emit(struct spv_emit *e, uint32_t root, struct spv_chain *ch, unsigned sc)
+{
+   uint32_t w[3 + SPV_CHAIN_MAX];
+   uint32_t ptrt = spv_ptr(e, ch->tid, sc);
+   if (!ptrt)
+      return 0;
+   w[0] = ptrt; w[1] = spv_id(e); w[2] = root;
+   memcpy(w + 3, ch->idx, ch->n * sizeof(uint32_t));
+   if (!spv_fn_inst(e, SpvOpAccessChain, w, 3 + ch->n))
+      return 0;
+   ch->n = 0;
+   return w[1];
+}
+
+static bool spv_chain_push(struct spv_emit *e, uint32_t *root, struct spv_chain *ch, unsigned sc,
+      uint32_t idx, uint32_t tid)
+{
+   if (ch->n == SPV_CHAIN_MAX)
+   {
+      *root = spv_chain_emit(e, *root, ch, sc);
+      if (!*root)
+         return false;
+   }
+   ch->idx[ch->n++] = idx;
+   ch->tid          = tid;
+   return true;
+}
+
 /* The pointer for an lvalue expression: an access chain from a
  * variable.  sc receives its storage class, laid whether the pointee
  * is a laid-out block type. */
-static uint32_t spv_lvalue(struct spv_emit *e, uint32_t node, unsigned *sc, bool *laid, bool *std140)
+static uint32_t spv_lvalue_root(struct spv_emit *e, uint32_t node, unsigned *sc, bool *laid,
+      bool *std140, struct spv_chain *ch)
 {
    const struct rslc_node *n = rslc_node_at(e->c, node);
    switch (n->op)
@@ -2388,6 +2557,28 @@ static uint32_t spv_lvalue(struct spv_emit *e, uint32_t node, unsigned *sc, bool
             }
             return sv->ptr;
          }
+         if (e->vars[v->id].byval)
+         {
+            /* a value indexed through a pointer: a variable holding it */
+            *sc = SPV_SC_FUNCTION; *laid = false; *std140 = false;
+            return spv_temp_of(e, e->vars[v->id].id, v->type);
+         }
+         if (v->storage == RSLC_ST_MEMBER)
+         {
+            /* a bare block member: the block, and the member's index */
+            const struct rslc_blockdecl *b = &e->c->prog.blocks[v->block];
+            uint32_t idx  = spv_const_int(e, (int32_t)v->member);
+            uint32_t root = e->block_var[v->block];
+            uint32_t ftid;
+            *sc     = b->push ? SPV_SC_PUSHCONSTANT : SPV_SC_UNIFORM;
+            *laid   = true;
+            *std140 = b->std140;
+            e->member_active[v->block][v->member] = 1;
+            ftid = spv_type_laid(e, b->type->fields[v->member].type, b->std140);
+            if (!ftid || !idx || !spv_chain_push(e, &root, ch, *sc, idx, ftid))
+               return 0;
+            return root;
+         }
          return spv_var_ptr(e, v, sc, laid, std140);
       }
       case RSLC_OP_MEMBER:
@@ -2396,8 +2587,7 @@ static uint32_t spv_lvalue(struct spv_emit *e, uint32_t node, unsigned *sc, bool
          const struct rslc_node *bn = rslc_node_at(e->c, n->a);
          uint32_t base;
          uint32_t idx;
-         uint32_t tid, ptrt, id;
-         uint32_t w[4];
+         uint32_t tid;
          if (n->op == RSLC_OP_MEMBER && bn->op == RSLC_OP_VAR
                && e->c->prog.vars[bn->a]->storage == RSLC_ST_BLOCK)
          {
@@ -2411,7 +2601,7 @@ static uint32_t spv_lvalue(struct spv_emit *e, uint32_t node, unsigned *sc, bool
             e->member_active[bv->block][n->b] = 1;
          }
          else
-            base = spv_lvalue(e, n->a, sc, laid, std140);
+            base = spv_lvalue_root(e, n->a, sc, laid, std140, ch);
          if (!base)
             return 0;
          if (n->op == RSLC_OP_MEMBER)
@@ -2437,40 +2627,25 @@ static uint32_t spv_lvalue(struct spv_emit *e, uint32_t node, unsigned *sc, bool
 #ifdef RSLC_EXTENDED
 have_tid:
 #endif
-         if (!tid)
+         if (!tid || !spv_chain_push(e, &base, ch, *sc, idx, tid))
             return 0;
-         ptrt = spv_ptr(e, tid, *sc);
-         if (!ptrt)
-            return 0;
-         id = spv_id(e);
-         w[0] = ptrt; w[1] = id; w[2] = base; w[3] = idx;
-         if (!spv_fn_inst(e, SpvOpAccessChain, w, 4))
-            return 0;
-         return id;
+         return base;
       }
       case RSLC_OP_SWIZZLE:
       {
          /* single-component swizzle is an access chain */
          unsigned cnt = n->aux & 3u;
-         uint32_t base, idx, tid, ptrt, id;
-         uint32_t w[4];
+         uint32_t base, idx, tid;
          if (cnt != 1)
             return 0;
-         base = spv_lvalue(e, n->a, sc, laid, std140);
+         base = spv_lvalue_root(e, n->a, sc, laid, std140, ch);
          if (!base)
             return 0;
          idx  = spv_const_int(e, (int32_t)((n->aux >> 2) & 3u));
          tid  = spv_type(e, n->type);
-         if (!idx || !tid)
+         if (!idx || !tid || !spv_chain_push(e, &base, ch, *sc, idx, tid))
             return 0;
-         ptrt = spv_ptr(e, tid, *sc);
-         if (!ptrt)
-            return 0;
-         id = spv_id(e);
-         w[0] = ptrt; w[1] = id; w[2] = base; w[3] = idx;
-         if (!spv_fn_inst(e, SpvOpAccessChain, w, 4))
-            return 0;
-         return id;
+         return base;
       }
       default:
       {
@@ -2482,6 +2657,18 @@ have_tid:
          return spv_temp_of(e, v, n->type);
       }
    }
+}
+
+
+static uint32_t spv_lvalue(struct spv_emit *e, uint32_t node, unsigned *sc, bool *laid, bool *std140)
+{
+   struct spv_chain ch;
+   uint32_t root;
+   ch.n = 0;
+   root = spv_lvalue_root(e, node, sc, laid, std140, &ch);
+   if (root && ch.n)
+      return spv_chain_emit(e, root, &ch, *sc);
+   return root;
 }
 
 /* Stores val into the lvalue node; multi-component swizzles become a
@@ -2893,7 +3080,7 @@ static uint32_t spv_construct_node(struct spv_emit *e, const struct rslc_node *n
 /* ext-inst builtin map; 0 = core op handled elsewhere */
 static uint32_t spv_bfn_ext(unsigned bfn, const struct rslc_type *t)
 {
-   bool f = t->base == RSLC_BASE_FLOAT;
+   bool f = RSLC_BASE_IS_REAL(t->base);
    bool s = t->base == RSLC_BASE_INT;
    switch (bfn)
    {
@@ -3143,7 +3330,8 @@ static uint32_t spv_builtin_node(struct spv_emit *e, const struct rslc_node *n)
                return 0;
 #ifdef RSLC_EXTENDED
             /* multisampled and buffer images have no levels */
-            if (t0->kind == RSLC_TY_SAMPLER2DMSARRAY || t0->kind == RSLC_TY_SAMPLERBUFFER)
+            if (     t0->kind == RSLC_TY_SAMPLER2DMSARRAY || t0->kind == RSLC_TY_SAMPLERBUFFER
+                  || (t0->kind == RSLC_TY_SAMPLERX && (t0->cols & RSLC_SX_MS)))
                return spv_r1(e, SpvOpImageQuerySize, tid, img, prec);
 #endif
             return spv_r2(e, SpvOpImageQuerySizeLod, tid, img, args[1], prec);
@@ -3169,7 +3357,8 @@ static uint32_t spv_builtin_node(struct spv_emit *e, const struct rslc_node *n)
             /* a buffer has no level; a multisampled image takes the sample */
             if (t0->kind == RSLC_TY_SAMPLERBUFFER)
                return spv_image_op(e, SpvOpImageFetch, tid, img, args[1], 0, 0, NULL, 0, prec);
-            if (t0->kind == RSLC_TY_SAMPLER2DMSARRAY)
+            if (     t0->kind == RSLC_TY_SAMPLER2DMSARRAY
+                  || (t0->kind == RSLC_TY_SAMPLERX && (t0->cols & RSLC_SX_MS)))
             {
                ops[0] = args[2];
                return spv_image_op(e, SpvOpImageFetch, tid, img, args[1], 0, SPV_IMG_SAMPLE, ops, 1, prec);
@@ -3372,13 +3561,28 @@ static uint32_t spv_builtin_node(struct spv_emit *e, const struct rslc_node *n)
       }
       case RSLC_BFN_IMAGESTORE:
       {
-         uint32_t w[3];
+         uint32_t w[5];
          w[0] = args[0]; w[1] = args[1]; w[2] = args[2];
+         if (nargs == 4)
+         {
+            /* a multisampled image: (image, coordinate, sample, texel) */
+            w[2] = args[3]; w[3] = SPV_IMG_SAMPLE; w[4] = args[2];
+            if (!spv_fn_inst(e, SpvOpImageWrite, w, 5))
+               return 0;
+            return tid;
+         }
          if (!spv_fn_inst(e, SpvOpImageWrite, w, 3))
             return 0;
          return tid;
       }
       case RSLC_BFN_IMAGELOAD:
+         if (nargs == 3)
+         {
+            /* a multisampled image: the sample is an image operand */
+            uint32_t ops[1];
+            ops[0] = args[2];
+            return spv_image_op(e, SpvOpImageRead, tid, args[0], args[1], 0, SPV_IMG_SAMPLE, ops, 1, prec);
+         }
          return spv_r2(e, SpvOpImageRead, tid, args[0], args[1], prec);
       case RSLC_BFN_IMAGESIZE:
          e->need_imagequery = true;
@@ -3391,7 +3595,22 @@ static uint32_t spv_builtin_node(struct spv_emit *e, const struct rslc_node *n)
                rslc_type_basic(e->c, RSLC_TY_VEC, RSLC_BASE_INT, 2, 1), zero, &used);
          if (!coord)
             return 0;
+         if (nargs == 2)
+         {
+            /* a multisampled attachment: the sample is an image operand */
+            uint32_t ops[1];
+            ops[0] = args[1];
+            return spv_image_op(e, SpvOpImageRead, tid, args[0], coord, 0, SPV_IMG_SAMPLE, ops, 1, prec);
+         }
          return spv_r2(e, SpvOpImageRead, tid, args[0], coord, prec);
+      }
+      case RSLC_BFN_TEXTURESAMPLES:
+      {
+         uint32_t img = spv_r1(e, SpvOpImage, e->tinfo[t0->id].img, args[0], 0);
+         if (!img)
+            return 0;
+         e->need_imagequery = true;
+         return spv_r1(e, 107 /* OpImageQuerySamples */, tid, img, prec);
       }
       case RSLC_BFN_SUBGROUPELECT:
       {
@@ -3737,6 +3956,39 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
    switch (n->op)
    {
       case RSLC_OP_CONST:
+         if (n->type->base == RSLC_BASE_DOUBLE)
+         {
+            /* 64 bits, low word first; one constant for each value */
+            uint32_t dt = spv_type(e, n->type), k, id;
+            uint32_t w[4];
+            if (!dt)
+               return 0;
+            for (k = 0; k < e->nvconsts; k++)
+               if (e->vconsts[k].type == dt && e->vconsts[k].c[0] == n->b && e->vconsts[k].c[1] == n->c)
+                  return e->vconsts[k].id;
+            id   = spv_id(e);
+            w[0] = dt; w[1] = id; w[2] = n->b; w[3] = n->c;
+            if (!spv_inst(e, SPV_SEC_TYPES, SpvOpConstant, w, 4))
+               return 0;
+            if (e->nvconsts == e->vconsts_cap)
+            {
+               uint32_t           ncap = e->vconsts_cap ? e->vconsts_cap * 2 : 32;
+               struct spv_vconst *nv   = (struct spv_vconst*)rslc_arena_alloc(e->c, ncap * sizeof(*nv));
+               if (!nv)
+                  return 0;
+               if (e->nvconsts)
+                  memcpy(nv, e->vconsts, e->nvconsts * sizeof(*nv));
+               e->vconsts     = nv;
+               e->vconsts_cap = ncap;
+            }
+            memset(&e->vconsts[e->nvconsts], 0, sizeof(e->vconsts[0]));
+            e->vconsts[e->nvconsts].type = dt;
+            e->vconsts[e->nvconsts].id   = id;
+            e->vconsts[e->nvconsts].c[0] = n->b;
+            e->vconsts[e->nvconsts].c[1] = n->c;
+            e->nvconsts++;
+            return id;
+         }
          return spv_const_bits(e, n->type, n->a);
       case RSLC_OP_VAR:
       {
@@ -3745,6 +3997,8 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
          uint32_t ptr;
          if (e->vars[v->id].is_const)
             return spv_const_var(e, v);
+         if (e->vars[v->id].byval)
+            return e->vars[v->id].id;
          ptr = spv_var_ptr(e, v, &sc, &laid, &std140);
          if (!ptr)
             return 0;
@@ -3759,7 +4013,8 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
             || rslc_node_at(e->c, n->b)->op == RSLC_OP_CONST;
          bool base_is_ptr = base->op == RSLC_OP_VAR || base->op == RSLC_OP_MEMBER
             || base->op == RSLC_OP_INDEX || (base->op == RSLC_OP_SWIZZLE && (base->aux & 3u) == 1);
-         if (base->op == RSLC_OP_VAR && e->vars[e->c->prog.vars[base->a]->id].is_const)
+         if (base->op == RSLC_OP_VAR && (e->vars[e->c->prog.vars[base->a]->id].is_const
+                  || e->vars[e->c->prog.vars[base->a]->id].byval))
             base_is_ptr = false;
          if (!base_is_ptr && const_idx)
          {
@@ -3837,6 +4092,13 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
                   return 0;
                continue;
             }
+            if (spv_param_byval(pv))
+            {
+               temps[i] = spv_rvalue(e, an);
+               if (!temps[i])
+                  return 0;
+               continue;
+            }
             temps[i] = spv_local(e, pv->type, NULL, pv->precision);
             if (!temps[i])
                return 0;
@@ -3883,6 +4145,37 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
             return 0;
          switch (n->aux)
          {
+#ifdef RSLC_EXTENDED
+            case RSLC_UN_ARRAYLEN:
+            {
+               /* OpArrayLength of the block and the member's index: the
+                * array is the last member of a buffer block, named bare
+                * or through the block's instance */
+               const struct rslc_var *v = NULL;
+               uint32_t member = 0, len, utid;
+               uint32_t w[4];
+               if (an->op == RSLC_OP_VAR && e->c->prog.vars[an->a]->storage == RSLC_ST_MEMBER)
+               {
+                  v      = e->c->prog.vars[an->a];
+                  member = v->member;
+               }
+               else if (an->op == RSLC_OP_MEMBER && rslc_node_at(e->c, an->a)->op == RSLC_OP_VAR
+                     && e->c->prog.vars[rslc_node_at(e->c, an->a)->a]->storage == RSLC_ST_BLOCK)
+               {
+                  v      = e->c->prog.vars[rslc_node_at(e->c, an->a)->a];
+                  member = an->b;
+               }
+               utid = spv_type(e, rslc_type_basic(e->c, RSLC_TY_SCALAR, RSLC_BASE_UINT, 1, 1));
+               if (!v || !utid)
+                  return 0;
+               e->member_active[v->block][member] = 1;
+               len = spv_id(e);
+               w[0] = utid; w[1] = len; w[2] = e->block_var[v->block]; w[3] = member;
+               if (!spv_fn_inst(e, 68 /* OpArrayLength */, w, 4))
+                  return 0;
+               return spv_r1(e, SpvOpBitcast, tid, len, 0);
+            }
+#endif
             case RSLC_UN_NEG:
             {
                uint32_t v = spv_rvalue(e, n->a);
@@ -3903,7 +4196,7 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
                   }
                   return spv_construct(e, n->type, cols, n->type->cols, prec);
                }
-               return spv_r1(e, n->type->base == RSLC_BASE_FLOAT ? SpvOpFNegate : SpvOpSNegate, tid, v, prec);
+               return spv_r1(e, RSLC_BASE_IS_REAL(n->type->base) ? SpvOpFNegate : SpvOpSNegate, tid, v, prec);
             }
             case RSLC_UN_NOT:
             {
@@ -3924,9 +4217,12 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
                const struct rslc_type *t = an->type;
                bool inc = n->aux == RSLC_UN_PREINC || n->aux == RSLC_UN_POSTINC;
                bool post = n->aux == RSLC_UN_POSTINC || n->aux == RSLC_UN_POSTDEC;
-               if (!ptr)
+               /* no one pointer to it - several components of a vector
+                * (v.xy--): read as a value, written back as an assignment
+                * to the same place is */
+               if (!ptr && (e->c->failed || t->kind == RSLC_TY_MAT))
                   return 0;
-               old = spv_load(e, t, ptr, prec);
+               old = ptr ? spv_load(e, t, ptr, prec) : spv_rvalue(e, n->a);
                if (!old)
                   return 0;
                if (t->base == RSLC_BASE_FLOAT)
@@ -3947,7 +4243,7 @@ static uint32_t spv_rvalue_impl(struct spv_emit *e, uint32_t node)
                }
                else
                   nv = one ? spv_r2(e, spv_binop(t, inc ? RSLC_BIN_ADD : RSLC_BIN_SUB), tid, old, one, prec) : 0;
-               if (!nv || !spv_store(e, ptr, nv))
+               if (!nv || !(ptr ? spv_store(e, ptr, nv) : spv_assign_to(e, n->a, nv)))
                   return 0;
                return post ? old : nv;
             }
@@ -4409,7 +4705,8 @@ static bool spv_function(struct spv_emit *e, const struct rslc_func *f)
    w[0] = 0; w[1] = rtid;
    for (i = 0; i < f->nparams; i++)
    {
-      w[2 + i] = spv_ptr_to(e, f->params[i]->type, spv_param_sc(f->params[i]->type));
+      w[2 + i] = spv_param_byval(f->params[i]) ? spv_type(e, f->params[i]->type)
+         : spv_ptr_to(e, f->params[i]->type, spv_param_sc(f->params[i]->type));
       if (!w[2 + i])
          return false;
    }
@@ -4423,10 +4720,12 @@ static bool spv_function(struct spv_emit *e, const struct rslc_func *f)
    for (i = 0; i < f->nparams; i++)
    {
       const struct rslc_var *pv = f->params[i];
-      uint32_t ptr = spv_ptr_to(e, pv->type, spv_param_sc(pv->type));
+      uint32_t ptr = spv_param_byval(pv) ? spv_type(e, pv->type)
+         : spv_ptr_to(e, pv->type, spv_param_sc(pv->type));
       uint32_t pid = spv_id(e);
       if (!ptr || !spv_inst2(e, SPV_SEC_FUNCS, SpvOpFunctionParameter, ptr, pid))
          return false;
+      e->vars[pv->id].byval = spv_param_byval(pv);
       e->vars[pv->id].id = pid;
       e->vars[pv->id].sc = (uint8_t)spv_param_sc(pv->type);
       if (pv->name && !spv_name(e, pid, pv->name->str))
@@ -4475,22 +4774,9 @@ static bool spv_function(struct spv_emit *e, const struct rslc_func *f)
       return false;
 
    /* splice the hoisted OpVariables after the entry label */
-   if (e->func_vars.n)
-   {
-      uint32_t n = e->func_vars.n;
-      uint32_t tail = fb->n - entry_pos;
-      uint32_t *tmp = (uint32_t*)rslc_scratch_alloc(e->c, tail * sizeof(*tmp));
-      if (!tmp)
-         return false;
-      memcpy(tmp, fb->v + entry_pos, tail * sizeof(*tmp));
-      fb->n = entry_pos;
-      for (i = 0; i < n; i++)
-         if (!spv_w(e, fb, e->func_vars.v[i]))
-            return false;
-      for (i = 0; i < tail; i++)
-         if (!spv_w(e, fb, tmp[i]))
-            return false;
-   }
+   if (e->func_vars.n && !spirv_words_insert(&e->words, fb, entry_pos,
+            e->func_vars.v, e->func_vars.n))
+      return false;
    return true;
 }
 
@@ -4692,6 +4978,12 @@ static bool spv_global_var(struct spv_emit *e, const struct rslc_var *v)
          return false;
       if (v->interp == RSLC_INTERP_NOPERSPECTIVE && !spv_decorate(e, id, SPV_DEC_NOPERSPECTIVE))
          return false;
+      if (v->interp == RSLC_INTERP_PERVERTEX)
+      {
+         if (!spv_decorate(e, id, 5285u /* PerVertexKHR */))
+            return false;
+         e->need_barycentric = true;
+      }
       if ((v->quals & RSLC_VQ_CENTROID) && !spv_decorate(e, id, SPV_DEC_CENTROID))
          return false;
       if ((v->quals & RSLC_VQ_SAMPLE) && !spv_decorate(e, id, SPV_DEC_SAMPLE))
@@ -4772,6 +5064,9 @@ static bool spv_builtin_var(struct spv_emit *e, const struct rslc_var *v)
       : v->builtin == RSLC_BI_LOCALINVOCATIONINDEX ? SPV_BI_LOCALINVOCATIONINDEX
       : v->builtin == RSLC_BI_HELPERINVOCATION ? SPV_BI_HELPERINVOCATION
       : v->builtin == RSLC_BI_POINTCOORD ? SPV_BI_POINTCOORD
+      : v->builtin == RSLC_BI_FRAGSTENCILREF ? 5014u /* FragStencilRefEXT */
+      : v->builtin == RSLC_BI_BARYCOORD ? 5286u /* BaryCoordKHR */
+      : v->builtin == RSLC_BI_BARYCOORDNOPERSP ? 5287u /* BaryCoordNoPerspKHR */
       : v->builtin == RSLC_BI_PRIMITIVEID ? SPV_BI_PRIMITIVEID : SPV_BI_POSITION;
    if (!ptr)
       return false;
@@ -4780,6 +5075,10 @@ static bool spv_builtin_var(struct spv_emit *e, const struct rslc_var *v)
       e->need_samplerateshading = true;
    if (v->builtin == RSLC_BI_FRAGDEPTH)
       e->writes_fragdepth = true;
+   if (v->builtin == RSLC_BI_FRAGSTENCILREF)
+      e->writes_stencilref = true;
+   if (v->builtin == RSLC_BI_BARYCOORD || v->builtin == RSLC_BI_BARYCOORDNOPERSP)
+      e->need_barycentric = true;
    id = spv_id(e);
    if (!spv_inst3(e, SPV_SEC_TYPES, SpvOpVariable, ptr, id, sc))
       return false;
@@ -4919,6 +5218,20 @@ static bool spv_pervertex(struct spv_emit *e)
          || !spv_mdecorate1(e, st, 2, SPV_DEC_BUILTIN, SPV_BI_CLIPDISTANCE)
          || !spv_mdecorate1(e, st, 3, SPV_DEC_BUILTIN, SPV_BI_CULLDISTANCE))
       return false;
+   /* a member made invariant: invariant gl_Position; */
+   {
+      uint32_t k;
+      for (k = 1; k < e->c->prog.nvars; k++)
+      {
+         const struct rslc_var *bv = e->c->prog.vars[k];
+         if (bv->storage == RSLC_ST_BUILTIN && (bv->quals & RSLC_VQ_INVARIANT)
+               && RSLC_BI_IN_PERVERTEX(bv->builtin)
+               && !spv_mdecorate(e, st, bv->builtin == RSLC_BI_POSITION ? 0
+                  : bv->builtin == RSLC_BI_POINTSIZE ? 1 : bv->builtin == RSLC_BI_CLIPDISTANCE ? 2 : 3,
+                  SPV_DEC_INVARIANT))
+            return false;
+      }
+   }
    ptr = spv_ptr(e, st, SPV_SC_OUTPUT);
    if (!ptr)
       return false;
@@ -5108,6 +5421,8 @@ static bool rslc_emit_spirv(struct rslc_ctx *c, struct rslc_result *result)
    rslc_scratch_mark(c, &mark);
    e->c     = c;
    e->bound = 1;
+   e->words.grow = spv_grow;
+   e->words.user = c;
    e->tinfo = (struct spv_tinfo*)rslc_arena_zalloc(c, (c->ntypes + 1 + 64) * sizeof(*e->tinfo));
    e->vars  = (struct spv_var*)rslc_arena_zalloc(c, (pr->nvars + 1) * sizeof(*e->vars));
    e->func_ids   = (uint32_t*)rslc_arena_zalloc(c, (pr->nfuncs + 1) * sizeof(uint32_t));
@@ -5179,9 +5494,24 @@ static bool rslc_emit_spirv(struct rslc_ctx *c, struct rslc_result *result)
       return false;
    if (e->need_clipdistance && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, SPV_CAP_CLIPDISTANCE))
       return false;
+   if (e->writes_stencilref && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, 5013u /* StencilExportEXT */))
+      return false;
+   if (e->need_barycentric && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, 5284u /* FragmentBarycentricKHR */))
+      return false;
+   if (e->need_float64 && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, 10u /* Float64 */))
+      return false;
    if (e->need_culldistance && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, SPV_CAP_CULLDISTANCE))
       return false;
    if (e->need_imagequery && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, SPV_CAP_IMAGEQUERY))
+      return false;
+   if (e->need_storageimageextended &&
+         !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, SPV_CAP_STORAGEIMAGEEXTENDED))
+      return false;
+   if (e->need_storageimagewritewithoutformat
+         && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, 56u /* StorageImageWriteWithoutFormat */))
+      return false;
+   if (e->need_storageimagemultisample
+         && !spv_inst1(e, SPV_SEC_CAPS, SpvOpCapability, 27u /* StorageImageMultisample */))
       return false;
 #ifdef RSLC_EXTENDED
    if (e->need_inputattachment
@@ -5230,6 +5560,12 @@ static bool rslc_emit_spirv(struct rslc_ctx *c, struct rslc_result *result)
          return false;
    }
 #endif
+   if (e->writes_stencilref && !spv_inst_str(e, SPV_SEC_CAPS, SpvOpExtension, NULL, 0,
+            "SPV_EXT_shader_stencil_export", NULL, 0))
+      return false;
+   if (e->need_barycentric && !spv_inst_str(e, SPV_SEC_CAPS, SpvOpExtension, NULL, 0,
+            "SPV_KHR_fragment_shader_barycentric", NULL, 0))
+      return false;
    if (!spv_inst_str(e, SPV_SEC_CAPS, SpvOpExtInstImport, &e->ext_id, 1, "GLSL.std.450", NULL, 0))
       return false;
    if (!spv_inst2(e, SPV_SEC_CAPS, SpvOpMemoryModel, 0 /* Logical */, 1 /* GLSL450 */))
@@ -5256,6 +5592,9 @@ static bool rslc_emit_spirv(struct rslc_ctx *c, struct rslc_result *result)
    if (e->writes_fragdepth
          && !spv_inst2(e, SPV_SEC_ENTRY, SpvOpExecutionMode, main_id, 12u /* DepthReplacing */))
       return false;
+   if (e->writes_stencilref
+         && !spv_inst2(e, SPV_SEC_ENTRY, SpvOpExecutionMode, main_id, 5027u /* StencilRefReplacingEXT */))
+      return false;
 #ifdef RSLC_EXTENDED
    for (i = 0; i < c->prog.nxmodes; i += 1 + c->prog.xmodes[i])
    {
@@ -5276,6 +5615,29 @@ static bool rslc_emit_spirv(struct rslc_ctx *c, struct rslc_result *result)
          w[2 + k] = c->prog.cs_local[k] ? c->prog.cs_local[k] : 1;
       if (!spv_inst(e, SPV_SEC_ENTRY, SpvOpExecutionMode, w, 5))
          return false;
+      if (c->prog.cs_local_spec[0] || c->prog.cs_local_spec[1] || c->prog.cs_local_spec[2])
+      {
+         /* A size set by a specialization constant: the WorkgroupSize
+          * builtin, made of them (and the sizes said), is what the
+          * pipeline runs at; the mode above is what it would be unset */
+         uint32_t wc[5];
+         const struct rslc_type *u1 = rslc_type_basic(c, RSLC_TY_SCALAR, RSLC_BASE_UINT, 1, 1);
+         const struct rslc_type *u3 = rslc_type_basic(c, RSLC_TY_VEC, RSLC_BASE_UINT, 3, 1);
+         if (!u1 || !u3 || !(wc[0] = spv_type(e, u3)))
+            return false;
+         for (k = 0; k < 3; k++)
+         {
+            wc[2 + k] = c->prog.cs_local_spec[k]
+               ? spv_const_var(e, c->prog.cs_local_spec[k])
+               : spv_const_bits(e, u1, w[2 + k]);
+            if (!wc[2 + k])
+               return false;
+         }
+         wc[1] = spv_id(e);
+         if (     !spv_inst(e, SPV_SEC_TYPES, SpvOpSpecConstantComposite, wc, 5)
+               || !spv_decorate1(e, wc[1], SPV_DEC_BUILTIN, SPV_BI_WORKGROUPSIZE))
+            return false;
+      }
    }
 #endif
    if (c->stage == RSLC_STAGE_GEOMETRY)
@@ -5311,29 +5673,20 @@ static bool rslc_emit_spirv(struct rslc_ctx *c, struct rslc_result *result)
 
    /* assemble the blob: header, reflection, SPIR-V words */
    {
-      uint32_t words = 5;
-      uint32_t s;
+      uint32_t words = (uint32_t)spirv_words_total(e->sec, SPV_SEC_COUNT);
       struct rslc_pbuf pb;
-      uint32_t *out;
-      for (s = 0; s < SPV_SEC_COUNT; s++)
-         words += e->sec[s].n;
       if (!rslc_blob_begin(c, &pb, words * 4, e->member_active, used))
          return false;
-      out = (uint32_t*)(pb.data + pb.len);
-      out[0] = SPV_MAGIC;
+      /* The module joined straight into the payload the blob made room for */
+      spirv_words_join((uint32_t*)(pb.data + pb.len), e->sec, SPV_SEC_COUNT,
 #ifdef RSLC_EXTENDED
-      /* the subgroup operations are SPIR-V 1.3's */
-      out[1] = e->need_groupnonuniform ? SPV_VERSION_1_3 : SPV_VERSION_1_0;
+            /* the subgroup operations are SPIR-V 1.3's */
+            e->need_groupnonuniform ? SPV_VERSION_1_3 : SPV_VERSION_1_0,
 #else
-      out[1] = SPV_VERSION_1_0;
+            SPV_VERSION_1_0,
 #endif
-      out[2] = 0;             /* generator */
-      out[3] = e->bound;
-      out[4] = 0;
-      pb.len += 5 * 4;
-      for (s = 0; s < SPV_SEC_COUNT; s++)
-         if (e->sec[s].n && !rslc_pbuf_put(c, &pb, e->sec[s].v, e->sec[s].n * 4))
-            return false;
+            0 /* generator */, e->bound);
+      pb.len += (size_t)words * 4;
       rslc_blob_end(c, &pb, RSLC_DST_SPIRV, result);
       result->spirv     = (const uint32_t*)(pb.data + ((struct rslc_blob_hdr*)pb.data)->payload_off);
       result->spirv_len = words;
@@ -5402,7 +5755,12 @@ bool rslc_emit_dst(struct rslc_ctx *c, struct rslc_result *result)
          return false;
 #ifdef RSLC_EXTENDED
       case RSLC_DST_DXBC:
+#ifdef RSLC_NO_DXBC
+         rslc_err(c, "built without the Direct3D bytecode backend", NULL, 0);
+         return false;
+#else
          return rslc_emit_dxbc(c, result);
+#endif
 #endif
       default:
          break;
@@ -5961,7 +6319,9 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
       enum rslc_stage stage,
       const struct rslc_opts *opts, struct rslc_result *result)
 {
-   struct rslc_ctx   c;
+   /* the context alone is most of a page: off the stack, beside the
+    * sanitizers' red zones */
+   struct rslc_ctx  *c;
    struct ing        g;
    struct rslc_prog *pr;
    struct rslc_pbuf  pb;
@@ -5970,31 +6330,36 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
 
    if (!words || !opts || !result)
       return false;
-   if (!rslc_ctx_init(&c, opts, stage))
+   if (!(c = (struct rslc_ctx*)malloc(sizeof(*c))))
       return false;
-   pr = &c.prog;
+   if (!rslc_ctx_init(c, opts, stage))
+   {
+      free(c);
+      return false;
+   }
+   pr = &c->prog;
 
    memset(&g, 0, sizeof(g));
-   g.c = &c;
+   g.c = c;
    g.w = words;
    g.n = (uint32_t)n;
    if (n < 5 || words[0] != RSLC_SPV_MAGIC)
-      rslc_err(&c, "not a SPIR-V module", NULL, 0);
+      rslc_err(c, "not a SPIR-V module", NULL, 0);
    else if ((words[1] >> 8) != 0x100)
-      rslc_err(&c, "SPIR-V version not 1.x", NULL, 0);
+      rslc_err(c, "SPIR-V version not 1.x", NULL, 0);
    else if (words[3] == 0 || words[3] > 0x10000)
-      rslc_err(&c, "SPIR-V id bound out of range", NULL, 0);
+      rslc_err(c, "SPIR-V id bound out of range", NULL, 0);
    else if (opts->dst != RSLC_DST_SPIRV && opts->dst != RSLC_DST_REFLECT)
-      rslc_err(&c, "a printed destination needs the GLSL, not a module", NULL, 0);
+      rslc_err(c, "a printed destination needs the GLSL, not a module", NULL, 0);
    else
    {
       uint32_t at, nf = 1;
       for (at = 5; at < n && (words[at] >> 16); at += words[at] >> 16)
          nf += (words[at] & 0xffffu) == SpvOpFunction;
       g.bound      = words[3];
-      g.ids        = (struct ing_id*)rslc_arena_zalloc(&c, (size_t)g.bound * sizeof(*g.ids));
-      g.func_at    = (uint32_t*)rslc_arena_zalloc(&c, nf * sizeof(uint32_t));
-      g.func_reach = (uint8_t*)rslc_arena_zalloc(&c, nf);
+      g.ids        = (struct ing_id*)rslc_arena_zalloc(c, (size_t)g.bound * sizeof(*g.ids));
+      g.func_at    = (uint32_t*)rslc_arena_zalloc(c, nf * sizeof(uint32_t));
+      g.func_reach = (uint8_t*)rslc_arena_zalloc(c, nf);
       if (g.ids && g.func_at && g.func_reach)
       {
          for (id = 0; id < g.bound; id++)
@@ -6066,7 +6431,7 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
                break;
             }
             g.block_var[k] = id;
-            g.active[k]    = (uint8_t*)rslc_arena_zalloc(&c, t->nfields ? t->nfields : 1);
+            g.active[k]    = (uint8_t*)rslc_arena_zalloc(c, t->nfields ? t->nfields : 1);
             if (!g.active[k])
                ok = false;
             break;
@@ -6092,7 +6457,7 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
             /* the reflection writer reads used[] by id */
             v->id = pr->nsamplers + 1;
             g.ids[id].sampler = (uint8_t)v->id;
-            ok = ing_push(&c, (void***)&pr->samplers, &pr->nsamplers, &pr->samplers_cap, v);
+            ok = ing_push(c, (void***)&pr->samplers, &pr->nsamplers, &pr->samplers_cap, v);
             break;
          case SPV_SC_INPUT:
          case SPV_SC_OUTPUT:
@@ -6115,7 +6480,7 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
                break;
             }
             v->storage = d->b == SPV_SC_INPUT ? RSLC_ST_IN : RSLC_ST_OUT;
-            ok = ing_push(&c, (void***)arr, cnt, cap, v);
+            ok = ing_push(c, (void***)arr, cnt, cap, v);
             break;
          }
          default:
@@ -6125,8 +6490,8 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
 
    if (ok)
    {
-      uint32_t *stack = (uint32_t*)rslc_arena_alloc(&c, g.nfuncs * sizeof(uint32_t));
-      g.used = (uint8_t*)rslc_arena_zalloc(&c, pr->nsamplers + 1);
+      uint32_t *stack = (uint32_t*)rslc_arena_alloc(c, g.nfuncs * sizeof(uint32_t));
+      g.used = (uint8_t*)rslc_arena_zalloc(c, pr->nsamplers + 1);
       if (!stack || !g.used)
          ok = false;
       else
@@ -6137,15 +6502,15 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
    if (ok)
    {
       size_t payload = opts->dst == RSLC_DST_SPIRV ? n * 4 : 0;
-      if (!rslc_blob_begin(&c, &pb, payload, g.active, g.used))
+      if (!rslc_blob_begin(c, &pb, payload, g.active, g.used))
          ok = false;
       else
       {
-         if (payload && !rslc_pbuf_put(&c, &pb, words, payload))
+         if (payload && !rslc_pbuf_put(c, &pb, words, payload))
             ok = false;
          else
          {
-            rslc_blob_end(&c, &pb, opts->dst, result);
+            rslc_blob_end(c, &pb, opts->dst, result);
             if (payload)
             {
                result->spirv     = (const uint32_t*)((uint8_t*)pb.data
@@ -6154,12 +6519,13 @@ bool rslc_compile_spirv(const uint32_t *words, size_t n,
             }
          }
          if (!ok)
-            rslc_pbuf_free(&c, &pb);
+            rslc_pbuf_free(c, &pb);
       }
-      if (!ok && !c.failed)
-         rslc_err(&c, "out of memory", NULL, 0);
+      if (!ok && !c->failed)
+         rslc_err(c, "out of memory", NULL, 0);
    }
 
-   rslc_ctx_close(&c);
+   rslc_ctx_close(c);
+   free(c);
    return ok;
 }

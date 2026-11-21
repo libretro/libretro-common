@@ -673,6 +673,70 @@ START_TEST (test_p256)
 }
 END_TEST
 
+struct p256_ecdsa_vector
+{
+   unsigned id;
+   uint8_t  key;        /* index into the file's key table */
+   uint8_t  valid;
+   uint8_t  digest_len;
+   uint8_t  digest[64];
+   uint8_t  sig[64];    /* r || s */
+};
+
+struct p256_ecdsa_der_vector
+{
+   unsigned id;
+   uint8_t  key;
+   uint8_t  valid;
+   uint8_t  sig_len;
+   uint8_t  digest[32];
+   uint8_t  sig[80];    /* ECDSA-Sig-Value */
+};
+
+#include "test_p256_edge_vectors.h"
+
+static void p256_check_vectors(const char *name, const uint8_t (*keys)[65],
+      const struct p256_ecdsa_vector *v, size_t n)
+{
+   size_t i;
+   for (i = 0; i < n; i++, v++)
+   {
+      int r = p256_ecdsa_verify(keys[v->key], v->digest, v->digest_len,
+            v->sig, v->sig + 32);
+      if (r != (v->valid ? 0 : -1))
+         fprintf(stderr, "%s vector %u: got %d\n", name, v->id, r);
+      ck_assert_int_eq(r, v->valid ? 0 : -1);
+   }
+}
+
+START_TEST (test_p256_vectors)
+{
+   p256_check_vectors("P-256 edge", p256_edge_keys, p256_edge_vectors,
+         sizeof(p256_edge_vectors) / sizeof(p256_edge_vectors[0]));
+   p256_check_vectors("P-256 generated", p256_gen_keys, p256_gen_vectors,
+         sizeof(p256_gen_vectors) / sizeof(p256_gen_vectors[0]));
+}
+END_TEST
+
+START_TEST (test_p256_der)
+{
+   struct x509_cert key;
+   size_t i;
+   memset(&key, 0, sizeof(key));
+   key.key_type = X509_KEY_P256;
+   for (i = 0; i < sizeof(p256_gen_der) / sizeof(p256_gen_der[0]); i++)
+   {
+      const struct p256_ecdsa_der_vector *v = &p256_gen_der[i];
+      int r;
+      key.ec_point = p256_gen_keys[v->key];
+      r = x509_verify_ecdsa_digest(&key, v->digest, 32, v->sig, v->sig_len);
+      if (r != (v->valid ? 0 : -1))
+         fprintf(stderr, "P-256 DER vector %u: got %d\n", v->id, r);
+      ck_assert_int_eq(r, v->valid ? 0 : -1);
+   }
+}
+END_TEST
+
 START_TEST (test_p384)
 {
    uint8_t pub[97], shared[48], bad[97], sig[48];
@@ -1082,6 +1146,37 @@ START_TEST (test_x509)
       ck_assert_int_eq(x509_trust_load_der_parts(&part, &len, 1), -1);
    }
    x509_trust_free();
+   /* CRLF line breaks decode as LF ones */
+   {
+      char   crlf[sizeof(x509_root_pem) * 2];
+      size_t i, n = 0;
+      for (i = 0; i < sizeof(x509_root_pem) - 1; i++)
+      {
+         if (x509_root_pem[i] == '\n')
+            crlf[n++] = '\r';
+         crlf[n++] = x509_root_pem[i];
+      }
+      ck_assert_int_eq(x509_trust_load_pem(crlf, n), 1);
+   }
+   x509_trust_free();
+   /* an adopted bundle is decoded where it lies and trusted as a copied
+    * one; one with nothing usable is freed, the published store kept */
+   {
+      char *pem = (char*)malloc(sizeof(x509_root_pem));
+      ck_assert(pem != NULL);
+      memcpy(pem, x509_root_pem, sizeof(x509_root_pem));
+      chain[0] = x509_leaf;  lens[0] = sizeof(x509_leaf);
+      chain[1] = x509_inter; lens[1] = sizeof(x509_inter);
+      ck_assert_int_eq(x509_trust_adopt_pem(pem, sizeof(x509_root_pem) - 1), 1);
+      ck_assert_int_eq(x509_verify_chain(chain, lens, 2, "example.com", X509_TEST_NOW, info, sizeof(info)), 0);
+      pem = (char*)malloc(sizeof(x509_root_pem));
+      ck_assert(pem != NULL);
+      memcpy(pem, x509_root_pem, sizeof(x509_root_pem));
+      memset(strstr(pem, "-----BEGIN"), '-', 11);   /* no certificate begins */
+      ck_assert_int_eq(x509_trust_adopt_pem(pem, sizeof(x509_root_pem) - 1), 0);
+      ck_assert_int_eq(x509_verify_chain(chain, lens, 2, "example.com", X509_TEST_NOW, info, sizeof(info)), 0);
+   }
+   x509_trust_free();
 }
 END_TEST
 
@@ -1214,6 +1309,105 @@ static uint32_t bulk_rand(void)
    bulk_rng ^= bulk_rng << 13; bulk_rng ^= bulk_rng >> 17; bulk_rng ^= bulk_rng << 5;
    return bulk_rng;
 }
+
+/* aes_ctr128_crypt: the counter is one 128-bit big-endian number, as
+ * SP 800-38A's standard incrementing function. Against the F.5.1
+ * vector, then a block at a time from counters whose low 32 bits are
+ * about to wrap (the carry into octets 0..11), up to the whole block
+ * wrapping to zero, in one call and in pieces on block boundaries. */
+static void ctr128_inc(uint8_t *c)
+{
+   int i;
+   for (i = 15; i >= 0; i--)
+      if (++c[i])
+         break;
+}
+
+START_TEST(test_aes_ctr128)
+{
+   static const uint8_t key[16] = {
+      0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,
+      0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c };
+   static const uint8_t ctr0[16] = {
+      0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,
+      0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff };
+   static const uint8_t pt[64] = {
+      0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,
+      0xae,0x2d,0x8a,0x57,0x1e,0x03,0xac,0x9c,0x9e,0xb7,0x6f,0xac,0x45,0xaf,0x8e,0x51,
+      0x30,0xc8,0x1c,0x46,0xa3,0x5c,0xe4,0x11,0xe5,0xfb,0xc1,0x19,0x1a,0x0a,0x52,0xef,
+      0xf6,0x9f,0x24,0x45,0xdf,0x4f,0x9b,0x17,0xad,0x2b,0x41,0x7b,0xe6,0x6c,0x37,0x10 };
+   static const uint8_t ct[64] = {
+      0x87,0x4d,0x61,0x91,0xb6,0x20,0xe3,0x26,0x1b,0xef,0x68,0x64,0x99,0x0d,0xb6,0xce,
+      0x98,0x06,0xf6,0x6b,0x79,0x70,0xfd,0xff,0x86,0x17,0x18,0x7b,0xb9,0xff,0xfd,0xff,
+      0x5a,0xe4,0xdf,0x3e,0xdb,0xd5,0xd3,0x5e,0x5b,0x4f,0x09,0x02,0x0d,0xb0,0x3e,0xab,
+      0x1e,0x03,0x1d,0xda,0x2f,0xbe,0x03,0xd1,0x79,0x21,0x70,0xa0,0xf3,0x00,0x9c,0xee };
+   static uint8_t in[2100], out[2100], ref[2100];
+   uint8_t c[16], iv[16], blk[16], k[32];
+   struct aes_ctx a;
+   unsigned it, i;
+
+   ck_assert_int_eq(aes_init(&a, key, 16), 0);
+   memcpy(c, ctr0, 16);
+   aes_ctr128_crypt(&a, c, pt, out, 64);
+   ck_assert_int_eq(memcmp(out, ct, 64), 0);
+
+   for (i = 0; i < sizeof(in); i++)
+      in[i] = (uint8_t)bulk_rand();
+   for (it = 0; it < 200; it++)
+   {
+      size_t len = bulk_rand() % 2049;
+      for (i = 0; i < 32; i++)
+         k[i] = (uint8_t)bulk_rand();
+      ck_assert_int_eq(aes_init(&a, k, (it & 1) ? 32 : 16), 0);
+      for (i = 0; i < 16; i++)
+         iv[i] = (uint8_t)bulk_rand();
+      /* The low word within 64 blocks of wrapping; every fourth run
+       * with the octets above it all ones too, so the carry runs out
+       * of the whole block */
+      iv[12] = iv[13] = iv[14] = 0xff;
+      iv[15] = (uint8_t)(0xc0 + (bulk_rand() % 64));
+      if (!(it & 3))
+         for (i = 0; i < 12; i++)
+            iv[i] = 0xff;
+      else if (it & 2)
+         for (i = 4; i < 12; i++)
+            iv[i] = 0xff;
+
+      memcpy(c, iv, 16);
+      for (i = 0; i < len; i++)
+      {
+         if (!(i % 16))
+         {
+            aes_encrypt_block(&a, c, blk);
+            ctr128_inc(c);
+         }
+         ref[i] = in[i] ^ blk[i % 16];
+      }
+      memcpy(blk, c, 16); /* the counter the reference ends on */
+
+      memcpy(c, iv, 16);
+      aes_ctr128_crypt(&a, c, in, out, len);
+      ck_assert_int_eq(memcmp(out, ref, len), 0);
+      ck_assert_int_eq(memcmp(c, blk, 16), 0);
+
+      /* In pieces of whole blocks, then the rest */
+      memcpy(c, iv, 16);
+      {
+         size_t p = 0;
+         while (p < len)
+         {
+            size_t n = 16 * (1 + bulk_rand() % 12);
+            if (n > len - p)
+               n = len - p;
+            aes_ctr128_crypt(&a, c, in + p, out + p, n);
+            p += n;
+         }
+      }
+      ck_assert_int_eq(memcmp(out, ref, len), 0);
+      ck_assert_int_eq(memcmp(c, blk, 16), 0);
+   }
+}
+END_TEST
 
 START_TEST(test_bulk_paths)
 {
@@ -1470,6 +1664,77 @@ START_TEST(test_streams)
 }
 END_TEST
 
+/* CFB128: SP 800-38A F.3.13 and F.3.17 (128- and 256-bit keys), then
+ * random streams split at random points against one call, decrypted
+ * back, in place and not. */
+START_TEST(test_aes_cfb128)
+{
+   static uint8_t in[600], out[600], ref[600], back[600];
+   uint8_t  key[32], iv[16], v[16], pt[64], ct[64];
+   unsigned it, num;
+   size_t   i;
+   struct aes_ctx a;
+
+   unhex(pt, 64, "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51"
+         "30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+   unhex(key, 16, "2b7e151628aed2a6abf7158809cf4f3c");
+   unhex(v, 16, "000102030405060708090a0b0c0d0e0f");
+   ck_assert_int_eq(aes_init(&a, key, 16), 0);
+   num = 0;
+   aes_cfb128_encrypt(&a, v, &num, pt, ct, 64);
+   ck_hex(ct, 64, "3b3fd92eb72dad20333449f8e83cfb4ac8a64537a0b3a93fcde3cdad9f1ce58b"
+         "26751f67a3cbb140b1808cf187a4f4dfc04b05357c5d1c0eeac4c66f9ff7f2e6");
+   unhex(key, 32, "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+   unhex(v, 16, "000102030405060708090a0b0c0d0e0f");
+   ck_assert_int_eq(aes_init(&a, key, 32), 0);
+   num = 0;
+   aes_cfb128_encrypt(&a, v, &num, pt, ct, 64);
+   ck_hex(ct, 64, "dc7e84bfda79164b7ecd8486985d386039ffed143b28b1c832113c6331e5407b"
+         "df10132415e54b92a13ed0a8267ae2f975a385741ab9cef82031623d55b1e471");
+
+   for (it = 0; it < 200; it++)
+   {
+      size_t len = bulk_rand() % sizeof(in), at;
+      for (i = 0; i < 32; i++)
+         key[i] = (uint8_t)bulk_rand();
+      for (i = 0; i < 16; i++)
+         iv[i] = (uint8_t)bulk_rand();
+      for (i = 0; i < len; i++)
+         in[i] = (uint8_t)bulk_rand();
+      ck_assert_int_eq(aes_init(&a, key, (it & 1) ? 32 : 16), 0);
+      memcpy(v, iv, 16);
+      num = 0;
+      aes_cfb128_encrypt(&a, v, &num, in, ref, len);
+      ck_assert_uint_eq(num, (unsigned)(len & 15));
+      /* the same stream in random pieces */
+      memcpy(v, iv, 16);
+      num = 0;
+      for (at = 0; at < len; )
+      {
+         size_t n = 1 + bulk_rand() % 40;
+         if (n > len - at)
+            n = len - at;
+         aes_cfb128_encrypt(&a, v, &num, in + at, out + at, n);
+         at += n;
+      }
+      ck_assert_int_eq(memcmp(out, ref, len), 0);
+      /* and back, in place */
+      memcpy(back, ref, len);
+      memcpy(v, iv, 16);
+      num = 0;
+      for (at = 0; at < len; )
+      {
+         size_t n = 1 + bulk_rand() % 40;
+         if (n > len - at)
+            n = len - at;
+         aes_cfb128_decrypt(&a, v, &num, back + at, back + at, n);
+         at += n;
+      }
+      ck_assert_int_eq(memcmp(back, in, len), 0);
+   }
+}
+END_TEST
+
 /* CBC: SP 800-38A F.2.1, then interleaved chains - in place and not,
  * 128- and 256-bit keys - against one block at a time through
  * aes_encrypt_block(). */
@@ -1581,6 +1846,81 @@ START_TEST(test_aes_cbc_decrypt)
 }
 END_TEST
 
+/* XTS-AES-128: IEEE 1619 vectors 1 and 2, then random data units -
+ * in place and not, both key sizes, lengths through the eight-block and
+ * the single-block loops - against one block at a time through
+ * aes_encrypt_block()/aes_decrypt_block(), and back. */
+START_TEST(test_aes_xts)
+{
+   static uint8_t in[1040], out[1040], ref[1040], back[1040];
+   uint8_t k1[32], k2[32], tw[16], t[16], b[16], pt[32];
+   unsigned it, i;
+   size_t off;
+   struct aes_ctx a, c;
+
+   memset(k1, 0, 16);
+   memset(k2, 0, 16);
+   memset(tw, 0, 16);
+   memset(pt, 0, 32);
+   ck_assert_int_eq(aes_init(&a, k1, 16), 0);
+   ck_assert_int_eq(aes_init(&c, k2, 16), 0);
+   aes_xts_encrypt(&a, &c, tw, pt, out, 32);
+   ck_hex(out, 32, "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e");
+   aes_xts_decrypt(&a, &c, tw, out, out, 32);
+   ck_assert_int_eq(memcmp(out, pt, 32), 0);
+
+   memset(k1, 0x11, 16);
+   memset(k2, 0x22, 16);
+   memset(tw, 0, 16);
+   memset(tw, 0x33, 5);
+   memset(pt, 0x44, 32);
+   ck_assert_int_eq(aes_init(&a, k1, 16), 0);
+   ck_assert_int_eq(aes_init(&c, k2, 16), 0);
+   aes_xts_encrypt(&a, &c, tw, pt, out, 32);
+   ck_hex(out, 32, "c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0");
+
+   for (it = 0; it < 300; it++)
+   {
+      size_t   len     = 16 * (bulk_rand() % 66);
+      int      inplace = (it & 4) != 0;
+      unsigned ks      = (it & 1) ? 32 : 16;
+      for (i = 0; i < 32; i++)
+      {
+         k1[i] = (uint8_t)bulk_rand();
+         k2[i] = (uint8_t)bulk_rand();
+      }
+      for (i = 0; i < 16; i++)
+         tw[i] = (uint8_t)bulk_rand();
+      for (i = 0; i < len; i++)
+         in[i] = (uint8_t)bulk_rand();
+      ck_assert_int_eq(aes_init(&a, k1, ks), 0);
+      ck_assert_int_eq(aes_init(&c, k2, ks), 0);
+      aes_encrypt_block(&c, tw, t);
+      for (off = 0; off < len; off += 16)
+      {
+         uint8_t carry = 0;
+         for (i = 0; i < 16; i++)
+            b[i] = in[off + i] ^ t[i];
+         aes_encrypt_block(&a, b, b);
+         for (i = 0; i < 16; i++)
+            ref[off + i] = b[i] ^ t[i];
+         for (i = 0; i < 16; i++)
+         {
+            uint8_t next = t[i] >> 7;
+            t[i]  = (uint8_t)((t[i] << 1) | carry);
+            carry = next;
+         }
+         t[0] ^= (uint8_t)(0x87 & (0 - carry));
+      }
+      memcpy(back, in, len);
+      aes_xts_encrypt(&a, &c, tw, in, inplace ? in : out, len);
+      ck_assert_int_eq(memcmp(inplace ? in : out, ref, len), 0);
+      aes_xts_decrypt(&a, &c, tw, inplace ? in : out, inplace ? in : out, len);
+      ck_assert_int_eq(memcmp(inplace ? in : out, back, len), 0);
+   }
+}
+END_TEST
+
 START_TEST(test_md5_unaligned)
 {
    static const uint8_t expected[16] = {
@@ -1616,6 +1956,7 @@ Suite *create_suite(void)
    TCase *tc_core = tcase_create("Core");
    tcase_set_timeout(tc_core, 60);
    tcase_add_test(tc_core, test_md5_unaligned);
+   tcase_add_test(tc_core, test_aes_xts);
    tcase_add_test(tc_core, test_aes_block);
    tcase_add_test(tc_core, test_aes_cmac);
    tcase_add_test(tc_core, test_aes_gcm);
@@ -1632,6 +1973,8 @@ Suite *create_suite(void)
    tcase_add_test(tc_core, test_x25519);
    tcase_add_test(tc_core, test_x509_policy);
    tcase_add_test(tc_core, test_p256);
+   tcase_add_test(tc_core, test_p256_vectors);
+   tcase_add_test(tc_core, test_p256_der);
    tcase_add_test(tc_core, test_p384);
    tcase_add_test(tc_core, test_b233);
    tcase_add_test(tc_core, test_rsa_sign);
@@ -1641,7 +1984,9 @@ Suite *create_suite(void)
    tcase_add_test(tc_core, test_aes_decrypt_hmac_sha1);
    tcase_add_test(tc_core, test_krb5_enctypes);
    tcase_add_test(tc_core, test_bulk_paths);
+   tcase_add_test(tc_core, test_aes_ctr128);
    tcase_add_test(tc_core, test_streams);
+   tcase_add_test(tc_core, test_aes_cfb128);
    tcase_add_test(tc_core, test_aes_cbc);
    tcase_add_test(tc_core, test_aes_cbc_decrypt);
    suite_add_tcase(s, tc_core);

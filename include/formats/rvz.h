@@ -27,6 +27,7 @@
 #include <stdint.h>
 
 #include <retro_common_api.h>
+#include <boolean.h>
 
 RETRO_BEGIN_DECLS
 
@@ -116,6 +117,21 @@ int rvz_disc_type(const rvz_t *rvz);
 /* the size of the disc image */
 uint64_t rvz_disc_size(const rvz_t *rvz);
 
+/* How the file's groups are compressed */
+#define RVZ_COMPRESSION_NONE  0
+#define RVZ_COMPRESSION_PURGE 1
+#define RVZ_COMPRESSION_BZIP2 2
+#define RVZ_COMPRESSION_LZMA  3
+#define RVZ_COMPRESSION_LZMA2 4
+#define RVZ_COMPRESSION_ZSTD  5
+
+/* The open file's RVZ_COMPRESSION_* method, -1 before it is open; and
+ * at @level (may be NULL) the compression level the file records */
+int rvz_compression(const rvz_t *rvz, int *level);
+
+/* the octets of the disc a group holds, 0 before the file is open */
+uint32_t rvz_chunk_size(const rvz_t *rvz);
+
 /**
  * rvz_read_begin:
  *
@@ -138,6 +154,35 @@ int rvz_read_step(rvz_t *rvz, rvz_request_t *req);
 
 /* octets the armed read has put at its @dst so far */
 size_t rvz_read_progress(const rvz_t *rvz);
+
+/**
+ * rvz_decrypted_supported:
+ * @partition_data : where the Wii partition's data starts on the disc
+ * @off            : an offset in that data, decrypted: 0x7c00 octets a
+ *                   sector, with no hashes
+ * @len            : octets from there
+ *
+ * Whether the range is one rvz_read_decrypted_begin() reads: it ends
+ * within one of the partition's data segments.
+ **/
+bool rvz_decrypted_supported(const rvz_t *rvz, uint64_t partition_data,
+      uint64_t off, uint64_t len);
+
+/**
+ * rvz_read_decrypted_begin:
+ *
+ * Arms a read of @len octets of a Wii partition's data at @off as it
+ * is decrypted, 0x7c00 octets a sector, into @dst, run with
+ * rvz_read_step() as rvz_read_begin()'s is. The file holds that data
+ * decrypted, so it comes as it is stored: no hashes are worked out and
+ * nothing is encrypted, as reading the disc image would, only to be
+ * decrypted again. A range past the partition's data fails the read.
+ *
+ * Returns: RVZ_OK, RVZ_ERROR_PARAM when no partition's data starts at
+ * @partition_data, or RVZ_ERROR_STATE before the image is open.
+ **/
+int rvz_read_decrypted_begin(rvz_t *rvz, uint64_t partition_data,
+      uint64_t off, void *dst, size_t len);
 
 RETRO_END_DECLS
 

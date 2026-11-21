@@ -407,6 +407,11 @@ static uint32_t rd_adler32_update(uint32_t adler,
    return rd_adler32_on(adler, buf, len, 16);
 }
 
+uint32_t encoding_adler32(uint32_t adler, const uint8_t *buf, size_t len)
+{
+   return rd_adler32_update(adler, buf, len);
+}
+
 /* Test entry point for tools/encodings/adler32_test.c: the kernel above is
  * static, and driving it only through rinflate/rdeflate would exercise
  * whatever lengths and alignments a stream happens to produce rather than
@@ -2220,6 +2225,7 @@ struct rdeflate
    uint32_t crc;       /* gzip: running crc32 of the input              */
    uint32_t total_in;  /* gzip: mod 2^32, for ISIZE                     */
    int      final_in;    /* caller signalled end of input                  */
+   int      flush_req;   /* sync flush asked for: 1 pending, 2 marker out */
    int      done;
    int      error;
 
@@ -2944,6 +2950,14 @@ void rdeflate_finish(void *data)
    s->final_in = 1;
 }
 
+/* write out everything taken so far, ending on a byte boundary */
+void rdeflate_flush(void *data)
+{
+   struct rdeflate *s = (struct rdeflate*)data;
+   if (!s->flush_req)
+      s->flush_req = 1;
+}
+
 /* ------- the parser: consume win[block_start..win_len) into symbols ------- */
 /* Fills the symbol buffer using greedy/lazy matching.  Leaves s->pos at the
  * first unprocessed byte.  Stops early if the symbol buffer is near full.
@@ -3141,8 +3155,10 @@ static void rd_parse(struct rdeflate *s)
       s->prev_lit       = prev_lit;
    }
 
-   /* flush a deferred match/literal at true end of input */
-   if (s->final_in && s->pos >= end && s->have_prev
+   /* flush a deferred match/literal at true end of input, or at a sync
+    * flush once all the input given so far is in */
+   if ((s->final_in || (s->flush_req && s->in_pos >= s->in_size))
+       && s->pos >= end && s->have_prev
        && s->nsyms < RD_BLOCK_SYMS - 2)
    {
       s->have_prev = 0;
@@ -3885,6 +3901,33 @@ int rdeflate_process(void *data, size_t *read, size_t *wrote)
          {
             block_ready  = 1;
             is_final     = 1;
+         }
+         /* sync flush: once all the input given is parsed, the pending
+          * symbols go out as a block, then an empty stored block ends
+          * the output on a byte boundary (zlib's Z_SYNC_FLUSH). The
+          * window is kept, so matches still reach across it. */
+         if (!block_ready && s->flush_req && !s->final_in
+               && s->in_pos >= s->in_size && s->pos >= s->win_len
+               && !s->have_prev)
+         {
+            if (s->nsyms)
+               block_ready = 1;
+            else
+            {
+               if (s->flush_req == 1)
+               {
+                  rd_putbits(s, 0, 3);  /* BFINAL=0, BTYPE=00 */
+                  if (s->bitcnt & 7)
+                     rd_putbits(s, 0, 8 - (s->bitcnt & 7));
+                  rd_putbits(s, 0x0000, 16);
+                  rd_putbits(s, 0xffff, 16);
+                  s->flush_req = 2;
+               }
+               if (!rd_flush_bytes(s))
+                  goto suspend;
+               s->flush_req = 0;
+               goto suspend;
+            }
          }
          if (!block_ready) /* need more input */
             goto suspend;   

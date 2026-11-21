@@ -20,6 +20,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <stdio.h>
@@ -380,8 +381,13 @@ done:
 int socket_poll(struct pollfd *fds, unsigned nfds, int timeout)
 {
 #if defined(_WIN32)
-   /* select() exists on 9x, XP, Vista+, and Xbox XTL. WSAPoll does not. */
-   fd_set rfds, wfds, efds;
+   /* select() exists on 9x, XP, Vista+, and Xbox XTL. WSAPoll does not.
+    * A Winsock fd_set is a count and an array that select() reads up to
+    * the count, and FD_SET drops what passes FD_SETSIZE (64), so more
+    * sockets than that get sets sized for them. */
+   fd_set sets[3];
+   fd_set *rfds = &sets[0], *wfds = &sets[1], *efds = &sets[2];
+   void   *big  = NULL;
    struct timeval tv, *ptv = NULL;
    unsigned i;
    int ret;
@@ -390,9 +396,18 @@ int socket_poll(struct pollfd *fds, unsigned nfds, int timeout)
    if (nfds && !fds)
       return -1;
 
-   FD_ZERO(&rfds);
-   FD_ZERO(&wfds);
-   FD_ZERO(&efds);
+   if (nfds > FD_SETSIZE)
+   {
+      size_t one = offsetof(fd_set, fd_array) + nfds * sizeof(SOCKET);
+      if (!(big = malloc(3 * one)))
+         return -1;
+      rfds = (fd_set*)big;
+      wfds = (fd_set*)((char*)big + one);
+      efds = (fd_set*)((char*)big + 2 * one);
+   }
+   rfds->fd_count = 0;
+   wfds->fd_count = 0;
+   efds->fd_count = 0;
 
    for (i = 0; i < nfds; i++)
    {
@@ -408,10 +423,10 @@ int socket_poll(struct pollfd *fds, unsigned nfds, int timeout)
       }
 
       if (fds[i].events & (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI))
-         FD_SET(s, &rfds);
+         rfds->fd_array[rfds->fd_count++] = s;
       if (fds[i].events & (POLLOUT | POLLWRNORM | POLLWRBAND))
-         FD_SET(s, &wfds);
-      FD_SET(s, &efds);
+         wfds->fd_array[wfds->fd_count++] = s;
+      efds->fd_array[efds->fd_count++] = s;
    }
 
    if (timeout >= 0)
@@ -422,9 +437,12 @@ int socket_poll(struct pollfd *fds, unsigned nfds, int timeout)
    }
 
    /* Winsock ignores nfds and walks the fd_set. */
-   ret = socket_select(0, &rfds, &wfds, &efds, ptv);
+   ret = socket_select(0, rfds, wfds, efds, ptv);
    if (ret < 0)
+   {
+      free(big);
       return ret;
+   }
 
    for (i = 0; i < nfds; i++)
    {
@@ -433,18 +451,19 @@ int socket_poll(struct pollfd *fds, unsigned nfds, int timeout)
       if (fds[i].revents & POLLNVAL)
          continue;
 
-      if (FD_ISSET(s, &rfds))
+      if (FD_ISSET(s, rfds))
          fds[i].revents |= (short)(fds[i].events &
                (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI));
-      if (FD_ISSET(s, &wfds))
+      if (FD_ISSET(s, wfds))
          fds[i].revents |= (short)(fds[i].events &
                (POLLOUT | POLLWRNORM | POLLWRBAND));
-      if (FD_ISSET(s, &efds))
+      if (FD_ISSET(s, efds))
          fds[i].revents |= POLLERR;
       if (fds[i].revents)
          nready++;
    }
 
+   free(big);
    return nready;
 #elif defined(VITA)
    int i, j;
@@ -800,6 +819,87 @@ static void socket_set_last_error(int err)
 #endif
 }
 #endif
+
+int socket_connect_begin(int fd, void *data)
+{
+   int result;
+   if (fd < 0 || !data || !socket_nonblock(fd))
+      return SOCKET_CONNECT_ERROR;
+   result = socket_connect(fd, data);
+   if (!result)
+      return SOCKET_CONNECT_READY;
+   return isinprogress(result) || isagain(result)
+      ? SOCKET_CONNECT_PENDING : SOCKET_CONNECT_ERROR;
+}
+
+int socket_connect_step(int fd, void *data)
+{
+   int result;
+   if (fd < 0 || !data)
+      return SOCKET_CONNECT_ERROR;
+#ifdef NETWORK_HAVE_POLL
+   {
+      struct pollfd fds = {0};
+      NET_POLL_FD(fd, &fds);
+      NET_POLL_EVENT(POLLOUT, &fds);
+      result = socket_poll(&fds, 1, 0);
+      if (result < 0)
+         return SOCKET_CONNECT_ERROR;
+      if (!result || !NET_POLL_HAS_EVENT(POLLOUT | POLLERR | POLLHUP | POLLNVAL, &fds))
+         return SOCKET_CONNECT_PENDING;
+   }
+#else
+   {
+      fd_set writable, errors;
+      struct timeval timeout;
+#ifndef _WIN32
+      if (fd >= FD_SETSIZE)
+         return SOCKET_CONNECT_ERROR;
+#endif
+      FD_ZERO(&writable);
+      FD_ZERO(&errors);
+      FD_SET(fd, &writable);
+      FD_SET(fd, &errors);
+      timeout.tv_sec = timeout.tv_usec = 0;
+      result = socket_select(fd + 1, NULL, &writable, &errors, &timeout);
+      if (result < 0)
+         return SOCKET_CONNECT_ERROR;
+      if (!result || (!FD_ISSET(fd, &writable) && !FD_ISSET(fd, &errors)))
+         return SOCKET_CONNECT_PENDING;
+   }
+#endif
+#if defined(GEKKO) && !defined(GEKKO_NATIVE)
+   result = socket_connect(fd, data);
+   if (!result || -result == EISCONN)
+      return SOCKET_CONNECT_READY;
+#elif defined(_3DS) || defined(GEKKO_NATIVE)
+   result = socket_connect(fd, data);
+   if (!result || errno == EISCONN)
+      return SOCKET_CONNECT_READY;
+#elif defined(WIIU)
+   result = socket_connect(fd, data);
+   if (!result || socketlasterr() == SO_EISCONN)
+      return SOCKET_CONNECT_READY;
+#else
+   {
+      int error = -1;
+      socklen_t size = sizeof(error);
+      result = getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&error, &size);
+      if (result < 0 || size != sizeof(error))
+         return SOCKET_CONNECT_ERROR;
+      if (!error)
+         return SOCKET_CONNECT_READY;
+#ifdef SOCKET_CONNECT_SETS_ERROR
+      socket_set_last_error(error);
+#endif
+      return SOCKET_CONNECT_ERROR;
+   }
+#endif
+#if defined(GEKKO) || defined(GEKKO_NATIVE) || defined(_3DS) || defined(WIIU)
+   return isinprogress(result) || isagain(result)
+      ? SOCKET_CONNECT_PENDING : SOCKET_CONNECT_ERROR;
+#endif
+}
 
 bool socket_connect_with_timeout(int fd, void *data, int timeout)
 {

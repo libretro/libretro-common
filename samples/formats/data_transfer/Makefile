@@ -13,7 +13,7 @@ COMMON_SOURCES := \
 	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
 	$(LIBRETRO_COMM_DIR)/file/file_path.c \
 	$(LIBRETRO_COMM_DIR)/file/file_path_io.c \
-	$(LIBRETRO_COMM_DIR)/formats/data_transfer.c \
+	$(LIBRETRO_COMM_DIR)/formats/data_transfer.c $(LIBRETRO_COMM_DIR)/streams/data_transfer_file.c \
 	$(LIBRETRO_COMM_DIR)/memmap/memmap.c \
 	$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
 	$(LIBRETRO_COMM_DIR)/string/rstrtod.c \
@@ -49,9 +49,10 @@ $(TARGET_TEST2): data_transfer_prefix_test.o $(COMMON_OBJS)
 
 ifeq ($(COUNT_IO),1)
 data_transfer_prefix_test.o: CFLAGS += -DDT_COUNT_IO
-$(TARGET_TEST2): LDFLAGS += -Wl,--wrap=filestream_read
+$(TARGET_TEST2): LDFLAGS += -Wl,--wrap=filestream_read -Wl,--wrap=filestream_read_at
 data_transfer_window_test.o: CFLAGS += -DDT_COUNT_IO
-$(TARGET_TEST3): LDFLAGS += -Wl,--wrap=filestream_seek -Wl,--wrap=filestream_read
+$(TARGET_TEST3): LDFLAGS += -Wl,--wrap=filestream_seek -Wl,--wrap=filestream_read \
+	-Wl,--wrap=filestream_read_at
 endif
 
 $(TARGET_TEST3): data_transfer_window_test.o $(COMMON_OBJS)

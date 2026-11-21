@@ -43,6 +43,16 @@
 #define MAX_EXC   4096
 
 static int failures = 0;
+
+/* Allocations made through malloc, calloc and realloc (the Makefile wraps
+ * them): reads of a Zstandard image once read through allocate nothing. */
+static unsigned long allocations = 0;
+void *__real_malloc(size_t size);
+void *__real_calloc(size_t n, size_t size);
+void *__real_realloc(void *p, size_t size);
+void *__wrap_malloc(size_t size) { allocations++; return __real_malloc(size); }
+void *__wrap_calloc(size_t n, size_t size) { allocations++; return __real_calloc(n, size); }
+void *__wrap_realloc(void *p, size_t size) { allocations++; return __real_realloc(p, size); }
 /* the Wii partition's data, in sectors: a full hash block and 37 */
 static uint32_t n_sectors = 101;
 static uint32_t rng_state;
@@ -234,6 +244,10 @@ static void emit(struct out *o, const void *p, size_t len)
 #define M_LZMA  3
 #define M_LZMA2 4
 #define M_ZSTD  5
+
+/* the level the writer records: a different one each method, one of
+ * them negative as Zstandard's may be */
+#define LEVEL_OF(cfg) ((int)(cfg)->method * 7 - 5)
 
 struct config
 {
@@ -723,6 +737,9 @@ struct image
    uint8_t *file;       /* the RVZ file, in memory */
    size_t   file_len;
    unsigned n_exc;
+   uint8_t *pdata;      /* a Wii partition's data, decrypted; or NULL */
+   uint64_t pdata_len;
+   uint64_t pdata_at;   /* where it starts on the disc */
 };
 
 static void put_be32_iso(uint8_t *iso, uint64_t off, uint32_t v)
@@ -764,6 +781,9 @@ static bool write_rvz(const struct config *cfg, const char *path, struct image *
    disc.d    = (uint8_t*)calloc(1, (size_t)disc.len);
    img->size = disc.len;
    img->n_exc = 0;
+   img->pdata = NULL;
+   img->pdata_len = 0;
+   img->pdata_at = data_at;
 
    if (!cfg->wii)
    {
@@ -896,7 +916,7 @@ static bool write_rvz(const struct config *cfg, const char *path, struct image *
    memset(dt, 0, sizeof(dt));
    put32(dt + 0x00, cfg->wii ? 2 : 1);
    put32(dt + 0x04, (uint32_t)cfg->method);
-   put32(dt + 0x08, 1);
+   put32(dt + 0x08, (uint32_t)LEVEL_OF(cfg));
    put32(dt + 0x0c, cfg->chunk);
    memcpy(dt + 0x10, disc.d, 0x80);
    put32(dt + 0x90, part.len ? 1 : 0);
@@ -959,7 +979,8 @@ static bool write_rvz(const struct config *cfg, const char *path, struct image *
    free(w.groups.d);
    free(raw.d);
    free(part.d);
-   free(pd.d);
+   img->pdata     = pd.d;
+   img->pdata_len = pd.len;
    free(exc);
    return true;
 }
@@ -1021,7 +1042,88 @@ static int64_t read_mem(rvz_t *z, const struct image *img,
    return e == RVZ_OK ? (int64_t)rvz_read_progress(z) : -1;
 }
 
+static int64_t read_dec(rvz_t *z, const struct image *img,
+      uint64_t off, void *dst, size_t len)
+{
+   rvz_request_t req;
+   int           e;
+   if (rvz_read_decrypted_begin(z, img->pdata_at, off, dst, len) != RVZ_OK)
+      return -1;
+   while ((e = rvz_read_step(z, &req)) == RVZ_PENDING)
+      supply(z, &req, img->file, img->file_len);
+   return e == RVZ_OK ? (int64_t)rvz_read_progress(z) : -1;
+}
+
 /* ---- the checks ---- */
+
+/* A Wii partition's data read decrypted, as the file holds it, against
+ * the data the image was made from */
+static void check_decrypted(const struct config *cfg, const struct image *img)
+{
+   static uint8_t buf[0x300000];
+   rvz_t   *z;
+   uint64_t at;
+   unsigned i;
+
+   if (!img->pdata)
+      return;
+   if (!(z = open_mem(img->file, img->file_len)))
+   {
+      fail("open", cfg->name);
+      return;
+   }
+   if (!rvz_decrypted_supported(z, img->pdata_at, 0, img->pdata_len))
+      fail("the partition's data read decrypted", cfg->name);
+   if (rvz_decrypted_supported(z, img->pdata_at, 0, img->pdata_len + 1))
+      fail("a decrypted read past the partition's data", cfg->name);
+   if (     rvz_decrypted_supported(z, img->pdata_at + SECTOR, 0, 1)
+         || rvz_read_decrypted_begin(z, img->pdata_at + SECTOR, 0, buf, 1)
+            != RVZ_ERROR_PARAM)
+      fail("a decrypted read where no partition's data starts", cfg->name);
+
+   /* the whole of it in order, in pieces of every size */
+   for (at = 0; at < img->pdata_len; )
+   {
+      size_t  want = 1 + rnd() % 0x50000;
+      size_t  left = (size_t)(img->pdata_len - at);
+      int64_t got;
+      if (want > left)
+         want = left;
+      got = read_dec(z, img, at, buf, want);
+      if (got != (int64_t)want || memcmp(buf, img->pdata + at, want))
+      {
+         fprintf(stderr, "  at 0x%llx + 0x%lx: got %lld\n",
+               (unsigned long long)at, (unsigned long)want, (long long)got);
+         fail("reading decrypted in order", cfg->name);
+         break;
+      }
+      at += want;
+   }
+   /* anywhere, any size */
+   for (i = 0; i < (cfg->method == M_LZMA || cfg->method == M_LZMA2
+            || cfg->method == M_BZIP2 ? 12u : 200u); i++)
+   {
+      uint64_t off  = ((uint64_t)rnd() << 16 ^ rnd()) % img->pdata_len;
+      size_t   want = 1 + rnd() % ((i & 7) == 0 ? sizeof(buf) : 0x9000);
+      int64_t  got;
+      if (want > img->pdata_len - off)
+         want = (size_t)(img->pdata_len - off);
+      got = read_dec(z, img, off, buf, want);
+      if (got != (int64_t)want || memcmp(buf, img->pdata + off, want))
+      {
+         fprintf(stderr, "  at 0x%llx + 0x%lx\n", (unsigned long long)off, (unsigned long)want);
+         fail("reading decrypted anywhere", cfg->name);
+         break;
+      }
+   }
+   /* the disc image reads as before after decrypted reads */
+   if (read_mem(z, img, 0, buf, 0x40000) != 0x40000 || memcmp(buf, img->iso, 0x40000))
+      fail("reading the image after decrypted reads", cfg->name);
+   /* past the partition's data */
+   if (read_dec(z, img, img->pdata_len, buf, 16) != -1)
+      fail("a decrypted read past the partition's data", cfg->name);
+   rvz_free(z);
+}
 
 static void check_image(const struct config *cfg, const struct image *img)
 {
@@ -1039,6 +1141,15 @@ static void check_image(const struct config *cfg, const struct image *img)
       fail("disc type", cfg->name);
    if (rvz_disc_size(z) != img->size)
       fail("disc size", cfg->name);
+   {
+      static const int methods[] = { RVZ_COMPRESSION_NONE, RVZ_COMPRESSION_PURGE,
+         RVZ_COMPRESSION_BZIP2, RVZ_COMPRESSION_LZMA, RVZ_COMPRESSION_LZMA2,
+         RVZ_COMPRESSION_ZSTD };
+      int level = -1;
+      if (     rvz_compression(z, &level) != methods[cfg->method]
+            || level != LEVEL_OF(cfg) || rvz_chunk_size(z) != cfg->chunk)
+         fail("compression and chunk size", cfg->name);
+   }
 
    /* the whole image in order, in pieces of every size */
    for (at = 0; at < img->size; )
@@ -1059,6 +1170,8 @@ static void check_image(const struct config *cfg, const struct image *img)
       at += (uint64_t)got;
    }
 
+   allocations = 0;
+
    /* anywhere, any size, across every boundary */
    /* fewer where a group is slow to decode: LZMA and bzip2, and 2 MiB
     * groups of literals the LZMA encoder here makes */
@@ -1076,6 +1189,12 @@ static void check_image(const struct config *cfg, const struct image *img)
          fail("reading anywhere", cfg->name);
          break;
       }
+   }
+
+   if (cfg->method == M_ZSTD && allocations)
+   {
+      fprintf(stderr, "  %lu allocations\n", allocations);
+      fail("reads allocating after the image was read through", cfg->name);
    }
 
    /* at and past the end */
@@ -1199,10 +1318,12 @@ int main(int argc, char **argv)
       if (cfg->wii && cfg->exceptions && !img.n_exc)
          fail("the writer made no exceptions", cfg->name);
       check_image(cfg, &img);
+      check_decrypted(cfg, &img);
       if (c == 0 || c == 6 || c == 18 || c == 24)
          check_damage(cfg, &img);
       free(img.iso);
       free(img.file);
+      free(img.pdata);
       run++;
    }
    /* groups stored as they are go straight where the read asked */

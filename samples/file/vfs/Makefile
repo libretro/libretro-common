@@ -13,6 +13,20 @@ TARGET_TEST9 := vfs_readahead_test
 TARGET_TEST10 := vfs_view_test
 TARGET_TEST11 := vfs_prefetch_offthread_test
 TARGET_TEST12 := vfs_close_result_test
+TARGET_TEST13 := vfs_descriptor_rw_test
+TARGET_TEST14 := vfs_positional_test
+TARGET_TEST15 := vfs_positional_nommap_test
+TARGET_TEST16 := vfs_positional_off32_test
+TARGET_TEST17 := vfs_positional_pathreopen_test
+TARGET_TEST18 := vfs_positional_ntverify_test
+TARGET_TEST19 := vfs_positional_wide_test
+TARGET_TEST20 := vfs_seek_read_mix_test
+TARGET_TEST21 := vfs_write_mix_test
+TARGET_TEST22 := vfs_stable_test
+TARGET_TEST23 := vfs_size_contract_test
+TARGET_TEST24 := vfs_positional_size_test
+BENCH_CRT     := vfs_native_bench
+BENCH_NATIVE  := vfs_native_bench_native
 
 LIBRETRO_COMM_DIR := ../../..
 
@@ -34,7 +48,9 @@ OBJS        := vfs_read_overflow_test.o vfs_mapped_ptr_test.o \
 	vfs_bulk_read_test.o filestream_rbuf_fault_test.o \
 	vfs_v5_metadata_test.o vfs_rename_replace_test.o \
 	vfs_prefetch_test.o vfs_readahead_test.o vfs_view_test.o \
-	vfs_prefetch_offthread_test.o vfs_close_result_test.o $(COMMON_OBJS)
+	vfs_prefetch_offthread_test.o vfs_close_result_test.o \
+	vfs_descriptor_rw_test.o vfs_positional_test.o \
+	vfs_positional_off32_test.o $(COMMON_OBJS)
 
 # vfs_view_test also hashes through sha1_calculate(), whose dispatch
 # asks features_cpu.c what the CPU has.
@@ -108,11 +124,17 @@ CLOSE_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
 UNAME_S := $(shell uname -s 2>/dev/null)
 ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
    MMAP ?= 0
+   $(call sample_objs,$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.o): CFLAGS += -Wframe-larger-than=2048 -Werror=frame-larger-than=2048
 else
    MMAP ?= 1
 endif
 ifeq ($(MMAP),1)
    CFLAGS += -DHAVE_MMAP
+endif
+# As RetroArch's Makefile builds Linux: what glibc declares only under it
+# (fallocate's hole punching) is what a frontend runs
+ifeq ($(UNAME_S),Linux)
+   CFLAGS += -D_GNU_SOURCE
 endif
 
 # vfs_bulk_read_test asserts which I/O path an open lands on, and the
@@ -124,6 +146,14 @@ endif
 DESCRIPTOR_IO ?=
 ifeq ($(DESCRIPTOR_IO),1)
    CFLAGS += -DVFS_HAVE_DESCRIPTOR_IO=1
+endif
+
+# 'make VFS_NATIVE=0' builds the suite with Windows streams on the C
+# runtime (VFS_WIN32_NO_NATIVE) rather than a handle of their own;
+# elsewhere it changes nothing.
+VFS_NATIVE ?=
+ifeq ($(VFS_NATIVE),0)
+   CFLAGS += -DVFS_WIN32_NO_NATIVE
 endif
 
 # FAKE_CFR=1 stands in a copy_file_range that copies to EOF whatever
@@ -156,7 +186,10 @@ endif
 
 all: $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) $(TARGET_TEST4) \
 	$(TARGET_TEST5) $(TARGET_TEST6) $(TARGET_TEST8) $(TARGET_TEST9) \
-	$(TARGET_TEST10) $(TARGET_TEST11) $(TARGET_TEST12) $(RENAME_TARGET)
+	$(TARGET_TEST10) $(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) \
+	$(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) $(TARGET_TEST17) \
+	$(TARGET_TEST18) $(TARGET_TEST19) $(TARGET_TEST20) $(TARGET_TEST21) $(TARGET_TEST22) $(TARGET_TEST23) $(TARGET_TEST24) $(BENCH_CRT) $(BENCH_NATIVE) \
+	$(RENAME_TARGET)
 
 %.o: %.c
 	$(CC) -c -o $@ $< $(CFLAGS)
@@ -173,6 +206,113 @@ $(TARGET_TEST): vfs_mapped_ptr_test.o $(COMMON_OBJS)
 
 $(TARGET_TEST8): vfs_prefetch_test.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST13): vfs_descriptor_rw_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST14): vfs_positional_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_nommap_test: the same test against a
+# vfs_implementation.o built without HAVE_MMAP, as Android's is, where
+# a Unix host must still read and write at offsets (pread/pwrite) - a
+# -1 there fails rather than skips.
+NOMMAP_VFS_OBJ := vfs_implementation_nommap.o
+NOMMAP_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(NOMMAP_VFS_OBJ)
+
+$(NOMMAP_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS))
+
+vfs_positional_required.o: vfs_positional_test.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_POSITIONAL_TEST_REQUIRED
+
+$(TARGET_TEST15): vfs_positional_required.o $(NOMMAP_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_off32_test links a vfs_implementation.o whose
+# positional offsets go through a 32-bit type, as off_t is on 32-bit
+# Linux and older 32-bit Android, so the refusal past 4 GiB is held on
+# a 64-bit host. Scoped to this object.
+OFF32_VFS_OBJ := vfs_implementation_off32.o
+OFF32_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(OFF32_VFS_OBJ)
+
+$(OFF32_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_POSITIONAL_OFF_T=int32_t
+
+$(TARGET_TEST16): vfs_positional_off32_test.o $(OFF32_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_positional_pathreopen_test: on Windows, the second handle made
+# the way NT before Vista makes it - the stream's path opened again and
+# checked against the handle - rather than with ReOpenFile. Elsewhere
+# the define changes nothing. Scoped to this object.
+PATHREOPEN_VFS_OBJ := vfs_implementation_pathreopen.o
+PATHREOPEN_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(PATHREOPEN_VFS_OBJ)
+
+$(PATHREOPEN_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_FORCE_PATH_REOPEN
+
+$(TARGET_TEST17): vfs_positional_required.o $(PATHREOPEN_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_ntverify_test: on Windows, the handle opened relative
+# to the stream's checked against it as NT before Vista has it checked,
+# whatever version runs it. Elsewhere the define changes nothing.
+NTVERIFY_VFS_OBJ := vfs_implementation_ntverify.o
+NTVERIFY_OBJS    := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	$(NTVERIFY_VFS_OBJ)
+
+$(NTVERIFY_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_ALWAYS_VERIFY
+
+$(TARGET_TEST18): vfs_positional_required.o $(NTVERIFY_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+# vfs_positional_wide_test: the positional test from twelve threads
+vfs_positional_wide.o: vfs_positional_test.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_POSITIONAL_TEST_REQUIRED -DTHREADS=12
+
+$(TARGET_TEST19): vfs_positional_wide.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -lpthread
+
+$(TARGET_TEST20): vfs_seek_read_mix_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST21): vfs_write_mix_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST22): vfs_stable_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST23): vfs_size_contract_test.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(TARGET_TEST24): vfs_positional_size_test.o $(COMMON_OBJS) \
+	rthreads_ra.o retro_eventcount_ra.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# vfs_native_bench / vfs_native_bench_native: read-only stream timings
+# through the C runtime (VFS_WIN32_NO_NATIVE), and through the stream's
+# own handle - run both on Windows and compare. Elsewhere the two are
+# the same build.
+CRT_VFS_OBJ := vfs_implementation_crt.o
+BENCH_OBJS  := $(filter-out %/vfs_implementation.o,$(COMMON_OBJS)) \
+	rthreads_ra.o retro_eventcount_ra.o
+
+$(CRT_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_NO_NATIVE
+
+vfs_native_bench_crt.o: vfs_native_bench.c
+	$(CC) -c -o $@ $< $(CFLAGS) -DVFS_WIN32_NO_NATIVE
+
+$(BENCH_CRT): vfs_native_bench_crt.o $(BENCH_OBJS) $(CRT_VFS_OBJ)
+	$(CC) -o $@ $^ $(LDFLAGS) $(RA_LIBS) -lpthread
+
+$(BENCH_NATIVE): vfs_native_bench.o $(COMMON_OBJS) rthreads_ra.o retro_eventcount_ra.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(RA_LIBS) -lpthread
 
 $(TARGET_TEST10): vfs_view_test.o $(VIEW_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -242,7 +382,7 @@ $(TARGET_TEST7): vfs_rename_replace_test.o $(RENAME_OBJS)
 
 $(CLOSE_VFS_OBJ): $(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c close_hook.h
 	$(CC) -c -o $@ $< $(filter-out -DHAVE_MMAP,$(CFLAGS)) -DPS2 \
-		-I. -include close_hook.h
+		-DRETRO_ATOMIC_FORCE_VOLATILE -I. -include close_hook.h
 
 $(TARGET_TEST12): vfs_close_result_test.o $(CLOSE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -252,17 +392,31 @@ clean:
 	rm -f $(TARGET) $(TARGET_TEST) $(TARGET_TEST2) $(TARGET_TEST3) \
 		$(TARGET_TEST4) $(TARGET_TEST5) $(TARGET_TEST6) \
 		$(TARGET_TEST7) $(TARGET_TEST8) $(TARGET_TEST9) $(TARGET_TEST10) \
-		$(TARGET_TEST11) $(TARGET_TEST12) $(CLOSE_VFS_OBJ) \
+		$(TARGET_TEST11) $(TARGET_TEST12) $(TARGET_TEST13) $(TARGET_TEST14) $(TARGET_TEST15) $(TARGET_TEST16) $(TARGET_TEST17) $(TARGET_TEST18) $(TARGET_TEST19) \
+	$(TARGET_TEST20) vfs_seek_read_mix_test.o \
+	$(TARGET_TEST21) vfs_write_mix_test.o \
+	$(TARGET_TEST22) vfs_stable_test.o \
+	$(TARGET_TEST23) vfs_size_contract_test.o \
+	$(TARGET_TEST24) vfs_positional_size_test.o \
+	$(BENCH_CRT) $(BENCH_NATIVE) vfs_positional_wide.o \
+	vfs_native_bench.o vfs_native_bench_crt.o $(CRT_VFS_OBJ) $(CLOSE_VFS_OBJ) \
 		$(OBJS) $(FAULT_FS_OBJ) $(RENAME_VFS_OBJ) \
-		$(RA_VFS_OBJ) $(HOOK_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o
+		$(RA_VFS_OBJ) $(HOOK_VFS_OBJ) rthreads_ra.o retro_eventcount_ra.o \
+		$(NOMMAP_VFS_OBJ) vfs_positional_required.o $(OFF32_VFS_OBJ) \
+		$(PATHREOPEN_VFS_OBJ) $(NTVERIFY_VFS_OBJ)
+	rm -f vfs_positional_off32.bin
 	rm -rf v5_meta_dir
 	rm -f large_3gib.bin large_5gib.bin seek_small.bin seek_4gib.bin
 	rm -f rbuf_fault.txt vfs_readahead_fixture.bin vfs_prefetch_offthread.bin
 	rm -f vfs_view_fixture.bin vfs_view_update.bin vfs_view_empty.bin
-	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.tmp
+	rm -f rename_replace.bin rename_replace.bin.old rename_replace.bin.old2 rename_replace.bin.tmp RENAME_REPLACE.BIN.OLD
 	rm -f close_result.bin close_result_w.bin
 	rm -f bulk_select.bin bulk_select_w.bin bulk_roundtrip.bin \
 		bulk_short.bin bulk_shrank.bin bulk_error.bin \
 		bulk_binary.bin bulk_threads.bin
 
 .PHONY: clean
+
+win32-stat-contract-check:
+	python3 win32_stat_test.py --cc "$(CC)" --sanitizer "$(SANITIZER)"
+.PHONY: win32-stat-contract-check

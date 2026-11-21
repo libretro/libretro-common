@@ -486,7 +486,10 @@ size_t word_wrap_wideglyph(char *s, size_t len,
 
          if (max_lines != 0 && lines >= max_lines)
             continue;
-         else if (lastwideglyph 
+         /* Not before a glyph that starts its line: one wider than
+          * the line would be put on a line of its own for ever */
+         else if (lastwideglyph
+              && lastwideglyph != s_start && lastwideglyph[-1] != '\n'
               && (!lastspace || lastwideglyph > lastspace))
          {
             /* Insert newline character */
@@ -495,6 +498,8 @@ size_t word_wrap_wideglyph(char *s, size_t len,
             src           -= s - lastwideglyph;
             s              = lastwideglyph + 1;
             lastwideglyph  = NULL;
+            /* A space before it is on the line ended here */
+            lastspace      = NULL;
 
             /* Early return if remaining src string
              * length is less than line width */
@@ -543,6 +548,59 @@ size_t word_wrap_wideglyph(char *s, size_t len,
 
    *s = '\0';
    return (size_t)(s - s_start);
+}
+
+size_t word_wrap_offset(const char *src, size_t at,
+      const char *wrapped, size_t wrapped_len)
+{
+   const char *end = wrapped + wrapped_len;
+   const char *z   = NULL; /* the next '\0' of the wrap, or its end */
+   const char *nl  = NULL; /* the next '\n' */
+   size_t      i   = 0;
+   size_t      d   = 0;
+   while (i < at && d < wrapped_len)
+   {
+      size_t r;
+      char   c;
+      /* Up to its next line end the wrap is the source byte for byte,
+       * so that much is compared as one run */
+      if (!z || z < wrapped + d)
+         if (!(z = (const char*)memchr(wrapped + d, '\0', wrapped_len - d)))
+            z = end;
+      if (!nl || nl < wrapped + d)
+         if (!(nl = (const char*)memchr(wrapped + d, '\n', wrapped_len - d)))
+            nl = end;
+      r = (size_t)((nl < z ? nl : z) - (wrapped + d));
+      if (r > at - i)
+         r = at - i;
+      if (r)
+      {
+         if (memcmp(wrapped + d, src + i, r))
+         {
+            /* The wrap holds a byte the source does not: stop there */
+            while (wrapped[d] == src[i])
+            {
+               i++;
+               d++;
+            }
+            break;
+         }
+         i += r;
+         d += r;
+         continue;
+      }
+      /* A line end: one the wrap made of a space or kept, or one it put
+       * before a wide glyph, which takes no byte of src */
+      c = src[i];
+      if (c == wrapped[d] || c == ' ' || c == '\n')
+         i++;
+      d++;
+   }
+   /* At a glyph a line end was put before: the glyph, not the end */
+   if (i == at && src[i] != ' ' && src[i] != '\n')
+      while (d < wrapped_len && (wrapped[d] == '\0' || wrapped[d] == '\n'))
+         d++;
+   return d;
 }
 
 /**

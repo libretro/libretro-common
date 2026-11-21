@@ -6,7 +6,7 @@ ifeq ($(shell uname -s),Darwin)
 CFLAGS += -D_DARWIN_C_SOURCE
 GC_SECTIONS := -Wl,-dead_strip
 endif
-TARGETS := rmp4_vp9_hw_stream_test rwebm_language_test rmp4_vp9_config_test rvp9_config_test rvp9_reference_test rvp9_hw_session_test rvp9_hw_segments_test rwebm_hw_stream_test
+TARGETS := rmp4_vp9_hw_stream_test rwebm_language_test rwebm_lacing_test rmp4_vp9_config_test rvp9_config_test rvp9_reference_test rvp9_hw_session_test rvp9_hw_segments_test rwebm_hw_stream_test
 THREADS ?= 1
 PIXEL_FLAGS :=
 PIXEL_SOURCES :=
@@ -84,8 +84,12 @@ rwebm_hw_stream_test: rwebm_hw_stream_test.c $(WEBM_SOURCES) ../../../formats/we
 rwebm_language_test: rwebm_language_test.c ../../../formats/webm/rwebm.c ../../../include/formats/rwebm.h
 	$(CC) $(CFLAGS) rwebm_language_test.c ../../../formats/webm/rwebm.c -o $@ $(LDFLAGS) -lm
 
+rwebm_lacing_test: rwebm_lacing_test.c ../../../formats/webm/rwebm.c ../../../include/formats/rwebm.h
+	$(CC) $(CFLAGS) rwebm_lacing_test.c ../../../formats/webm/rwebm.c -o $@ $(LDFLAGS) -lm
+
 check: $(TARGETS)
 	./rwebm_language_test
+	./rwebm_lacing_test
 	./rmp4_vp9_hw_stream_test
 	./rmp4_vp9_config_test
 	./rvp9_config_test
@@ -119,14 +123,26 @@ stack-check:
 pixel-check: rvp9_pixel_test
 	python3 check_pixels.py ./rvp9_pixel_test
 
+PLANAR_SOURCES := video_planar_test.c $(WEBM_SOURCES) ../../../formats/webm/rwebm_video.c \
+ ../../../formats/mp4/rmp4.c ../../../formats/mp4/rmp4_video.c \
+ ../../../formats/image/image_yuv_blit.c
+
+video_planar_test: $(PLANAR_SOURCES) ../../../include/formats/image_yuv_blit.h
+	$(CC) $(CFLAGS) $(PIXEL_FLAGS) -D_POSIX_C_SOURCE=200809L -DHAVE_RMP4 -DHAVE_RWEBM -DHAVE_RVP9 \
+	 $(PLANAR_SOURCES) $(PIXEL_SOURCES) -o $@ $(LDFLAGS) -lm
+
+planar-check: video_planar_test check_planar.py
+	python3 check_planar.py ./video_planar_test
+
 rvp9_pixel_test: rvp9_pixel_test.c ../../../formats/vp9/rvp9.c ../../../formats/vp9/rvp9_recon.inc ../../../include/formats/rvp9.h $(PIXEL_SOURCES)
 	$(CC) $(CFLAGS) $(PIXEL_FLAGS) rvp9_pixel_test.c ../../../formats/vp9/rvp9.c $(PIXEL_SOURCES) -o $@ $(LDFLAGS)
 
 clean:
 	rm -f rmp4_h26x_stream_test rmp4_h26x_stream_test.exe rmp4_h26x_hw_test rmp4_h26x_hw_test.exe
 	rm -f rvp9_pixel_test rvp9_pixel_test.exe
+	rm -f video_planar_test video_planar_test.exe
 	rm -f rwebm_h26x_stream_test rwebm_h26x_stream_test.exe
 	rm -f rwebm_h26x_hw_test rwebm_h26x_hw_test.exe
 	rm -f $(TARGETS) $(addsuffix .exe,$(TARGETS))
 
-.PHONY: all check stream-check h26x-check mp4-h26x-check h26x-color-check pixel-check stack-check clean
+.PHONY: all check stream-check h26x-check mp4-h26x-check h26x-color-check pixel-check planar-check stack-check clean

@@ -85,6 +85,7 @@ struct rslc_pr
 #ifdef RSLC_EXTENDED
    bool                     msl_boolread;   /* inside the bool(...) of a block read */
    bool                     msl_dual;       /* a dual-source output: every color names its index */
+   const struct rslc_var   *fb_out;         /* GLSL: the output an input attachment reads */
 #endif
    uint8_t                 *active[RSLC_MAX_BLOCKS];
    unsigned                 version;
@@ -417,6 +418,9 @@ static void pr_type_full(struct rslc_pr *p, const struct rslc_type *t)
    pr_array_suffix(p, t);
 }
 
+/* GLSL ES: of the opaque types only sampler2D and samplerCube have a
+ * default precision (and int and uint sampler2D the statements the stage
+ * opens with); any other takes its own, highp where none is stated. */
 static void pr_precision(struct rslc_pr *p, unsigned prec, const struct rslc_type *t)
 {
    const struct rslc_type *bt = t;
@@ -426,6 +430,17 @@ static void pr_precision(struct rslc_pr *p, unsigned prec, const struct rslc_typ
       bt = bt->elem;
    if (bt->kind == RSLC_TY_STRUCT || bt->kind == RSLC_TY_VOID || bt->base == RSLC_BASE_BOOL)
       return;
+   if (!prec && (RSLC_TY_IS_SAMPLER(bt->kind) || RSLC_TY_IS_IMAGE(bt->kind)))
+   {
+      if (bt->kind == RSLC_TY_SAMPLER2D)
+         return;
+#ifdef RSLC_EXTENDED
+      if (     bt->kind == RSLC_TY_SAMPLERX && bt->rows == RSLC_SDIM_CUBE
+            && !bt->cols && bt->base == RSLC_BASE_FLOAT)
+         return;
+#endif
+      prec = RSLC_PREC_HIGH;
+   }
    switch (prec)
    {
       case RSLC_PREC_LOW:    pr_s(p, "lowp "); break;
@@ -1970,6 +1985,17 @@ static void pr_builtin(struct rslc_pr *p, const struct rslc_node *n)
       pr_msl_builtin(p, n);
       return;
    }
+#ifdef RSLC_EXTENDED
+   /* the framebuffer's value: the inout output, or ARM's built-in */
+   if (bfn == RSLC_BFN_SUBPASSLOAD)
+   {
+      if (p->fb_out)
+         pr_var_name(p, p->fb_out);
+      else
+         pr_s(p, "gl_LastFragColorARM");
+      return;
+   }
+#endif
    /* fma() needs GLSL 4.00 / ES 3.20; below that it is written out */
    if (bfn == RSLC_BFN_FMA && ((!p->es && p->version < 400) || (p->es && p->version < 320)))
    {
@@ -4490,6 +4516,32 @@ static void pr_ioblock_decl(struct rslc_pr *p, const struct rslc_var *v, bool is
 }
 #endif
 
+#ifdef RSLC_EXTENDED
+/* GLSL, GL_EXT_shader_framebuffer_fetch: the colour output an input
+ * attachment reads, the one at its index (an output without a location
+ * is at 0); it prints inout.  Every attachment must find one. */
+static bool pr_fb_fetch_output(struct rslc_pr *p, const struct rslc_var *in)
+{
+   const struct rslc_prog *pr = &p->c->prog;
+   const struct rslc_var  *out = NULL;
+   uint32_t i;
+   if (p->c->opts->fb_fetch != RSLC_FB_FETCH_EXT)
+      return true;
+   for (i = 0; i < pr->noutputs && !out; i++)
+   {
+      const struct rslc_var *v = pr->outputs[i];
+      if (v->index)
+         continue;
+      if (v->location == in->member || (v->location == RSLC_UNSET && in->member == 0))
+         out = v;
+   }
+   if (!out || (p->fb_out && p->fb_out != out))
+      return false;
+   p->fb_out = out;
+   return true;
+}
+#endif
+
 static void pr_io_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
 {
    bool layout_ok = p->es ? p->version >= 300 : p->version >= 330;
@@ -4528,6 +4580,11 @@ static void pr_io_decl(struct rslc_pr *p, const struct rslc_var *v, bool is_in)
       pr_s(p, "centroid ");
    if (v->quals & RSLC_VQ_SAMPLE)
       pr_s(p, "sample ");
+#ifdef RSLC_EXTENDED
+   if (v == p->fb_out)
+      pr_s(p, "inout ");
+   else
+#endif
    pr_s(p, is_in ? "in " : "out ");
    pr_precision(p, v->precision, v->type);
    pr_type(p, v->type);
@@ -4558,6 +4615,8 @@ static const char *pr_image_format(unsigned fmt)
       case RSLC_IMGFMT_RGBA16F:  return "rgba16f";
       case RSLC_IMGFMT_R32F:     return "r32f";
       case RSLC_IMGFMT_RGBA8:    return "rgba8";
+      case RSLC_IMGFMT_RG8:      return "rg8";
+      case RSLC_IMGFMT_R8:       return "r8";
       case RSLC_IMGFMT_RGBA32I:  return "rgba32i";
       case RSLC_IMGFMT_RGBA16I:  return "rgba16i";
       case RSLC_IMGFMT_RGBA8I:   return "rgba8i";
@@ -4717,6 +4776,31 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
       pr_s(p, "#extension GL_ARB_shader_bit_encoding : require");
       pr_nl(p);
    }
+#ifdef RSLC_EXTENDED
+   for (i = 1; i < pr->nvars; i++)
+      if (pr->vars[i]->storage == RSLC_ST_SUBPASS)
+      {
+         pr_s(p, c->opts->fb_fetch == RSLC_FB_FETCH_ARM
+               ? "#extension GL_ARM_shader_framebuffer_fetch : require"
+               : "#extension GL_EXT_shader_framebuffer_fetch : require");
+         pr_nl(p);
+         break;
+      }
+   if (pr->early_fragment_tests && c->opts->early_z_depth_unchanged
+         && (p->es || p->version < 420))
+   {
+      pr_s(p, p->es ? "#extension GL_EXT_conservative_depth : require"
+            : "#extension GL_ARB_conservative_depth : require");
+      pr_nl(p);
+   }
+   if (pr->subgroup)
+   {
+      pr_s(p, "#extension GL_KHR_shader_subgroup_basic : require");
+      pr_nl(p);
+      pr_s(p, "#extension GL_KHR_shader_subgroup_arithmetic : require");
+      pr_nl(p);
+   }
+#endif
    if (!p->es && p->version < 400 && p->uses_gather)
    {
       pr_s(p, "#extension GL_ARB_texture_gather : require");
@@ -4772,6 +4856,7 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
    for (i = 0; i < pr->nsamplers; i++)
    {
       pr_s(p, "uniform ");
+      pr_precision(p, pr->samplers[i]->precision, pr->samplers[i]->type);
       pr_type(p, pr->samplers[i]->type);
       pr_c(p, ' ');
       pr_var_name(p, pr->samplers[i]);
@@ -4781,6 +4866,13 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
    }
    if (pr->early_fragment_tests)
    {
+#ifdef RSLC_EXTENDED
+      /* the driver may then test depth early, as the stage does not
+       * change it */
+      if (c->opts->early_z_depth_unchanged)
+         pr_s(p, "layout(depth_unchanged) out float gl_FragDepth;");
+      else
+#endif
       pr_s(p, "layout(early_fragment_tests) in;");
       pr_nl(p);
    }
@@ -4832,6 +4924,7 @@ static bool pr_glsl(struct rslc_pr *p, struct rslc_result *result)
             pr_s(p, "readonly ");
          if (v->quals & RSLC_VQ_WRITEONLY)
             pr_s(p, "writeonly ");
+         pr_precision(p, v->precision, v->type);
       }
       else if (v->storage == RSLC_ST_SHARED)
          pr_s(p, "shared ");
@@ -6685,12 +6778,11 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
       rslc_err(c, p->hlsl ? "hlsl: no geometry stage yet" : "msl: no geometry stage", NULL, 0);
       return false;
    }
-   /* subgroup operations have a form in SPIR-V and MSL alone; HLSL's
-    * shader models here have no helper invocation either */
-   if (!p->msl && pr->subgroup)
+   /* subgroup operations have no form in HLSL's shader models here,
+    * which have no helper invocation either */
+   if (p->hlsl && pr->subgroup)
    {
-      rslc_err(c, p->hlsl ? "hlsl: no form of subgroup operations"
-            : "glsl: no form of subgroup operations", NULL, 0);
+      rslc_err(c, "hlsl: no form of subgroup operations", NULL, 0);
       return false;
    }
    if (p->hlsl)
@@ -6701,8 +6793,19 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
             rslc_err(c, "hlsl: no form of gl_HelperInvocation", NULL, 0);
             return false;
          }
-   /* an input attachment has a form in MSL alone */
-   if (!p->msl)
+   /* an input attachment has a form in MSL, and in GLSL where the caller
+    * names the framebuffer fetch extension */
+   if (!p->msl && !p->hlsl && c->opts->fb_fetch != RSLC_FB_FETCH_NONE)
+   {
+      for (k = 1; k < pr->nvars; k++)
+         if (pr->vars[k]->storage == RSLC_ST_SUBPASS && !pr_fb_fetch_output(p, pr->vars[k]))
+         {
+            rslc_err(c, "glsl: no colour output for the input attachment", NULL,
+                  pr->vars[k]->line);
+            return false;
+         }
+   }
+   else if (!p->msl)
       for (k = 1; k < pr->nvars; k++)
          if (pr->vars[k]->storage == RSLC_ST_SUBPASS)
          {
@@ -6710,6 +6813,17 @@ bool rslc_emit_text(struct rslc_ctx *c, struct rslc_result *result)
                   NULL, pr->vars[k]->line);
             return false;
          }
+   if (p->es)
+      for (k = 1; k < pr->nvars; k++)
+      {
+         const struct rslc_var *v = pr->vars[k];
+         if (v->storage == RSLC_ST_IMAGE &&
+               (v->type->cols == RSLC_IMGFMT_R8 || v->type->cols == RSLC_IMGFMT_RG8))
+         {
+            rslc_err(c, "glsl es: no r8 or rg8 storage image format", NULL, v->line);
+            return false;
+         }
+      }
    if (p->hlsl && c->stage == RSLC_STAGE_COMPUTE)
    {
       uint32_t k;
@@ -6800,9 +6914,16 @@ struct rslc_rm_spec
    uint32_t clone;   /* the function written for it; fid for mask 0 */
 };
 
+struct rslc_rm_colour_call
+{
+   const struct rslc_type *args[8];
+   int32_t offset[2];
+   unsigned bfn, nargs;
+};
+
 struct rslc_rm;
 static uint32_t rslc_rm_helper(struct rslc_rm *r, unsigned bfn, unsigned nargs,
-      const struct rslc_type *sampler);
+      const struct rslc_type *sampler, const struct rslc_node *node);
 
 struct rslc_rm
 {
@@ -6815,6 +6936,8 @@ struct rslc_rm
    uint32_t                  nvars0;    /* vars before cloning */
    bool                      fail;
    bool                      touched;
+   struct rslc_rm_colour_call *colours;
+   unsigned                  ncolours;
 };
 
 /* Whether a read of the frame, of builtin n->a with @nargs arguments,
@@ -6826,12 +6949,16 @@ static bool rslc_rm_supported(const struct rslc_rm *r, const struct rslc_node *n
    const struct rslc_remap *rm   = r->rm;
    const struct rslc_type  *vec4 = rslc_type_basic(r->c, RSLC_TY_VEC,
          sampler->base, 4, 1);
-   bool lin_ok = !rm->linear
+   bool lin_ok = rm->colour || !rm->linear
       || rm->wrap == RSLC_REMAP_WRAP_EDGE || rm->wrap == RSLC_REMAP_WRAP_BORDER;
    if (     sampler->base != RSLC_BASE_FLOAT
          && n->a != RSLC_BFN_TEXELFETCH && n->a != RSLC_BFN_TEXELFETCHOFFSET
          && n->a != RSLC_BFN_TEXTURESIZE)
       return false;
+   if (rm->colour)
+      return nargs <= 8 && sampler->base == RSLC_BASE_FLOAT
+         && (n->type == vec4 || n->a == RSLC_BFN_TEXTURESIZE
+            || n->a == RSLC_BFN_TEXTUREQUERYLOD || n->a == RSLC_BFN_TEXTUREQUERYLEVELS);
    switch (n->a)
    {
       case RSLC_BFN_TEXTURE:
@@ -6940,12 +7067,71 @@ static void rslc_rm_walk(struct rslc_rm *r, uint32_t node, bool apply)
                r->fail = true;
                return;
             }
+            if (r->rm->colour && (n->a == RSLC_BFN_TEXTURESIZE
+                     || n->a == RSLC_BFN_TEXTUREQUERYLOD
+                     || n->a == RSLC_BFN_TEXTUREQUERYLEVELS))
+               return;
+            if (r->rm->colour && !apply
+                  && (n->a == RSLC_BFN_TEXTUREGATHER
+                     || n->a == RSLC_BFN_TEXTUREGATHEROFFSET))
+            {
+               unsigned at, k;
+               struct rslc_cval offset;
+               memset(&offset, 0, sizeof(offset));
+               if (n->a == RSLC_BFN_TEXTUREGATHEROFFSET
+                     && !rslc_const_eval(c, rslc_list_item(c, n->b, 2), &offset))
+               { r->fail = true; return; }
+               for (at = 0; at < r->ncolours; at++)
+               {
+                  struct rslc_rm_colour_call *call = &r->colours[at];
+                  if (call->bfn != n->a || call->nargs != cnt
+                        || call->offset[0] != (int32_t)offset.v[0]
+                        || call->offset[1] != (int32_t)offset.v[1]) continue;
+                  for (k = 0; k < cnt; k++)
+                     if (call->args[k] != rslc_node_at(c,
+                              rslc_list_item(c, n->b, k))->type) break;
+                  if (k == cnt) break;
+               }
+               if (at == r->ncolours)
+               {
+                  struct rslc_rm_colour_call *call;
+                  if (at == 64) { r->fail = true; return; }
+                  call = &r->colours[r->ncolours++];
+                  call->bfn = n->a;
+                  call->nargs = cnt;
+                  call->offset[0] = (int32_t)offset.v[0];
+                  call->offset[1] = (int32_t)offset.v[1];
+                  for (k = 0; k < cnt; k++)
+                     call->args[k] = rslc_node_at(c,
+                           rslc_list_item(c, n->b, k))->type;
+               }
+            }
             r->touched = true;
             for (i = 1; i < cnt; i++)
                rslc_rm_walk(r, rslc_list_item(c, n->b, i), apply);
             if (apply)
             {
-               uint32_t f = rslc_rm_helper(r, n->a, cnt, st);
+               uint32_t f;
+               if (r->rm->colour && n->a != RSLC_BFN_TEXTUREGATHER
+                     && n->a != RSLC_BFN_TEXTUREGATHEROFFSET)
+               {
+                  struct rslc_node original = *n;
+                  uint32_t arg, args;
+                  for (f = 1; f < c->prog.nfuncs; f++)
+                     if (!strcmp(c->prog.funcs[f]->name->str,
+                              "rarch_sample_colour")) break;
+                  if (f == c->prog.nfuncs) { r->fail = true; return; }
+                  arg = rslc_node_new(c, RSLC_OP_BUILTIN, original.type,
+                        original.a, original.b, original.c, original.aux,
+                        original.line);
+                  args = rslc_list_new(c, &arg, 1);
+                  n = rslc_node_at(c, node);
+                  n->op = RSLC_OP_CALL;
+                  n->a = f;
+                  n->b = args;
+                  return;
+               }
+               f = rslc_rm_helper(r, n->a, cnt, st, n);
                if (!f)
                {
                   r->fail = true;
@@ -7173,7 +7359,7 @@ static bool rslc_rm_clone(struct rslc_rm *r, struct rslc_rm_spec *s)
 /* The helper parsed for builtin @bfn with @nargs arguments, the first
  * a @sampler. */
 static uint32_t rslc_rm_helper(struct rslc_rm *r, unsigned bfn, unsigned nargs,
-      const struct rslc_type *sampler)
+      const struct rslc_type *sampler, const struct rslc_node *node)
 {
    struct rslc_ctx  *c = r->c;
    const char       *bn = rslc_bfn_name(bfn);
@@ -7181,14 +7367,38 @@ static uint32_t rslc_rm_helper(struct rslc_rm *r, unsigned bfn, unsigned nargs,
    size_t            len;
    struct rslc_sym  *s;
    uint32_t          i;
-   if (!bn)
-      return 0;
-   len = strlen(bn);
-   if (len > sizeof(name) - 12)
-      return 0;
-   memcpy(name, "rarch_rect_", 11);
-   memcpy(name + 11, bn, len);
-   len += 11;
+   if (r->rm->colour)
+   {
+      struct rslc_cval offset;
+      unsigned at, k;
+      memset(&offset, 0, sizeof(offset));
+      if (bfn == RSLC_BFN_TEXTUREGATHEROFFSET
+            && !rslc_const_eval(c, rslc_list_item(c, node->b, 2), &offset)) return 0;
+      for (at = 0; at < r->ncolours; at++)
+      {
+         const struct rslc_rm_colour_call *call = &r->colours[at];
+         if (call->bfn != bfn || call->nargs != nargs
+               || call->offset[0] != (int32_t)offset.v[0]
+               || call->offset[1] != (int32_t)offset.v[1]) continue;
+         for (k = 0; k < nargs; k++)
+            if (call->args[k] != rslc_node_at(c,
+                     rslc_list_item(c, node->b, k))->type) break;
+         if (k == nargs) break;
+      }
+      if (at == r->ncolours) return 0;
+      /* C89 has no snprintf: 20 characters and ten digits fit */
+      sprintf(name, "rarch_colour_gather_%u", at);
+      len = strlen(name);
+   }
+   else
+   {
+      if (!bn) return 0;
+      len = strlen(bn);
+      if (len > sizeof(name) - 12) return 0;
+      memcpy(name, "rarch_rect_", 11);
+      memcpy(name + 11, bn, len);
+      len += 11;
+   }
    if (!(s = rslc_sym(c, name, len)))
       return 0;
    for (i = 1; i < c->prog.nfuncs; i++)
@@ -7196,7 +7406,14 @@ static uint32_t rslc_rm_helper(struct rslc_rm *r, unsigned bfn, unsigned nargs,
       const struct rslc_func *f = c->prog.funcs[i];
       if (     f->name == s && f->nparams == nargs && f->body
             && f->params[0]->type == sampler)
-         return f->id;
+      {
+         unsigned k;
+         if (!r->rm->colour) return f->id;
+         for (k = 1; k < nargs; k++)
+            if (f->params[k]->type != rslc_node_at(c,
+                     rslc_list_item(c, node->b, k))->type) break;
+         if (k == nargs) return f->id;
+      }
    }
    return 0;
 }
@@ -7344,6 +7561,97 @@ static bool rslc_rm_text_gather(struct rslc_rm *r, struct rslc_pbuf *b,
            "rarch_rect_v2[0], rarch_rect_v3[0]);\n}\n");
 }
 
+/* Typed wrappers preserve the sampling operation itself. The IR walk
+ * only redirects the selected samplers, including function arguments. */
+static bool rslc_rm_colour_type(struct rslc_rm *r, struct rslc_pbuf *b,
+      const struct rslc_type *type)
+{
+   const char *base = type->base == RSLC_BASE_FLOAT ? "float"
+      : type->base == RSLC_BASE_INT ? "int" : "uint";
+   if (type->kind == RSLC_TY_SAMPLER2D)
+      return rslc_rm_text(r, b, "sampler2D");
+   if (type->kind == RSLC_TY_SCALAR) return rslc_rm_text(r, b, base);
+   if (type->kind != RSLC_TY_VEC) return false;
+   return rslc_rm_text(r, b, type->base == RSLC_BASE_FLOAT ? "vec"
+         : type->base == RSLC_BASE_INT ? "ivec" : "uvec")
+      && rslc_pbuf_putu(r->c, b, type->rows);
+}
+
+static bool rslc_rm_colour_args(struct rslc_rm *r, struct rslc_pbuf *b,
+      unsigned count)
+{
+   unsigned k;
+   for (k = 0; k < count; k++)
+      if (!(rslc_rm_text(r, b, k ? ", a" : "a")
+               && rslc_pbuf_putu(r->c, b, k))) return false;
+   return true;
+}
+
+static bool rslc_rm_colour_snippet(struct rslc_rm *r, struct rslc_pbuf *b)
+{
+   unsigned i, k;
+   bool ok = rslc_rm_text(r, b,
+         "#version 450\n"
+         "vec4 rarch_sample_colour(vec4 v) {\n"
+         "if ($R.w == 0.0) return v;\n"
+         "vec3 x = vec3(dot($R.xyz, v.rgb), dot($C.xyz, v.rgb), dot($T.xyz, v.rgb));\n"
+         "return vec4(sign(x) * pow(abs(x), vec3($C.w)), v.a);\n}\n");
+   for (i = 0; ok && i < r->ncolours; i++)
+   {
+      const struct rslc_rm_colour_call *call = &r->colours[i];
+      const char *bn = rslc_bfn_name(call->bfn);
+      unsigned gather_args = call->bfn == RSLC_BFN_TEXTUREGATHEROFFSET ? 3 : 2;
+      char offset[64];
+      /* C89 has no snprintf: two longs and the text fit in 64 */
+      sprintf(offset, ", ivec2(%ld, %ld)",
+            (long)call->offset[0], (long)call->offset[1]);
+      ok = rslc_rm_text(r, b, "vec4 ")
+         && rslc_rm_text(r, b, "rarch_colour_gather_") && rslc_pbuf_putu(r->c, b, i)
+         && rslc_rm_text(r, b, "(");
+      for (k = 0; ok && k < call->nargs; k++)
+         ok = rslc_rm_text(r, b, k ? ", " : "")
+            && rslc_rm_colour_type(r, b, call->args[k])
+            && rslc_rm_text(r, b, " a") && rslc_pbuf_putu(r->c, b, k);
+      ok = ok && rslc_rm_text(r, b, ") {\n");
+      ok = ok && rslc_rm_text(r, b, "if ($R.w == 0.0) {\n");
+      for (k = 0; ok && k < (call->nargs > gather_args ? 4u : 1u); k++)
+      {
+         if (call->nargs > gather_args)
+            ok = rslc_rm_text(r, b, "if (a")
+               && rslc_pbuf_putu(r->c, b, gather_args)
+               && rslc_rm_text(r, b, " == ") && rslc_pbuf_putu(r->c, b, k)
+               && rslc_rm_text(r, b, ") ");
+         ok = ok && rslc_rm_text(r, b, "return ") && rslc_rm_text(r, b, bn)
+            && rslc_rm_text(r, b, "(") && rslc_rm_colour_args(r, b, 2)
+            && (gather_args == 2 || rslc_rm_text(r, b, offset))
+            && rslc_rm_text(r, b, ", ") && rslc_pbuf_putu(r->c, b, k)
+            && rslc_rm_text(r, b, ");\n");
+      }
+      ok = ok && rslc_rm_text(r, b, "}\n");
+      for (k = 0; ok && k < 4; k++)
+         ok = rslc_rm_text(r, b, "vec4 c") && rslc_pbuf_putu(r->c, b, k)
+            && rslc_rm_text(r, b, " = ") && rslc_rm_text(r, b, bn)
+            && rslc_rm_text(r, b, "(") && rslc_rm_colour_args(r, b, 2)
+            && (gather_args == 2 || rslc_rm_text(r, b, offset))
+            && rslc_rm_text(r, b, ", ") && rslc_pbuf_putu(r->c, b, k)
+            && rslc_rm_text(r, b, ");\n");
+      ok = ok && rslc_rm_text(r, b, "vec4 result;\n");
+      for (k = 0; ok && k < 4; k++)
+         ok = rslc_rm_text(r, b, "result[") && rslc_pbuf_putu(r->c, b, k)
+            && rslc_rm_text(r, b, "] = rarch_sample_colour(vec4(c0[")
+            && rslc_pbuf_putu(r->c, b, k) && rslc_rm_text(r, b, "], c1[")
+            && rslc_pbuf_putu(r->c, b, k) && rslc_rm_text(r, b, "], c2[")
+            && rslc_pbuf_putu(r->c, b, k) && rslc_rm_text(r, b, "], c3[")
+            && rslc_pbuf_putu(r->c, b, k) && rslc_rm_text(r, b, "]))[")
+            && (call->nargs > gather_args
+               ? rslc_rm_text(r, b, "a") && rslc_pbuf_putu(r->c, b, gather_args)
+               : rslc_rm_text(r, b, "0")) && rslc_rm_text(r, b, "];\n");
+      ok = ok && rslc_rm_text(r, b, "return result;\n}\n");
+
+   }
+   return ok;
+}
+
 /* The helpers for the pass's sampling, as GLSL. */
 static bool rslc_rm_snippet(struct rslc_rm *r, struct rslc_pbuf *b)
 {
@@ -7360,7 +7668,7 @@ static bool rslc_rm_snippet(struct rslc_rm *r, struct rslc_pbuf *b)
             "ivec2 rarch_rect_m = rarch_rect_i - rarch_rect_q * rarch_rect_n;\n"
             "rarch_rect_m = ivec2("
             "rarch_rect_m.x < 0 ? rarch_rect_m.x + rarch_rect_n.x : rarch_rect_m.x, "
-            "rarch_rect_m.y < 0 ? rarch_rect_m.y + rarch_rect_n.y : rarch_rect_m.y);\n"
+            "rarch_rect_m.y < 0 ? rarch_rect_m.y + rarch_rect_n.y : rarch_rect_m.y);\n") && rslc_rm_text(r, b,
             "return ivec2("
             "rarch_rect_m.x >= rarch_rect_n.x ? rarch_rect_m.x - rarch_rect_n.x : rarch_rect_m.x, "
             "rarch_rect_m.y >= rarch_rect_n.y ? rarch_rect_m.y - rarch_rect_n.y : rarch_rect_m.y);\n}\n");
@@ -7616,6 +7924,8 @@ bool rslc_remap_run(struct rslc_ctx *c)
    if (idx == 1 && base + 48 > RSLC_REMAP_PUSH_LIMIT)
       return true;
 
+   if (rm->colour && !(r.colours = (struct rslc_rm_colour_call*)rslc_arena_zalloc(c,
+               64 * sizeof(*r.colours)))) return false;
    if (!(r.specs = (struct rslc_rm_spec*)rslc_arena_alloc(c,
                RSLC_RM_MAX_SPECS * sizeof(*r.specs))))
       return false;
@@ -7635,7 +7945,7 @@ bool rslc_remap_run(struct rslc_ctx *c)
       return false;
    if (!rslc_pbuf_init(c, &text, 0, 6144))
       return false;
-   ok = rslc_rm_snippet(&r, &text)
+   ok = (rm->colour ? rslc_rm_colour_snippet(&r, &text) : rslc_rm_snippet(&r, &text))
       && rslc_front_parse(c, (const char*)text.data, text.len);
    rslc_pbuf_free(c, &text);
    if (!ok)

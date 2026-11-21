@@ -59,6 +59,9 @@
  * round trip to move almost nothing; see the drain loop in
  * net_http_update(). */
 #define NET_HTTP_MIN_RECV_WINDOW    (32 * 1024)
+/* A chunk this long is handed to a spans sink where it was received,
+ * not slid down over the chunk header before it */
+#define NET_HTTP_SPAN_MIN           (16 * 1024)
 
 /* The receive buffer never grows past a maximal body plus one window.
  * Content-Length was already capped, but a close-delimited or chunked
@@ -238,6 +241,7 @@ typedef struct response
 
 typedef struct request
 {
+   char *target; /* owns domain and path */
    char *domain;
    char *path;
    char *method;
@@ -258,7 +262,13 @@ typedef struct request
 struct http_t
 {
    net_http_sink_t sink;
+   net_http_sink_spans_t sink_spans;
    void *sink_data;
+   /* A chunked body held for a spans sink: the decoded runs, as
+    * offsets into response.data, in order */
+   size_t span_off[NET_HTTP_SINK_SPANS_MAX];
+   size_t span_len[NET_HTTP_SINK_SPANS_MAX];
+   unsigned span_count;
    /* The transport stage that failed (a literal such as
     * "ssl_connect_failed") and the library code that went with it,
     * for net_http_failure().  NULL/0 until something fails. */
@@ -296,6 +306,8 @@ struct http_t
    /* The request has already been replayed once on a fresh
     * connection; it will not be replayed again. */
    bool retried;
+   /* 3xx responses are handed back as they are, not followed. */
+   bool no_redirect;
    unsigned redirects;
 
    /* For the stall bound: when the transfer last moved and how far it
@@ -324,6 +336,7 @@ struct http_connection_t
    char *auth;
    size_t contentlength; /* ptr alignment */
    net_http_sink_t sink;
+   net_http_sink_spans_t sink_spans;
    void *sink_data;
    net_http_source_t source;
    net_http_source_rewind_t source_rewind;
@@ -331,6 +344,7 @@ struct http_connection_t
    const struct ssl_socket_retro_config *tls;
    int port;
    bool ssl;
+   bool no_redirect;
 };
 
 /* The OS error left by the socket call that just failed, for
@@ -445,7 +459,7 @@ static bool net_http_dns_entry_valid(struct dns_cache_entry *entry)
  * URL Encode a string
  * caller is responsible for deleting the destination buffer
  **/
-void net_http_urlencode(char **dest, const char *source)
+size_t net_http_urlencode_to(char *s, size_t len, const char *source)
 {
    /* Bitmask for unreserved chars: A-Z a-z 0-9 * - . / _ */
    static const uint32_t safe[4] = {
@@ -454,47 +468,46 @@ void net_http_urlencode(char **dest, const char *source)
       0x87FFFFFE, /* 64-95:  A-Z _          */
       0x07FFFFFE  /* 96-127: a-z            */
    };
+   static const char hex[] = "0123456789ABCDEF";
+   size_t _len = 0;
 
-   const char *s;
-   char *enc;
-   size_t len = 0;
-
-   /* First pass: compute exact output length */
-   for (s = source; *s; s++)
+   for (; *source; source++)
    {
-      unsigned char c = (unsigned char)*s;
+      unsigned char c = (unsigned char)*source;
       if (c < 128 && (safe[c >> 5] & (1u << (c & 31))))
-         len += 1;
-      else
-         len += 3;
-   }
-
-   enc   = (char*)malloc(len + 1);
-   *dest = enc;
-
-   /* Malloc failure: leave *dest NULL and bail.  Callers that
-    * dereference the result (common in URL-builder flows) will
-    * then hit a single deliberate NULL check instead of a random
-    * crash in the encoding loop below. */
-   if (!enc)
-      return;
-
-   /* Second pass: encode */
-   for (s = source; *s; s++)
-   {
-      unsigned char c = (unsigned char)*s;
-      if (c < 128 && (safe[c >> 5] & (1u << (c & 31))))
-         *enc++ = (char)c;
+      {
+         if (_len + 1 < len)
+            s[_len] = (char)c;
+         _len += 1;
+      }
       else
       {
-         static const char hex[] = "0123456789ABCDEF";
-         *enc++ = '%';
-         *enc++ = hex[c >> 4];
-         *enc++ = hex[c & 0x0F];
+         if (_len + 3 < len)
+         {
+            s[_len    ] = '%';
+            s[_len + 1] = hex[c >> 4];
+            s[_len + 2] = hex[c & 0x0F];
+         }
+         else if (_len < len)
+            len = _len + 1; /* no half escapes; nothing more fits */
+         _len += 3;
       }
    }
 
-   *enc = '\0';
+   if (len)
+      s[_len < len ? _len : len - 1] = '\0';
+   return _len;
+}
+
+void net_http_urlencode(char **dest, const char *source)
+{
+   size_t _len = net_http_urlencode_to(NULL, 0, source);
+
+   /* Malloc failure: leave *dest NULL.  Callers that dereference the
+    * result (common in URL-builder flows) then hit a single deliberate
+    * NULL check instead of a random crash. */
+   if ((*dest = (char*)malloc(_len + 1)))
+      net_http_urlencode_to(*dest, _len + 1, source);
 }
 
 /**
@@ -968,6 +981,12 @@ void net_http_connection_set_user_agent(
    conn->useragent = user_agent ? strdup(user_agent) : NULL;
 }
 
+void net_http_connection_set_redirects(
+      struct http_connection_t *conn, bool follow)
+{
+   conn->no_redirect = !follow;
+}
+
 void net_http_connection_set_headers(
       struct http_connection_t *conn, const char *headers)
 {
@@ -975,6 +994,13 @@ void net_http_connection_set_headers(
       free(conn->headers);
 
    conn->headers = headers ? strdup(headers) : NULL;
+}
+
+void net_http_connection_take_headers(
+      struct http_connection_t *conn, char *headers)
+{
+   free(conn->headers);
+   conn->headers = headers;
 }
 
 void net_http_connection_set_tls(struct http_connection_t *conn,
@@ -1000,8 +1026,19 @@ void net_http_connection_set_sink(struct http_connection_t *conn,
 {
    if (!conn)
       return;
-   conn->sink      = cb;
-   conn->sink_data = userdata;
+   conn->sink       = cb;
+   conn->sink_spans = NULL;
+   conn->sink_data  = userdata;
+}
+
+void net_http_connection_set_sink_spans(struct http_connection_t *conn,
+      net_http_sink_spans_t cb, void *userdata)
+{
+   if (!conn)
+      return;
+   conn->sink       = NULL;
+   conn->sink_spans = cb;
+   conn->sink_data  = userdata;
 }
 
 void net_http_connection_set_content(
@@ -1439,10 +1476,16 @@ struct http_t *net_http_new(struct http_connection_t *conn)
    state->tls  = conn->tls;
    state->conn = NULL;
 
-   state->request.domain        = strdup(conn->domain);
-   state->request.path          = strdup(conn->path);
-   state->request.method        = strdup(conn->method);
-   state->request.contenttype   = conn->contenttype ? strdup(conn->contenttype) : NULL;
+   /* conn is freed right after this: its strings move, not copy.
+    * domain and path point into its url. */
+   state->request.target        = conn->url;
+   state->request.domain        = conn->domain;
+   state->request.path          = conn->path;
+   state->request.method        = conn->method;
+   state->request.contenttype   = conn->contenttype;
+   conn->url                    = NULL;
+   conn->method                 = NULL;
+   conn->contenttype            = NULL;
    state->request.contentlength = conn->contentlength;
    if (conn->postdata && conn->contentlength)
    {
@@ -1464,13 +1507,19 @@ struct http_t *net_http_new(struct http_connection_t *conn)
    state->request.source        = conn->source;
    state->request.source_rewind = conn->source_rewind;
    state->request.source_data   = conn->source_data;
-   state->request.useragent= conn->useragent ? strdup(conn->useragent) : NULL;
-   state->request.headers  = conn->headers ? strdup(conn->headers) : NULL;
-   state->request.auth     = conn->auth    ? strdup(conn->auth)    : NULL;
+   state->request.useragent= conn->useragent;
+   conn->useragent         = NULL;
+   /* Moved like postdata above: conn is freed right after this */
+   state->request.headers  = conn->headers;
+   conn->headers           = NULL;
+   state->request.auth     = conn->auth;
+   conn->auth              = NULL;
    state->request.port     = conn->port;
+   state->no_redirect      = conn->no_redirect;
 
    state->response.status  = -1;
    state->sink                  = conn->sink;
+   state->sink_spans            = conn->sink_spans;
    state->sink_data             = conn->sink_data;
    state->response.owns_data    = true;
    state->response.owns_headers = true;
@@ -1479,7 +1528,8 @@ struct http_t *net_http_new(struct http_connection_t *conn)
    state->response.buflen  = 64 * 1024;  /* Start with larger buffer to reduce reallocations */
    state->response.data    = (char*)malloc(state->response.buflen);
 
-   /* Any of the strdup / malloc calls above can return NULL on OOM.
+   /* The receive buffer is the one allocation here, and a connection
+    * net_http_connection_done() never split has no domain or path.
     * The dispatch path in net_http_update() dereferences
     * request.domain and writes to response.data without guards; fail
     * the whole setup early here rather than stack up NULL derefs
@@ -1491,12 +1541,7 @@ struct http_t *net_http_new(struct http_connection_t *conn)
     * exist yet; it is allocated with the first header line. */
    if (   !state->response.data
        || !state->request.domain
-       || !state->request.path
-       || !state->request.method
-       || (conn->contenttype && !state->request.contenttype)
-       || (conn->useragent && !state->request.useragent)
-       || (conn->headers   && !state->request.headers)
-       || (conn->auth      && !state->request.auth))
+       || !state->request.path)
    {
       /* Note: no postdata OOM check here.  Ownership of postdata is
        * moved from conn (above), not copied, so the transfer cannot
@@ -1903,6 +1948,22 @@ static void net_http_send_reset(struct http_t *state)
    state->send_phase   = SEND_NONE;
 }
 
+/* Whether the caller's pre-formatted headers carry @name (with its
+ * colon), at the start of a line, in any case. */
+static bool net_http_has_header(const char *headers, const char *name)
+{
+   size_t len = strlen(name);
+   const char *line;
+   for (line = headers; line && *line; )
+   {
+      const char *next = strchr(line, '\n');
+      if (!strncasecmp(line, name, len))
+         return true;
+      line = next ? next + 1 : NULL;
+   }
+   return false;
+}
+
 static size_t net_http_put(char *dst, size_t at, const char *src)
 {
    size_t n = strlen(src);
@@ -1917,7 +1978,10 @@ static bool net_http_build_head(struct http_t *state)
 {
    struct request *request = &state->request;
    const char *method      = request->method ? request->method : "GET";
-   bool body_method        = request->method && request->method[0] == 'P';
+   /* Content-Length goes with a POST/PUT/PATCH, empty or not, and with
+    * any other method carrying a body, which is sent */
+   bool body_method        = (request->method && request->method[0] == 'P')
+      || ((request->postdata || request->source) && request->contentlength);
    size_t cap              = 192
       + STRLEN_CONST("Accept-Encoding: identity\r\n")
       + strlen(method) + strlen(request->path) + strlen(request->domain)
@@ -1968,11 +2032,17 @@ static bool net_http_build_head(struct http_t *state)
 #endif
    }
    /* The body reaches callers as sent: no content coding is decoded,
-    * so none is accepted. Without this header a server may pick any. */
-   n = net_http_put(h, n, "Accept-Encoding: identity\r\n");
-   n = net_http_put(h, n, "User-Agent: ");
-   n = net_http_put(h, n, request->useragent ? request->useragent : "libretro");
-   n = net_http_put(h, n, "\r\n\r\n");
+    * so none is accepted. Without this header a server may pick any.
+    * A caller sending its own takes on decoding what it accepts. */
+   if (!net_http_has_header(request->headers, "Accept-Encoding:"))
+      n = net_http_put(h, n, "Accept-Encoding: identity\r\n");
+   if (!net_http_has_header(request->headers, "User-Agent:"))
+   {
+      n = net_http_put(h, n, "User-Agent: ");
+      n = net_http_put(h, n, request->useragent ? request->useragent : "libretro");
+      n = net_http_put(h, n, "\r\n");
+   }
+   n = net_http_put(h, n, "\r\n");
 
    state->out_head     = h;
    state->out_head_len = n;
@@ -2206,7 +2276,18 @@ static bool net_http_list_has(const char *v, const char *tok, size_t toklen)
  * receive buffer is drained after every read. */
 static bool net_http_body_streams(const struct http_t *state)
 {
-   return state->sink || state->response.discard;
+   return state->sink || state->sink_spans || state->response.discard;
+}
+
+/* A streamed body stays in the receive buffer, where it was read (or
+ * de-chunked), until the window left behind it would fall below the
+ * floor: the sink then gets it in one piece of
+ * 32 KB or more instead of one piece per read, which over TLS or a
+ * slow link is a few hundred bytes to one record at a time.  Nothing
+ * is copied to hold it, and the buffer never grows for it. */
+static bool net_http_sink_due(const struct response *response)
+{
+   return response->buflen - response->pos < NET_HTTP_MIN_RECV_WINDOW;
 }
 
 static ssize_t net_http_receive_header(struct http_t *state, ssize_t len)
@@ -2289,6 +2370,7 @@ static ssize_t net_http_receive_header(struct http_t *state, ssize_t len)
                response->conn_close = true;
             if (   status >= 300 && status < 400
                 && response->location
+                && !state->no_redirect
                 && state->redirects < NET_HTTP_MAX_REDIRECTS)
                response->discard = true;
             if (status >= 100 && status < 200 && status != 101)
@@ -2485,8 +2567,9 @@ static ssize_t net_http_receive_header(struct http_t *state, ssize_t len)
 
    if (response->part >= P_BODY)
    {
-      len           = response->pos;
-      response->pos = 0;
+      len               = response->pos;
+      response->pos     = 0;
+      state->span_count = 0;
       /* With a sink the body never accumulates, so sizing the buffer
        * to Content-Length would allocate the very thing streaming
        * exists to avoid -- up to NET_HTTP_MAX_CONTENT_LENGTH of it,
@@ -2543,9 +2626,86 @@ static ssize_t net_http_receive_header(struct http_t *state, ssize_t len)
  *
  * A sink refusing the write (full disk, I/O error) aborts the
  * transfer the same way a transport failure would. */
+/* Spans are kept for a chunked body going to a spans sink */
+static bool net_http_spans_kept(const struct http_t *state)
+{
+   return      state->sink_spans
+          && !state->response.discard
+          &&  state->response.bodytype == T_CHUNK;
+}
+
+/* Records @len decoded bytes at offset @off of the receive buffer.
+ * They extend the last run when they follow it; a new run needs a
+ * free slot, which net_http_span_room() checked. */
+static bool net_http_span_add(struct http_t *state, size_t off, size_t len)
+{
+   unsigned n = state->span_count;
+   if (!len)
+      return true;
+   if (n && state->span_off[n - 1] + state->span_len[n - 1] == off)
+   {
+      state->span_len[n - 1] += len;
+      return true;
+   }
+   if (n >= NET_HTTP_SINK_SPANS_MAX)
+   {
+      state->err = true;
+      return false;
+   }
+   state->span_off[n] = off;
+   state->span_len[n] = len;
+   state->span_count  = n + 1;
+   return true;
+}
+
+/* Whether a chunk at offset @off may stay where it lies: a free slot
+ * for a new run, or a run it would extend */
+static bool net_http_span_room(const struct http_t *state, size_t off)
+{
+   unsigned n = state->span_count;
+   return n < NET_HTTP_SINK_SPANS_MAX
+       || state->span_off[n - 1] + state->span_len[n - 1] == off;
+}
+
 static bool net_http_sink_flush(struct http_t *state, size_t n)
 {
    struct response *response = (struct response*)&state->response;
+
+   if (state->sink_spans && !response->discard)
+   {
+      struct net_http_span spans[NET_HTTP_SINK_SPANS_MAX];
+      size_t   total = 0;
+      unsigned count = 0;
+      if (net_http_spans_kept(state))
+      {
+         /* The runs end where the decoded bytes end: @n */
+         for (; count < state->span_count; count++)
+         {
+            spans[count].data = response->data + state->span_off[count];
+            spans[count].len  = state->span_len[count];
+            total            += state->span_len[count];
+         }
+         state->span_count = 0;
+      }
+      else if (n)
+      {
+         spans[0].data = response->data;
+         spans[0].len  = n;
+         total         = n;
+         count         = 1;
+      }
+      if (!count)
+         return true;
+      if (!state->sink_spans(state->sink_data, spans, count))
+      {
+         net_http_log_transport_state(state, "sink_write_failed", -1);
+         state->err     = true;
+         response->part = P_DONE;
+         return false;
+      }
+      response->flushed += total;
+      return true;
+   }
 
    if (!n || response->discard)
       return true;
@@ -2569,7 +2729,34 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
    if (newlen < 0 || state->err)
    {
       if (response->bodytype != T_FULL)
+      {
+         /* A Content-Length or chunked body cut short by the peer: the
+          * decoded bytes still held below the 32 KB floor arrived
+          * whole, so they reach the sink before the transfer fails.
+          * Held back, they were lost, and a download resumed from
+          * the file's end asked again for what it had received. */
+         if (newlen < 0 && net_http_body_streams(state))
+         {
+            /* Decoded bytes are data[0..pos) for an identity body and
+             * in the middle of a chunk (P_BODY, where len is what the
+             * chunk still owes), and data[0..len) between chunks
+             * (P_BODY_CHUNKLEN, where pos also covers the raw tail) */
+            size_t held = (     response->bodytype == T_CHUNK
+                           &&   response->part     != P_BODY)
+               ? response->len : response->pos;
+            if (held)
+               net_http_sink_flush(state, held);
+         }
          return false;
+      }
+      /* What is still held of a streamed body goes to the sink first */
+      if (net_http_body_streams(state) && response->pos)
+      {
+         if (!net_http_sink_flush(state, response->pos))
+            return false;
+         response->pos = 0;
+         response->len = 0;
+      }
       response->part       = P_DONE;
       /* The close that ended the body ended the connection too. */
       response->conn_close = true;
@@ -2648,12 +2835,18 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
 
       if (response->part == P_BODY)
       {
-         /* Finish the chunk carried over from the previous call. */
+         /* Finish the chunk carried over from the previous call.  It
+          * was received behind the last run, which it extends. */
+         if (     net_http_spans_kept(state)
+               && !net_http_span_add(state, response->pos,
+                  (size_t)newlen < response->len
+                  ? (size_t)newlen : response->len))
+            return false;
          if ((size_t)newlen < response->len)
          {
             response->pos += newlen;
             response->len -= newlen;
-            if (net_http_body_streams(state))
+            if (net_http_body_streams(state) && net_http_sink_due(response))
             {
                if (!net_http_sink_flush(state, response->pos))
                   return false;
@@ -2759,18 +2952,38 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
          if (avail < chunklen)
          {
             /* Chunk straddles the end of the raw region.  Move what
-             * we have and remember the outstanding remainder. */
-            if (avail && out != end)
-               memmove(out, end, avail);
+             * we have and remember the outstanding remainder.  For a
+             * spans sink a long chunk stays where it lies; the rest of
+             * it is received right behind. */
+            if (     net_http_spans_kept(state)
+                  && chunklen >= NET_HTTP_SPAN_MIN
+                  && net_http_span_room(state,
+                     (size_t)(end - response->data)))
+            {
+               if (!net_http_span_add(state,
+                        (size_t)(end - response->data), avail))
+                  return false;
+               out = end;
+            }
+            else
+            {
+               if (avail && out != end)
+                  memmove(out, end, avail);
+               if (     net_http_spans_kept(state)
+                     && !net_http_span_add(state,
+                        (size_t)(out - response->data), avail))
+                  return false;
+            }
             out           += avail;
             response->pos  = (size_t)(out - response->data);
             response->len  = chunklen - avail;
             response->part = P_BODY;
-            if (net_http_body_streams(state))
+            if (net_http_body_streams(state) && net_http_sink_due(response))
             {
                /* In P_BODY, pos is the decoded count and len is what
                 * is still outstanding in this chunk, so the decoded
-                * prefix can go and the next receive appends at 0. */
+                * prefix can go and the next receive appends at 0.
+                * Until then the next receive appends behind it. */
                if (!net_http_sink_flush(state, response->pos))
                   return false;
                response->pos = 0;
@@ -2778,8 +2991,25 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
             goto check_grow;
          }
 
-         if (out != end)
-            memmove(out, end, chunklen);
+         if (     net_http_spans_kept(state)
+               && chunklen >= NET_HTTP_SPAN_MIN
+               && net_http_span_room(state, (size_t)(end - response->data)))
+         {
+            /* Left where it lies, for the spans sink */
+            if (!net_http_span_add(state,
+                     (size_t)(end - response->data), chunklen))
+               return false;
+            out = end;
+         }
+         else
+         {
+            if (out != end)
+               memmove(out, end, chunklen);
+            if (     net_http_spans_kept(state)
+                  && !net_http_span_add(state,
+                     (size_t)(out - response->data), chunklen))
+               return false;
+         }
          out += chunklen;
          in   = end + chunklen;
       }
@@ -2792,12 +3022,13 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
          memmove(out, in, leftover);
       response->pos  = response->len + leftover;
       response->part = P_BODY_CHUNKLEN;
-      if (net_http_body_streams(state))
+      if (net_http_body_streams(state) && net_http_sink_due(response))
       {
          /* Decoded bytes sit at data[0..len) with the unconsumed raw
           * tail behind them; hand off the former and slide the tail
           * to the front so the invariant (len == decoded offset of
-          * the current chunklen line) still holds at 0. */
+          * the current chunklen line) still holds at 0.  Until then
+          * they stay where they are, as for a body kept whole. */
          if (!net_http_sink_flush(state, response->len))
             return false;
          if (leftover)
@@ -2820,7 +3051,7 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
        * function, which sets P_DONE and shrinks the buffer. */
       response->pos += newlen;
       response->len  = response->pos;
-      if (net_http_body_streams(state))
+      if (net_http_body_streams(state) && net_http_sink_due(response))
       {
          if (!net_http_sink_flush(state, response->pos))
             return false;
@@ -2865,12 +3096,13 @@ static bool net_http_receive_body(struct http_t *state, ssize_t newlen)
          }
          return true;
       }
-      if (net_http_body_streams(state))
+      if (net_http_body_streams(state) && net_http_sink_due(response))
       {
          /* T_LEN's `len` is the outstanding count once streaming, so
           * decrement it by what we hand off; the "pos == len"
-          * completion test above keeps working unchanged.  The
-          * advertised total lives in content_len for progress. */
+          * completion test above keeps working unchanged, held bytes
+          * included.  The advertised total lives in content_len for
+          * progress. */
          if (!net_http_sink_flush(state, response->pos))
             return false;
          response->len -= response->pos;
@@ -2931,8 +3163,9 @@ static bool net_http_redirect(struct http_t *state, const char *location)
     *
     * @location aliases the header list, which is cleared further
     * down; it is only read before that, by the join. */
-   char *new_domain = NULL;
-   char *new_path   = NULL;
+   char *new_target = NULL;
+   const char *new_path;
+   size_t path_len;
    char *tmp;
    char *base;
    char *url;
@@ -3027,16 +3260,14 @@ static bool net_http_redirect(struct http_t *state, const char *location)
 
    /* request.path is kept without its leading slash; the request line
     * supplies it. */
-   new_domain = (char*)malloc(host_len + 1);
-   new_path   = strdup(*auth_end == '/' ? auth_end + 1 : auth_end);
-   if (!new_domain || !new_path)
-   {
-      free(new_domain);
-      free(new_path);
+   new_path = *auth_end == '/' ? auth_end + 1 : auth_end;
+   path_len = strlen(new_path);
+   /* domain and path in one block, as net_http_new() leaves them */
+   if (!(new_target = (char*)malloc(host_len + 1 + path_len + 1)))
       goto fail;
-   }
-   memcpy(new_domain, host, host_len);
-   new_domain[host_len] = '\0';
+   memcpy(new_target, host, host_len);
+   new_target[host_len] = '\0';
+   memcpy(new_target + host_len + 1, new_path, path_len + 1);
    free(base);
 
    /* Credentials go only where the caller sent them: another host or
@@ -3045,7 +3276,7 @@ static bool net_http_redirect(struct http_t *state, const char *location)
    if (state->request.headers || state->request.auth)
    {
       bool same_host = strlen(state->request.domain) == host_len
-            && !strncasecmp(new_domain, state->request.domain, host_len);
+            && !strncasecmp(new_target, state->request.domain, host_len);
       bool same_port = port == state->request.port
             || (!state->ssl && ssl
                   && state->request.port == 80 && port == 443);
@@ -3058,10 +3289,10 @@ static bool net_http_redirect(struct http_t *state, const char *location)
       }
    }
 
-   free(state->request.domain);
-   free(state->request.path);
-   state->request.domain = new_domain;
-   state->request.path   = new_path;
+   free(state->request.target);
+   state->request.target = new_target;
+   state->request.domain = new_target;
+   state->request.path   = new_target + host_len + 1;
    state->request.port   = port;
    state->ssl            = ssl;
    state->request_sent       = false;
@@ -3274,7 +3505,14 @@ bool net_http_wait(struct http_t *state, int timeout_ms)
       return true;
 
    if (state->conn->connected && state->request_sent)
+   {
       rd = true;
+#ifdef HAVE_RETROSSL
+      if (state->ssl && state->conn->ssl_ctx
+            && ssl_socket_retro_pending(state->conn->ssl_ctx, &wr))
+         return true;
+#endif
+   }
    else
       wr = true;
 
@@ -3560,16 +3798,9 @@ bool net_http_update_budget(struct http_t *state,
          if (response->part == P_DONE || state->err)
             break;
 
-         /* _len == 0 is EAGAIN: the socket is drained for now.
-          * _len < 0 past the header stage is a close, which the body
-          * parser above has already turned into P_DONE for T_FULL and
-          * into an error otherwise; either way we are finished here.
-          *
-          * This is the one exit that leaves nothing buffered anywhere,
-          * including inside the TLS layer: the SSL read reports EAGAIN
-          * only once it has handed over every decrypted byte it holds.
-          * Breaking on the budget below leaves bytes waiting, so only
-          * this exit marks the transfer as blocked. */
+         /* Zero yields: net_http_wait checks TLS-local work as well as
+          * socket readiness. A negative result ends a close-delimited
+          * body, or fails any other unfinished body above. */
          if (_len <= 0)
          {
             state->blocked = (_len == 0);
@@ -3612,7 +3843,8 @@ bool net_http_update_budget(struct http_t *state,
    state->conn = NULL;
 
    if (   response->status >= 300 && response->status < 400
-       && response->location)
+       && response->location
+       && !state->no_redirect)
    {
       if (state->redirects >= NET_HTTP_MAX_REDIRECTS)
       {
@@ -3834,7 +4066,7 @@ uint8_t* net_http_data(struct http_t *state, size_t* len, bool accept_err)
    }
 
    /* Nothing was retained: the body went to the sink as it arrived. */
-   if (state->sink)
+   if (state->sink || state->sink_spans)
    {
       if (len)
          *len = 0;
@@ -3873,10 +4105,7 @@ void net_http_delete(struct http_t *state)
       free(state->response.data);
    if (state->response.owns_headers)
       free(state->response.hdr);
-   if (state->request.domain)
-      free(state->request.domain);
-   if (state->request.path)
-      free(state->request.path);
+   free(state->request.target);
    if (state->request.method)
       free(state->request.method);
    if (state->request.contenttype)

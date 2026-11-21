@@ -45,6 +45,86 @@ static void output(rflv_mux_t *m, FILE *f)
    }
 }
 
+static rflv_mux_t *hevc_annexb_mux(const rflv_config_t *c)
+{
+   rflv_config_t config = *c;
+   const unsigned char *hvcc = (const unsigned char*)c->avcc;
+   unsigned char *sets;
+   size_t at = 23, used = 0, size;
+   unsigned arrays, count, type;
+   rflv_mux_t *mux;
+   assert(c->avcc_size >= 23);
+   sets = (unsigned char*)malloc(c->avcc_size + 16);
+   assert(sets);
+   for (arrays = hvcc[22]; arrays; arrays--)
+   {
+      assert(c->avcc_size - at >= 3);
+      type = hvcc[at++] & 63;
+      count = read_be(hvcc + at, 2);
+      at += 2;
+      while (count--)
+      {
+         assert(c->avcc_size - at >= 2);
+         size = read_be(hvcc + at, 2);
+         at += 2;
+         assert(size && size <= c->avcc_size - at);
+         if (type >= 32 && type <= 34)
+         {
+            assert(used + size + 4 <= c->avcc_size + 16);
+            memcpy(sets + used, "\0\0\0\1", 4);
+            memcpy(sets + used + 4, hvcc + at, size);
+            used += size + 4;
+         }
+         at += size;
+      }
+   }
+   assert(at == c->avcc_size);
+   config.avcc = sets;
+   config.avcc_size = used;
+   mux = rflv_mux_new_hevc_annexb(&config);
+   free(sets);
+   return mux;
+}
+
+static rflv_mux_t *annexb_mux(const rflv_config_t *c)
+{
+   rflv_config_t config = *c;
+   const unsigned char *avcc = (const unsigned char*)c->avcc;
+   unsigned char *sets;
+   size_t sps, pps, at;
+   rflv_mux_t *mux;
+   assert(c->avcc_size >= 7 && (avcc[5] & 31) == 1);
+   sps = read_be(avcc + 6, 2);
+   at = 8 + sps;
+   assert(at + 3 <= c->avcc_size && avcc[at] == 1);
+   pps = read_be(avcc + at + 1, 2);
+   assert(pps && pps <= c->avcc_size - at - 3);
+   sets = (unsigned char*)malloc(sps + pps + 8);
+   assert(sets);
+   memcpy(sets, "\0\0\0\1", 4);
+   memcpy(sets + 4, avcc + 8, sps);
+   memcpy(sets + sps + 4, "\0\0\0\1", 4);
+   memcpy(sets + sps + 8, avcc + at + 3, pps);
+   config.avcc = sets;
+   config.avcc_size = sps + pps + 8;
+   mux = rflv_mux_new_annexb(&config);
+   free(sets);
+   return mux;
+}
+
+static void annexb_packet(unsigned char *data, size_t size)
+{
+   size_t at = 0, length;
+   while (at < size)
+   {
+      assert(size - at >= 4);
+      length = read_be(data + at, 4);
+      assert(length && length <= size - at - 4);
+      memcpy(data + at, "\0\0\0\1", 4);
+      at += length + 4;
+   }
+}
+
 int main(int argc, char **argv)
 {
    rflv_config_t c;
@@ -53,10 +133,15 @@ int main(int argc, char **argv)
    unsigned char *data, *p;
    size_t size, pos, length;
    long bytes;
-   unsigned pass, type, timestamp, prefix;
+   unsigned pass, type, timestamp, prefix, packet_type;
    int result, composition;
    int64_t pts;
-   assert(argc == 3);
+   bool annexb = argc == 4 && (!strcmp(argv[3], "annexb") || !strcmp(argv[3], "annexb-color"));
+   bool native_av1 = argc == 4 && (!strcmp(argv[3], "obu") || !strcmp(argv[3], "obu-color"));
+   bool metadata = argc == 4 && (!strcmp(argv[3], "color") || !strcmp(argv[3], "annexb-color")
+         || !strcmp(argv[3], "obu-color"));
+   bool hevc = false, av1 = false, keyframe;
+   assert(argc == 3 || (argc == 4 && (annexb || native_av1 || metadata)));
    f = fopen(argv[1], "rb");
    assert(f && !fseek(f, 0, SEEK_END));
    bytes = ftell(f);
@@ -66,7 +151,7 @@ int main(int argc, char **argv)
    assert(data && fread(data, 1, size, f) == size && !fclose(f));
    assert(!memcmp(data, "FLV\1", 4) && read_be(data + 5, 4) == 9);
    memset(&c, 0, sizeof(c));
-   c.max_packet_size = 0xfffffa;
+   c.max_packet_size = 0xfffff7;
    m = NULL;
    f = NULL;
    for (pass = 0; pass < 2; pass++)
@@ -83,13 +168,29 @@ int main(int argc, char **argv)
             continue;
          prefix = type == 9 ? 5 : 2;
          assert(length >= prefix);
-         assert(type == 9 ? (p[11] & 15) == 7 : (p[11] >> 4) == 10);
-         if (type == 9 && p[12] == 2)
+         if (type == 9)
+         {
+            hevc = (p[11] & 0x80) && !memcmp(p + 12, "hvc1", 4);
+            av1 = (p[11] & 0x80) && !memcmp(p + 12, "av01", 4);
+            assert(hevc || av1 || (p[11] & 15) == 7);
+            packet_type = hevc || av1 ? p[11] & 15 : p[12];
+            if (hevc && packet_type == 1)
+               prefix = 8;
+         }
+         else
+         {
+            assert((p[11] >> 4) == 10);
+            packet_type = p[12];
+         }
+         if (type == 9 && packet_type == 2)
+            continue;
+         /* FFmpeg can emit an AV1 sequence marker before configuration. */
+         if (type == 9 && av1 && packet_type == 0 && length == prefix)
             continue;
          assert(length > prefix);
          if (!pass)
          {
-            if (p[12] != 0)
+            if (packet_type != 0)
                continue;
             if (type == 9)
             {
@@ -105,17 +206,26 @@ int main(int argc, char **argv)
             }
             continue;
          }
-         if (p[12] != 1)
+         if (packet_type != 1 && !(type == 9 && hevc && packet_type == 3))
             continue;
          timestamp = read_be(p + 4, 3) | ((unsigned)p[7] << 24);
-         composition = type == 9 ? (int)read_be(p + 13, 3) : 0;
+         composition = type == 9 && !av1 && (!hevc || packet_type == 1)
+            ? (int)read_be(p + (hevc ? 16 : 13), 3) : 0;
          if (composition & 0x800000)
             composition -= 0x1000000;
          pts = (int64_t)timestamp + composition;
          assert(pts >= 0);
-         result = rflv_mux_push(m, type == 9 ? 1 : 2,
+         keyframe = type == 9 && ((p[11] >> 4) & 7) == 1;
+         if (annexb && type == 9)
+         {
+            annexb_packet(p + 11 + prefix, length - prefix);
+            result = rflv_mux_push_annexb(m, p + 11 + prefix, length - prefix,
+                  timestamp, (uint64_t)pts, keyframe);
+         }
+         else
+            result = rflv_mux_push(m, type == 9 ? 1 : 2,
                p + 11 + prefix, length - prefix, timestamp, (uint64_t)pts,
-               type == 9 && (p[11] >> 4) == 1);
+               keyframe);
          assert(result == RFLV_PROGRESS);
          do
             result = rflv_mux_step(m);
@@ -126,7 +236,30 @@ int main(int argc, char **argv)
       assert(pos == size);
       if (!pass)
       {
-         m = rflv_mux_new(&c);
+         if (native_av1)
+         {
+            assert(av1 && c.avcc_size > 4);
+            c.avcc = (const unsigned char*)c.avcc + 4;
+            c.avcc_size -= 4;
+         }
+         m = annexb ? (hevc ? hevc_annexb_mux(&c) : annexb_mux(&c))
+            : av1 ? native_av1 ? rflv_mux_new_av1_obu(&c) : rflv_mux_new_av1(&c)
+            : hevc ? rflv_mux_new_hevc(&c) : rflv_mux_new(&c);
+         if (metadata)
+         {
+            static const uint16_t xy[] = {34000,16000,13250,34500,7500,3000,15635,16450};
+            video_color_metadata_t described;
+            memset(&described, 0, sizeof(described));
+            described.primaries = described.matrix = 9;
+            described.transfer = 16;
+            described.range = 1;
+            described.max_cll = 1000; described.max_fall = 400;
+            described.mastering.present = VIDEO_MASTERING_DISPLAY_COMPLETE;
+            described.mastering.luminance_max = 10000000;
+            described.mastering.luminance_min = 50;
+            memcpy(described.mastering.chromaticity, xy, sizeof(xy));
+            assert((hevc || av1) && rflv_mux_set_color(m, &described, 10));
+         }
          f = fopen(argv[2], "wb");
          assert(m && f);
          output(m, f);

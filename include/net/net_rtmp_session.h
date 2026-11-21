@@ -31,28 +31,52 @@ enum net_rtmp_session_state
    NET_RTMP_SESSION_FAILED = -1,
    NET_RTMP_SESSION_HANDSHAKE,
    NET_RTMP_SESSION_NEGOTIATING,
-   NET_RTMP_SESSION_READY
+   NET_RTMP_SESSION_READY,
+   NET_RTMP_SESSION_DRAINING,
+   NET_RTMP_SESSION_FINISHED
 };
 RETRO_BEGIN_DECLS
 /* One worker; cold allocation. Copies configuration and handshake random.
  * No socket ownership, internal clock or I/O. */
 net_rtmp_session_t *net_rtmp_session_new(const net_rtmp_publish_config_t *config,
       const uint8_t random[1528], uint32_t time, size_t max_reply, unsigned streams);
+/* Same ownership; caps is read only during construction and not retained. */
+net_rtmp_session_t *net_rtmp_session_new_caps(const net_rtmp_publish_config_t *config,
+      const uint8_t random[1528], uint32_t time, size_t max_reply, unsigned streams,
+      const net_rtmp_codec_caps_t *caps);
 /* One handshake/receive segment. Zero consumption requires step/output work. */
 bool net_rtmp_session_feed(net_rtmp_session_t *session,
       const void *data, size_t size, size_t *consumed, uint32_t receive_time);
 /* One output retirement, command dispatch or reply-parser step. True means
  * local progress; false requires transport activity or reports FAILED. */
 bool net_rtmp_session_step(net_rtmp_session_t *session);
-/* Borrow one output span. Partial consumption keeps its remaining bytes live. */
+/* Borrow one output span, capped to peer credit. Partial consumption keeps
+ * the grant live, even if a later peer message reduces its window. */
 bool net_rtmp_session_get(net_rtmp_session_t *session, net_rtmp_span_t *span);
 bool net_rtmp_session_consume(net_rtmp_session_t *session, size_t size);
+/* READY and no media borrow: announce a new outgoing chunk size. Media
+ * admission stays busy until the announcement has left the transport. */
+bool net_rtmp_session_chunk_size(net_rtmp_session_t *session, unsigned size);
+/* READY only: one audio(8), video(9) or AMF0 data(18) message, up to three
+ * borrowed spans. False takes nothing. Payload includes its FLV codec header,
+ * without an FLV tag header/trailer. Timestamp is milliseconds, modulo 2^32.
+ * The producer keeps bytes immutable until media_release succeeds. */
+bool net_rtmp_session_media(net_rtmp_session_t *session, unsigned type,
+      uint32_t timestamp, const net_rtmp_span_t *spans, size_t count);
+/* Retires a fully sent message, or a canceled message after transport discard.
+ * True returns the producer's borrow. No allocation or wait. */
+bool net_rtmp_session_media_release(net_rtmp_session_t *session);
+/* After returning media/transport borrows. Stops admission and sends
+ * deleteStream after pending commands. Idempotent; FINISHED means all
+ * session bytes were consumed, not that TLS or the socket has drained.
+ * The transport owner must flush before closing. No wait or allocation. */
+bool net_rtmp_session_finish(net_rtmp_session_t *session);
 enum net_rtmp_session_state net_rtmp_session_status(
       const net_rtmp_session_t *session, uint32_t *stream, uint64_t *sent);
 void net_rtmp_session_cancel(net_rtmp_session_t *session);
 /* After cancellation, retire a transport borrow without reporting it sent. */
 bool net_rtmp_session_discard(net_rtmp_session_t *session);
-/* Refuses a live transport borrow. Releases internal borrows before freeing. */
+/* Refuses live transport/media borrows. Releases internal borrows before freeing. */
 bool net_rtmp_session_free(net_rtmp_session_t *session);
 RETRO_END_DECLS
 #endif

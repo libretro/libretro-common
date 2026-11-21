@@ -20,11 +20,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/* XXH64 and XXH3 (64-bit) against xxHash's own values: the ones its
+/* XXH32, XXH64 and XXH3 (64-bit) against xxHash's own values: the ones its
  * sanity check holds, over the buffer it fills, and more made with
  * xxHash 0.8.1 over the same buffer, longer, for the lengths around
- * each of XXH3's turns and for many blocks. XXH64 is taken in one call
- * and in pieces of every size; XXH3's long inputs go through each path
+ * each of XXH3's turns and for many blocks. XXH32 and XXH64 are taken in
+ * one call and in pieces of every size; XXH3's long inputs go through each path
  * this CPU can run, which must all agree with each other at every
  * length up to three blocks and at every alignment. XXH3 taken in
  * pieces must be what it is in one call, through each path, for the
@@ -35,6 +35,7 @@
 #include <string.h>
 #include <stdint.h>
 
+#include <encodings/xxh32.h>
 #include <encodings/xxh64.h>
 
 /* the paths themselves, which xxh3_64() chooses between */
@@ -50,6 +51,70 @@ typedef struct
    uint64_t seed;
    uint64_t hash;
 } vec_t;
+
+typedef struct
+{
+   uint32_t len;
+   uint32_t seed;
+   uint32_t hash;
+} vec32_t;
+
+/* XSUM_XXH32_testdata, then more */
+static const vec32_t xxh32_spec[] = {
+   {      0,          0, 0x02CC5D05U },
+   {      0,    PRIME32, 0x36B78AE7U },
+   {      1,          0, 0xCF65B03EU },
+   {      1,    PRIME32, 0xB4545AA4U },
+   {     14,          0, 0x1208E7E2U },
+   {     14,    PRIME32, 0x6AF1D1FEU },
+   {    222,          0, 0x5BD11DBDU },
+   {    222,    PRIME32, 0x58803C5FU },
+   {      3, 0x00000000U, 0xC23884F5U },
+   {      3, 0x9E3779B1U, 0x1A269947U },
+   {      3, 0x01234567U, 0x1D69BDC8U },
+   {      4, 0x00000000U, 0xA9DE7CE9U },
+   {      4, 0x9E3779B1U, 0x2BAAFE83U },
+   {      4, 0x01234567U, 0xFD8A2B1EU },
+   {     15, 0x00000000U, 0x6B859E14U },
+   {     15, 0x9E3779B1U, 0xAD53090DU },
+   {     15, 0x01234567U, 0x6310FE36U },
+   {     16, 0x00000000U, 0x93BA3759U },
+   {     16, 0x9E3779B1U, 0xA94FC1E1U },
+   {     16, 0x01234567U, 0x77126E47U },
+   {     17, 0x00000000U, 0x89FDC23EU },
+   {     17, 0x9E3779B1U, 0xC9910739U },
+   {     17, 0x01234567U, 0x8CE2AF80U },
+   {     31, 0x00000000U, 0x5F40E562U },
+   {     31, 0x9E3779B1U, 0x5C0C3350U },
+   {     31, 0x01234567U, 0x872FD58CU },
+   {     32, 0x00000000U, 0xD89829ECU },
+   {     32, 0x9E3779B1U, 0xA5C44467U },
+   {     32, 0x01234567U, 0x903C4460U },
+   {     33, 0x00000000U, 0x31A427E5U },
+   {     33, 0x9E3779B1U, 0x0DE5B1F9U },
+   {     33, 0x01234567U, 0xDE84B464U },
+   {     63, 0x00000000U, 0xF1D48FDBU },
+   {     63, 0x9E3779B1U, 0x956B3D77U },
+   {     63, 0x01234567U, 0xD2C408BCU },
+   {     64, 0x00000000U, 0x02E95DBBU },
+   {     64, 0x9E3779B1U, 0xCF82F830U },
+   {     64, 0x01234567U, 0x8AD71BFBU },
+   {     65, 0x00000000U, 0x16992B3DU },
+   {     65, 0x9E3779B1U, 0x428EEC5FU },
+   {     65, 0x01234567U, 0x6F4DEBDAU },
+   {    100, 0x00000000U, 0x96AD8143U },
+   {    100, 0x9E3779B1U, 0x83D48124U },
+   {    100, 0x01234567U, 0xDF1138F2U },
+   {   1000, 0x00000000U, 0x2052D698U },
+   {   1000, 0x9E3779B1U, 0xD38B6679U },
+   {   1000, 0x01234567U, 0xF608BBCBU },
+   {   4097, 0x00000000U, 0x4115D4E2U },
+   {   4097, 0x9E3779B1U, 0xD0552AEDU },
+   {   4097, 0x01234567U, 0x2D53CE1CU },
+   { 100000, 0x00000000U, 0x7DA1E9AEU },
+   { 100000, 0x9E3779B1U, 0xFAAE15DAU },
+   { 100000, 0x01234567U, 0x0D3876E7U },
+};
 
 /* XSUM_XXH64_testdata */
 static const vec_t xxh64_spec[] = {
@@ -228,9 +293,12 @@ int main(void)
       g     *= PRIME64;
    }
 
+   /* NEON builds no scalar path */
+#if !defined(XXH3_HAVE_NEON)
    paths[np].name = "scalar";
    paths[np].id   = 1;
    paths[np++].fn = xxh3_long_scalar;
+#endif
 #if defined(XXH3_HAVE_SSE2)
    {
       uint64_t simd = cpu_features_get();
@@ -263,6 +331,28 @@ int main(void)
    paths[np++].fn = xxh3_long_neon;
 #endif
 
+   /* XXH32: whole, and in pieces */
+   for (i = 0; i < sizeof(xxh32_spec) / sizeof(xxh32_spec[0]); i++)
+   {
+      const vec32_t *v = &xxh32_spec[i];
+      uint32_t       h = xxh32(buf, v->len, v->seed);
+      xxh32_state_t  s;
+      size_t         at;
+      checks++;
+      if (h != v->hash)
+         fail("xxh32", v->len, v->seed, h, v->hash);
+      for (n = 1; n <= 37; n += 2)
+      {
+         xxh32_reset(&s, v->seed);
+         xxh32_update(&s, buf, 0);
+         for (at = 0; at < v->len; at += n)
+            xxh32_update(&s, buf + at, at + n > v->len ? v->len - at : n);
+         checks++;
+         if ((h = xxh32_digest(&s)) != v->hash)
+            fail("xxh32 in pieces", v->len, v->seed, h, v->hash);
+      }
+   }
+
    /* XXH64: whole, and in pieces */
    for (i = 0; i < sizeof(xxh64_spec) / sizeof(xxh64_spec[0]); i++)
    {
@@ -284,6 +374,36 @@ int main(void)
       }
    }
 
+   /* XXH3 at every length to 128 the compiler knows, which xxh3.h
+    * hashes in place, and just past it, against the function */
+#define XXH3_KNOWN(n) do { \
+   checks += 2; \
+   if (xxh3_64(buf + 3, n, 0) != (xxh3_64)(buf + 3, n, 0)) \
+      fail("xxh3_64 known length", n, 0, xxh3_64(buf + 3, n, 0), \
+            (xxh3_64)(buf + 3, n, 0)); \
+   if (xxh3_64(buf + 3, n, PRIME64) != (xxh3_64)(buf + 3, n, PRIME64)) \
+      fail("xxh3_64 known length", n, PRIME64, \
+            xxh3_64(buf + 3, n, PRIME64), (xxh3_64)(buf + 3, n, PRIME64)); \
+} while (0)
+   XXH3_KNOWN(0); XXH3_KNOWN(1); XXH3_KNOWN(2); XXH3_KNOWN(3); XXH3_KNOWN(4); XXH3_KNOWN(5); XXH3_KNOWN(6); XXH3_KNOWN(7);
+   XXH3_KNOWN(8); XXH3_KNOWN(9); XXH3_KNOWN(10); XXH3_KNOWN(11); XXH3_KNOWN(12); XXH3_KNOWN(13); XXH3_KNOWN(14); XXH3_KNOWN(15);
+   XXH3_KNOWN(16); XXH3_KNOWN(17); XXH3_KNOWN(18); XXH3_KNOWN(19); XXH3_KNOWN(20); XXH3_KNOWN(21); XXH3_KNOWN(22); XXH3_KNOWN(23);
+   XXH3_KNOWN(24); XXH3_KNOWN(25); XXH3_KNOWN(26); XXH3_KNOWN(27); XXH3_KNOWN(28); XXH3_KNOWN(29); XXH3_KNOWN(30); XXH3_KNOWN(31);
+   XXH3_KNOWN(32); XXH3_KNOWN(33); XXH3_KNOWN(34); XXH3_KNOWN(35); XXH3_KNOWN(36); XXH3_KNOWN(37); XXH3_KNOWN(38); XXH3_KNOWN(39);
+   XXH3_KNOWN(40); XXH3_KNOWN(41); XXH3_KNOWN(42); XXH3_KNOWN(43); XXH3_KNOWN(44); XXH3_KNOWN(45); XXH3_KNOWN(46); XXH3_KNOWN(47);
+   XXH3_KNOWN(48); XXH3_KNOWN(49); XXH3_KNOWN(50); XXH3_KNOWN(51); XXH3_KNOWN(52); XXH3_KNOWN(53); XXH3_KNOWN(54); XXH3_KNOWN(55);
+   XXH3_KNOWN(56); XXH3_KNOWN(57); XXH3_KNOWN(58); XXH3_KNOWN(59); XXH3_KNOWN(60); XXH3_KNOWN(61); XXH3_KNOWN(62); XXH3_KNOWN(63);
+   XXH3_KNOWN(64); XXH3_KNOWN(65); XXH3_KNOWN(66); XXH3_KNOWN(67); XXH3_KNOWN(68); XXH3_KNOWN(69); XXH3_KNOWN(70); XXH3_KNOWN(71);
+   XXH3_KNOWN(72); XXH3_KNOWN(73); XXH3_KNOWN(74); XXH3_KNOWN(75); XXH3_KNOWN(76); XXH3_KNOWN(77); XXH3_KNOWN(78); XXH3_KNOWN(79);
+   XXH3_KNOWN(80); XXH3_KNOWN(81); XXH3_KNOWN(82); XXH3_KNOWN(83); XXH3_KNOWN(84); XXH3_KNOWN(85); XXH3_KNOWN(86); XXH3_KNOWN(87);
+   XXH3_KNOWN(88); XXH3_KNOWN(89); XXH3_KNOWN(90); XXH3_KNOWN(91); XXH3_KNOWN(92); XXH3_KNOWN(93); XXH3_KNOWN(94); XXH3_KNOWN(95);
+   XXH3_KNOWN(96); XXH3_KNOWN(97); XXH3_KNOWN(98); XXH3_KNOWN(99); XXH3_KNOWN(100); XXH3_KNOWN(101); XXH3_KNOWN(102); XXH3_KNOWN(103);
+   XXH3_KNOWN(104); XXH3_KNOWN(105); XXH3_KNOWN(106); XXH3_KNOWN(107); XXH3_KNOWN(108); XXH3_KNOWN(109); XXH3_KNOWN(110); XXH3_KNOWN(111);
+   XXH3_KNOWN(112); XXH3_KNOWN(113); XXH3_KNOWN(114); XXH3_KNOWN(115); XXH3_KNOWN(116); XXH3_KNOWN(117); XXH3_KNOWN(118); XXH3_KNOWN(119);
+   XXH3_KNOWN(120); XXH3_KNOWN(121); XXH3_KNOWN(122); XXH3_KNOWN(123); XXH3_KNOWN(124); XXH3_KNOWN(125); XXH3_KNOWN(126); XXH3_KNOWN(127);
+   XXH3_KNOWN(128); XXH3_KNOWN(129); XXH3_KNOWN(130); XXH3_KNOWN(240);
+#undef XXH3_KNOWN
+
    /* XXH3: the chosen path, then each */
    for (i = 0; i < sizeof(xxh3_spec) / sizeof(xxh3_spec[0]); i++)
    {
@@ -303,12 +423,12 @@ int main(void)
    }
 
    /* every length to three blocks, at every alignment, every path as
-    * the scalar one */
+    * the first */
    for (n = 241; n <= 3 * 1024 + 64; n++)
    {
       unsigned off  = (unsigned)(n & 7);
       uint64_t seed = (n & 1) ? 0 : (uint64_t)n * PRIME64;
-      uint64_t want = xxh3_long_scalar(buf + off, n, seed);
+      uint64_t want = paths[0].fn(buf + off, n, seed);
       for (p = 1; p < np; p++)
       {
          uint64_t h = paths[p].fn(buf + off, n, seed);
@@ -370,6 +490,34 @@ int main(void)
          checks++;
          if (h != want)
             fail("xxh3 split anywhere", (unsigned)n, seed, h, want);
+      }      /* xxh3_64_pair: two spans hashed as the one they make, split
+       * on a stripe (the direct path) and anywhere (the incremental
+       * one), over the lengths either side of 240 and of a block */
+      {
+         static const size_t lens[] = { 0, 1, 16, 17, 128, 129, 240, 241,
+            300, 1024, 1087, 1088, 2048, 3000, 4100 };
+         for (i = 0; i < sizeof(lens) / sizeof(lens[0]); i++)
+         {
+            size_t   len = lens[i], cut;
+            uint64_t seed = (i & 1) ? (uint64_t)len * PRIME64 : 0;
+            uint64_t want = xxh3_64(buf + 3, len, seed);
+            for (cut = 0; cut <= len; cut += (len < 300 ? 1 : 61))
+            {
+               uint64_t h = xxh3_64_pair(cut ? buf + 3 : NULL, cut,
+                     len - cut ? buf + 3 + cut : NULL, len - cut, seed);
+               checks++;
+               if (h != want)
+                  fail("xxh3_64_pair", (unsigned)cut, seed, h, want);
+            }
+            for (cut = 0; cut <= len; cut += 64)
+            {
+               uint64_t h = xxh3_64_pair(cut ? buf + 3 : NULL, cut,
+                     len - cut ? buf + 3 + cut : NULL, len - cut, seed);
+               checks++;
+               if (h != want)
+                  fail("xxh3_64_pair on a stripe", (unsigned)cut, seed, h, want);
+            }
+         }
       }
    }
 

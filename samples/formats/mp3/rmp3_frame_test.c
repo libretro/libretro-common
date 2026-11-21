@@ -1,11 +1,12 @@
 /* rmp3's one-frame-at-a-time API against its pull API.
  *
- * rmp3dec_decode_s16 is the frame decoder the pull API runs, handed
- * the caller's buffer. Walked over a file frame by frame it must give
- * the samples rmp3_read_s16 gives, to the bit, and account for every
- * byte; junk ahead of a frame is skipped and counted in frame_bytes, a
- * buffer with no whole frame gives frame_bytes 0, and rmp3dec_init
- * forgets the bit reservoir. Streams from ffmpeg (libmp3lame): MPEG-1
+ * rmp3dec_decode_s16/_f32 are the frame decoder the pull API runs,
+ * handed the caller's buffer. Walked over a file frame by frame they
+ * must give the samples rmp3_read_s16/_f32 give, to the bit, and
+ * account for every byte, also when only part of the next frame
+ * follows; junk ahead of a frame is skipped and counted in
+ * frame_bytes, a buffer with no whole frame gives frame_bytes 0, and
+ * rmp3dec_init forgets the bit reservoir. Streams from ffmpeg (libmp3lame): MPEG-1
  * stereo and mono at several rates, MPEG-2 at 22 kHz.
  *
  * Needs ffmpeg with libmp3lame in PATH; a missing tool is a failure. */
@@ -133,6 +134,38 @@ static void frame_case(const char *name, const char *args, unsigned want_ch)
    snprintf(label, sizeof(label), "%s: every byte accounted for", name);
    check(label, pos == len);
 
+   /* a frame handed over with just the first two bytes of the next
+    * behind it, as a caller framing the stream itself has it, decodes
+    * the same */
+   {
+      size_t   at    = 0, t = 0;
+      int      ok    = 1;
+      rmp3dec *probe = (rmp3dec*)malloc(sizeof(*probe));
+      rmp3dec_init(dec);
+      while (ok && at < len)
+      {
+         rmp3dec_frame_info info;
+         size_t win;
+         /* this frame's length, from a decoder handed the rest */
+         rmp3dec_init(probe);
+         rmp3dec_decode_s16(probe, buf + at, (int)(len - at), pcm, &info);
+         win = (size_t)info.frame_bytes + 2;
+         if (win > len - at)
+            win = len - at;
+         int    n   = rmp3dec_decode_s16(dec, buf + at, (int)win, pcm, &info);
+         if (info.frame_bytes <= 0)
+            break;
+         at += (size_t)info.frame_bytes;
+         if (t + (size_t)n * info.channels > ref_n
+               || memcmp(pcm, ref + t, (size_t)n * info.channels * sizeof(int16_t)))
+            ok = 0;
+         t += (size_t)n * info.channels;
+      }
+      free(probe);
+      snprintf(label, sizeof(label), "%s: a frame and part of the next", name);
+      check(label, ok && at == len && t == ref_n);
+   }
+
    /* junk ahead of the first frame is skipped and counted */
    {
       uint8_t *junk = (uint8_t*)malloc(len + 100);
@@ -167,6 +200,44 @@ static void frame_case(const char *name, const char *args, unsigned want_ch)
       snprintf(label, sizeof(label), "%s: init starts the stream afresh", name);
       check(label, n > 0
             && !memcmp(pcm, ref, (size_t)n * info.channels * sizeof(int16_t)));
+   }
+
+   /* the float pipeline, frame by frame against rmp3_read_f32 */
+   {
+      float *fref = (float*)malloc(44100 * 4 * 2 * sizeof(float));
+      float *fgot = (float*)malloc(44100 * 4 * 2 * sizeof(float));
+      float  fpcm[RMP3_MAX_SAMPLES_PER_FRAME];
+      size_t fref_n = 0, ftotal = 0;
+      memset(pull, 0, sizeof(*pull));
+      if (fref && fgot && rmp3_init_memory(pull, buf, len))
+      {
+         fref_n = (size_t)rmp3_read_f32(pull, 44100 * 4, fref) * pull->channels;
+         rmp3_uninit(pull);
+      }
+      rmp3dec_init(dec);
+      pos  = 0;
+      same = fref && fgot;
+      while (same && pos < len)
+      {
+         rmp3dec_frame_info info;
+         int n = rmp3dec_decode_f32(dec, buf + pos, (int)(len - pos), fpcm, &info);
+         if (info.frame_bytes <= 0)
+            break;
+         pos += (size_t)info.frame_bytes;
+         if (ftotal + (size_t)n * info.channels > (size_t)44100 * 4 * 2)
+            break;
+         memcpy(fgot + ftotal, fpcm, (size_t)n * info.channels * sizeof(float));
+         ftotal += (size_t)n * info.channels;
+      }
+      if (ftotal != fref_n || !ftotal)
+         same = 0;
+      for (k = 0; same && k < ftotal; k++)
+         if (memcmp(&fgot[k], &fref[k], sizeof(float)))
+            same = 0;
+      snprintf(label, sizeof(label), "%s: f32 frame by frame is rmp3_read_f32's", name);
+      check(label, same && pos == len);
+      free(fref);
+      free(fgot);
    }
 
    free(buf);

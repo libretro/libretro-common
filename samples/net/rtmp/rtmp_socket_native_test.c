@@ -21,6 +21,14 @@
  */
 #include <net/net_rtmp_socket.h>
 #include <net/net_socket.h>
+#ifdef HAVE_SSL
+#include <net/net_socket_ssl.h>
+#include <streams/file_stream.h>
+#endif
+#include <net/net_resolve.h>
+#include <formats/rflv_mux.h>
+#include <rthreads/rthreads.h>
+#include <retro_timers.h>
 #include <features/features_cpu.h>
 #include <assert.h>
 #include <stdio.h>
@@ -29,25 +37,331 @@
 
 static uint8_t random_bytes[1528];
 
+static size_t read_tag(FILE *file, uint8_t *header, uint8_t *payload)
+{
+   uint8_t previous[4];
+   uint32_t last_size;
+   size_t size = fread(header, 1, 11, file);
+   if (!size)
+      return 0;
+   assert(size == 11);
+   size = ((size_t)header[1] << 16) | ((size_t)header[2] << 8) | header[3];
+   assert(size && size <= 1048576 && !header[8] && !header[9] && !header[10]);
+   assert(fread(payload, 1, size, file) == size);
+   assert(fread(previous, 1, 4, file) == 4);
+   last_size = ((uint32_t)previous[0] << 24) | ((uint32_t)previous[1] << 16)
+      | ((uint32_t)previous[2] << 8) | previous[3];
+   assert(last_size == size + 11);
+   return size;
+}
+
+static void send_spans(net_rtmp_session_t *session, net_rtmp_socket_t *transport,
+      int fd, unsigned type, uint32_t timestamp, const net_rtmp_span_t *spans,
+      size_t count, retro_time_t deadline)
+{
+   while (!net_rtmp_session_media(session, type, timestamp, spans, count))
+   {
+      assert(cpu_features_get_time_usec() < deadline);
+      assert(net_rtmp_socket_step(transport, 0) != NET_RTMP_SOCKET_ERROR);
+   }
+   while (!net_rtmp_session_media_release(session))
+   {
+      bool read = true, write = false;
+      int result;
+      if (cpu_features_get_time_usec() >= deadline)
+      {
+         uint64_t sent;
+         net_rtmp_session_status(session, NULL, &sent);
+         fprintf(stderr, "media deadline: sent %lu\n", (unsigned long)sent);
+         assert(!"media transfer deadline");
+      }
+      result = net_rtmp_socket_step(transport, 0);
+      assert(result != NET_RTMP_SOCKET_ERROR);
+      if (result == NET_RTMP_SOCKET_IDLE)
+         socket_wait(fd, &read, &write, 10);
+   }
+}
+
+static rflv_mux_t *media_mux(FILE *file, uint8_t *header, uint8_t *payload)
+{
+   rflv_config_t config;
+   rflv_mux_t *mux;
+   uint8_t *avcc = NULL, *asc = NULL;
+   size_t size;
+   bool av1 = false, hevc = false;
+   memset(&config, 0, sizeof(config));
+   config.video_timescale = config.audio_timescale = 1000;
+   config.max_packet_size = 1048576;
+   while ((!avcc || !asc) && (size = read_tag(file, header, payload)) != 0)
+   {
+      if (header[0] == 9 && size > 5
+            && (payload[0] == 0x90 || payload[1] == 0))
+      {
+         assert(!avcc);
+         av1 = payload[0] == 0x90 && !memcmp(payload + 1, "av01", 4);
+         hevc = payload[0] == 0x90 && !memcmp(payload + 1, "hvc1", 4);
+         assert(av1 || hevc || payload[0] == 23);
+         config.avcc_size = size - 5;
+         config.avcc = avcc = (uint8_t*)malloc(config.avcc_size);
+         assert(avcc);
+         memcpy(avcc, payload + 5, config.avcc_size);
+      }
+      if (header[0] == 8 && size > 2 && payload[1] == 0)
+      {
+         assert(!asc && payload[0] == 175);
+         config.asc_size = size - 2;
+         config.asc = asc = (uint8_t*)malloc(config.asc_size);
+         assert(asc);
+         memcpy(asc, payload + 2, config.asc_size);
+      }
+   }
+   assert(avcc && asc);
+   mux = av1 ? rflv_mux_new_av1(&config)
+      : hevc ? rflv_mux_new_hevc(&config) : rflv_mux_new(&config);
+   free(avcc);
+   free(asc);
+   assert(mux && !fseek(file, 13, SEEK_SET));
+   assert(rflv_mux_release(mux));
+   return mux;
+}
+
+static void send_mux(net_rtmp_session_t *session, net_rtmp_socket_t *transport,
+      int fd, rflv_mux_t *mux, const void *input, size_t size, retro_time_t deadline)
+{
+   int result;
+   while ((result = rflv_mux_step(mux)) != RFLV_BUSY)
+   {
+      rflv_tag_t tag;
+      net_rtmp_span_t spans[2];
+      assert((result == RFLV_PROGRESS || result == RFLV_PACKET)
+            && cpu_features_get_time_usec() < deadline);
+      if (result != RFLV_PACKET)
+         continue;
+      assert(rflv_mux_get_tag(mux, &tag));
+      if (input)
+      {
+         assert(tag.spans[1].data == input && tag.spans[1].size == size);
+         assert(rflv_mux_push(mux, 1, input, size, 0, 0, true) == RFLV_BUSY);
+      }
+      spans[0].data = tag.spans[0].data;
+      spans[0].size = tag.spans[0].size;
+      spans[1].data = tag.spans[1].data;
+      spans[1].size = tag.spans[1].size;
+      send_spans(session, transport, fd, tag.type, tag.timestamp, spans, 2, deadline);
+      assert(rflv_mux_release(mux));
+   }
+}
+
+static void send_media(net_rtmp_session_t *session, net_rtmp_socket_t *transport,
+      int fd, const char *path, bool remux)
+{
+   FILE *file = fopen(path, "rb");
+   uint8_t header[13];
+   uint8_t *payload = (uint8_t*)malloc(1048576);
+   rflv_mux_t *mux = NULL;
+   retro_time_t deadline = cpu_features_get_time_usec() + 10000000;
+   size_t size;
+   unsigned count = 0;
+   assert(file && payload);
+   assert(fread(header, 1, 13, file) == 13);
+   assert(!memcmp(header, "FLV\1", 4) && header[8] == 9);
+   if (remux)
+   {
+      mux = media_mux(file, header, payload);
+      send_mux(session, transport, fd, mux, NULL, 0, deadline);
+   }
+   while ((size = read_tag(file, header, payload)) != 0)
+   {
+      uint32_t timestamp = ((uint32_t)header[7] << 24) | ((uint32_t)header[4] << 16)
+         | ((uint32_t)header[5] << 8) | header[6];
+      net_rtmp_span_t span;
+      assert(++count < 4096);
+      if (mux)
+      {
+         size_t prefix;
+         uint64_t pts = timestamp;
+         bool enhanced = header[0] == 9 && size > 5 && (payload[0] & 0x80);
+         bool hevc = enhanced && !memcmp(payload + 1, "hvc1", 4);
+         unsigned type = payload[0] & 15;
+         if ((header[0] != 8 && header[0] != 9) || size < 2
+               || (enhanced ? type != 1 && !(hevc && type == 3) : payload[1] != 1))
+            continue;
+         prefix = header[0] == 9 ? 5 : 2;
+         if (hevc && type == 1)
+            prefix = 8;
+         assert(size > prefix);
+         if (enhanced)
+            assert(hevc || !memcmp(payload + 1, "av01", 4));
+         if (header[0] == 9 && (!enhanced || (hevc && type == 1)))
+         {
+            const uint8_t *cts = payload + (enhanced ? 5 : 2);
+            int32_t composition = ((int32_t)cts[0] << 16)
+               | ((int32_t)cts[1] << 8) | cts[2];
+            if (composition & 0x800000)
+               composition -= 0x1000000;
+            assert(composition >= 0 || timestamp >= (uint32_t)-composition);
+            pts = composition < 0 ? timestamp - (uint32_t)-composition
+               : (uint64_t)timestamp + (uint32_t)composition;
+         }
+         assert(rflv_mux_push(mux, header[0] == 9 ? 1 : 2, payload + prefix,
+                  size - prefix, timestamp, pts, ((payload[0] >> 4) & 7) == 1)
+               == RFLV_PROGRESS);
+         send_mux(session, transport, fd, mux, payload + prefix, size - prefix, deadline);
+         continue;
+      }
+      span.data = payload;
+      span.size = size;
+      send_spans(session, transport, fd, header[0], timestamp, &span, 1, deadline);
+   }
+   if (mux)
+   {
+      assert(rflv_mux_finish(mux));
+      rflv_mux_free(mux);
+   }
+   assert(!ferror(file) && count && !fclose(file));
+   free(payload);
+}
+
+static bool resolve_dispatch(void (*work)(void*), void *job, void *data)
+{
+   sthread_t **thread = (sthread_t**)data;
+   *thread = sthread_create(work, job);
+   return *thread != NULL;
+}
+
+#ifndef HAVE_SSL
+static void finish_transport(int fd)
+{
+   uint8_t input[256];
+   bool error = false;
+   retro_time_t deadline = cpu_features_get_time_usec() + 5000000;
+#ifdef _WIN32
+   assert(!shutdown(fd, SD_SEND));
+#else
+   assert(!shutdown(fd, SHUT_WR));
+#endif
+   while (!error)
+   {
+      bool read = true, write = false;
+      assert(cpu_features_get_time_usec() < deadline);
+      socket_receive_all_nonblocking(fd, &error, input, sizeof(input));
+      if (!error)
+         socket_wait(fd, &read, &write, 10);
+   }
+}
+#else
+static void *connect_tls(int fd)
+{
+   const char *path = getenv("RTMPS_CA");
+   char *pem = NULL;
+   int64_t size = 0;
+   void *ssl;
+   int result;
+   retro_time_t deadline = cpu_features_get_time_usec() + 10000000;
+   assert(path && filestream_read_file(path, (void**)&pem, &size));
+   assert(pem && size > 0);
+   ssl_socket_retro_set_trust_pem(pem, (size_t)size);
+   ssl = ssl_socket_init(fd, "localhost");
+   assert(ssl);
+   do
+   {
+      bool read = false, write = false;
+      assert(cpu_features_get_time_usec() < deadline);
+      result = ssl_socket_handshake_step(ssl, &read, &write);
+      assert(result >= 0);
+      if (!result && (read || write))
+         assert(socket_wait(fd, &read, &write, 5000));
+   } while (!result);
+   ssl_socket_retro_set_trust_pem(NULL, 0);
+   free(pem);
+   return ssl;
+}
+
+/* Flushed, then closed as over TCP: the close notification, a
+ * half-close, and reads until the server closes. Closing with its last
+ * replies unread would reset the connection, which can discard the end
+ * of the stream before the server reads it. */
+static void finish_tls(net_rtmp_socket_t *transport, void *ssl, int fd)
+{
+   uint8_t input[256];
+   bool error = false;
+   retro_time_t deadline = cpu_features_get_time_usec() + 5000000;
+   int result;
+   do
+   {
+      bool read = false, write = true;
+      assert(cpu_features_get_time_usec() < deadline);
+      result = net_rtmp_socket_flush(transport);
+      assert(result >= 0);
+      if (!result)
+         assert(socket_wait(fd, &read, &write, 1000));
+   } while (!result);
+   assert(!ssl_socket_close_notify(ssl));
+#ifdef _WIN32
+   assert(!shutdown(fd, SD_SEND));
+#else
+   assert(!shutdown(fd, SHUT_WR));
+#endif
+   while (!error)
+   {
+      bool read = true, write = false;
+      assert(cpu_features_get_time_usec() < deadline);
+      if (!ssl_socket_receive_all_nonblocking(ssl, &error, input,
+               sizeof(input)) && !error)
+         socket_wait(fd, &read, &write, 10);
+   }
+}
+#endif
+
 int main(int argc, char **argv)
 {
    net_rtmp_publish_config_t config;
    net_rtmp_session_t *session;
    net_rtmp_socket_t *transport;
+#ifdef HAVE_SSL
+   void *ssl;
+#endif
    void *address = NULL;
+   net_resolve_t *resolver;
+   sthread_t *resolver_thread = NULL;
+   struct addrinfo *resolved;
    retro_time_t deadline;
    uint64_t sent;
    uint32_t stream;
    unsigned i, port;
    int fd, result;
-   assert(argc == 4 && network_init());
+   assert((argc == 4 || argc == 5 || argc == 6) && network_init());
+   assert(argc != 6 || !strcmp(argv[5], "mux"));
    port = (unsigned)strtoul(argv[2], NULL, 10);
    assert(port && port <= 65535);
-   fd = socket_init(&address, (uint16_t)port, "127.0.0.1", SOCKET_TYPE_STREAM, AF_INET);
+   resolver = net_resolve_new("127.0.0.1", port,
+         resolve_dispatch, &resolver_thread);
+   assert(resolver && resolver_thread);
+   deadline = cpu_features_get_time_usec() + 5000000;
+   do
+   {
+      result = net_resolve_poll(resolver, &address);
+      assert(cpu_features_get_time_usec() < deadline);
+      if (result == NET_RESOLVE_PENDING)
+         retro_sleep(1);
+   } while (result == NET_RESOLVE_PENDING);
+   assert(result == NET_RESOLVE_READY && address);
+   resolved = (struct addrinfo*)address;
+   fd = socket(resolved->ai_family, resolved->ai_socktype, resolved->ai_protocol);
    assert(fd >= 0 && address);
-   result = socket_connect(fd, address);
-   freeaddrinfo_retro((struct addrinfo*)address);
-   if (result < 0)
+   result = socket_connect_begin(fd, address);
+   deadline = cpu_features_get_time_usec() + 5000000;
+   while (result == SOCKET_CONNECT_PENDING)
+   {
+      bool read = false, write = true;
+      assert(cpu_features_get_time_usec() < deadline);
+      result = socket_connect_step(fd, address);
+      if (result == SOCKET_CONNECT_PENDING)
+         socket_wait(fd, &read, &write, 10);
+   }
+   net_resolve_free(resolver);
+   sthread_join(resolver_thread);
+   if (result != SOCKET_CONNECT_READY)
    {
       socket_close(fd);
       return 77;
@@ -60,7 +374,12 @@ int main(int argc, char **argv)
       random_bytes[i] = (uint8_t)(i * 13 + 1);
    session = net_rtmp_session_new(&config, random_bytes, 0, 65536, 8);
    assert(session);
+#ifdef HAVE_SSL
+   ssl = connect_tls(fd);
+   transport = net_rtmp_socket_new_tls(session, fd, ssl);
+#else
    transport = net_rtmp_socket_new(session, fd);
+#endif
    assert(transport);
    deadline = cpu_features_get_time_usec() + 10000000;
    while (net_rtmp_session_status(session, &stream, &sent) != NET_RTMP_SESSION_READY)
@@ -73,8 +392,34 @@ int main(int argc, char **argv)
          socket_wait(fd, &read, &write, 10);
    }
    assert(stream && sent > 3073);
+   if (argc >= 5)
+   {
+      assert(net_rtmp_session_chunk_size(session, 4096));
+      send_media(session, transport, fd, argv[4], argc == 6);
+      assert(net_rtmp_session_finish(session));
+      deadline = cpu_features_get_time_usec() + 10000000;
+      while (net_rtmp_session_status(session, NULL, NULL) != NET_RTMP_SESSION_FINISHED)
+      {
+         bool read = true, write = true;
+         assert(cpu_features_get_time_usec() < deadline);
+         result = net_rtmp_socket_step(transport, 0);
+         assert(result != NET_RTMP_SOCKET_ERROR);
+         if (result == NET_RTMP_SOCKET_IDLE)
+            socket_wait(fd, &read, &write, 10);
+      }
+#ifdef HAVE_SSL
+      finish_tls(transport, ssl, fd);
+#else
+      finish_transport(fd);
+#endif
+   }
    net_rtmp_socket_free(transport);
+#ifdef HAVE_SSL
+   ssl_socket_close(ssl);
+   ssl_socket_free(ssl);
+#else
    socket_close(fd);
+#endif
    assert(net_rtmp_session_free(session));
    puts("PASS native nonblocking TCP publish session");
    return 0;

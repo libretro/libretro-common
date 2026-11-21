@@ -20,6 +20,7 @@
  * THE SOFTWARE.
  */
 #include <net/net_rtmp_session.h>
+#include <formats/rflv_mux.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -225,6 +226,294 @@ static void rejection(void)
    output_size = 0;
 }
 
+static void incoming(net_rtmp_session_t *s, unsigned type, unsigned stream,
+      const void *body, size_t size)
+{
+   size_t at, used;
+   assert(size < 128);
+   memset(input, 0, 12);
+   input[0] = type <= 6 ? 2 : 3;
+   input[6] = (uint8_t)size;
+   input[7] = (uint8_t)type;
+   input[8] = (uint8_t)stream;
+   memcpy(input + 12, body, size);
+   for (at = 0; at < size + 12; at += used)
+   {
+      assert(net_rtmp_session_feed(s, input + at, size + 12 - at, &used, 0));
+      assert(used);
+   }
+}
+
+static net_rtmp_session_t *ready(void)
+{
+   static const uint8_t connected[] =
+      "\2\0\7_result\0\77\360\0\0\0\0\0\0\5\3"
+      "\0\4code\2\0\35NetConnection.Connect.Success\0\0\11";
+   static const uint8_t created[] =
+      { 2, 0, 7, '_', 'r', 'e', 's', 'u', 'l', 't',
+         0, 64, 0, 0, 0, 0, 0, 0, 0, 5, 0, 64, 49, 0, 0, 0, 0, 0, 0 };
+   static const uint8_t started[] =
+      "\2\0\10onStatus\0\0\0\0\0\0\0\0\0\5\3"
+      "\0\4code\2\0\27NetStream.Publish.Start\0\0\11";
+   net_rtmp_session_t *s = negotiating();
+   pump(s);
+   incoming(s, 20, 0, connected, sizeof(connected) - 1);
+   pump(s);
+   incoming(s, 20, 0, created, sizeof(created));
+   pump(s);
+   incoming(s, 20, 17, started, sizeof(started) - 1);
+   pump(s);
+   assert(net_rtmp_session_status(s, NULL, NULL) == NET_RTMP_SESSION_READY);
+   output_size = 0;
+   return s;
+}
+
+static void mux_lifetime(void)
+{
+   static const uint8_t asc[] = { 18, 16 };
+   static const uint8_t packet[] = { 1, 2, 3, 4, 5, 6, 7 };
+   net_rtmp_session_t *s = ready();
+   rflv_config_t config;
+   rflv_mux_t *mux;
+   unsigned phase;
+   memset(&config, 0, sizeof(config));
+   config.asc = asc;
+   config.asc_size = sizeof(asc);
+   config.audio_timescale = 1000;
+   config.max_packet_size = 1024;
+   mux = rflv_mux_new(&config);
+   assert(mux && rflv_mux_release(mux));
+   for (phase = 0; phase < 2; phase++)
+   {
+      rflv_tag_t tag, again;
+      net_rtmp_span_t spans[2], span;
+      if (phase)
+         assert(rflv_mux_push(mux, 2, packet, sizeof(packet), 1000, 1000, false)
+               == RFLV_PROGRESS);
+      assert(rflv_mux_get_tag(mux, &tag) && tag.type == 8);
+      assert(tag.timestamp == (phase ? 1000u : 0u));
+      spans[0].data = tag.spans[0].data;
+      spans[0].size = tag.spans[0].size;
+      spans[1].data = tag.spans[1].data;
+      spans[1].size = tag.spans[1].size;
+      assert(net_rtmp_session_media(s, tag.type, tag.timestamp, spans, 2));
+      assert(!net_rtmp_session_media_release(s));
+      assert(rflv_mux_push(mux, 2, packet, sizeof(packet), 2000, 2000, false)
+            == RFLV_BUSY);
+      if (!phase)
+      {
+         pump(s);
+         assert(net_rtmp_session_media_release(s));
+         assert(rflv_mux_release(mux));
+         output_size = 0;
+         continue;
+      }
+      assert(net_rtmp_session_get(s, &span));
+      assert(net_rtmp_session_consume(s, span.size));
+      assert(net_rtmp_session_get(s, &span) && span.data == tag.spans[0].data);
+      assert(net_rtmp_session_consume(s, span.size));
+      assert(net_rtmp_session_get(s, &span) && span.data == packet);
+      assert(span.size == sizeof(packet) && net_rtmp_session_consume(s, 0));
+      net_rtmp_session_cancel(s);
+      assert(!net_rtmp_session_media_release(s));
+      assert(rflv_mux_get_tag(mux, &again));
+      assert(again.spans[0].data == tag.spans[0].data && again.spans[1].data == packet);
+      assert(!net_rtmp_session_free(s));
+      assert(net_rtmp_session_discard(s));
+      assert(net_rtmp_session_media_release(s));
+      assert(rflv_mux_release(mux) && !rflv_mux_get_tag(mux, &tag));
+   }
+   assert(rflv_mux_finish(mux));
+   rflv_mux_free(mux);
+   assert(net_rtmp_session_free(s));
+   output_size = 0;
+}
+
+static void media(void)
+{
+   static const uint8_t first[] =
+      { 6, 255, 255, 255, 0, 1, 2, 9, 17, 0, 0, 0, 1, 0, 0, 0 };
+   static const uint8_t continuation[] = { 198, 1, 0, 0, 0 };
+   static const uint8_t ping[] = { 0, 6, 0, 0, 4, 210 };
+   static const uint8_t pong[] =
+      { 2, 0, 0, 0, 0, 0, 6, 4, 0, 0, 0, 0, 0, 7, 0, 0, 4, 210 };
+   static uint8_t payload[258];
+   net_rtmp_session_t *s = ready();
+   net_rtmp_span_t spans[3], span;
+   size_t i;
+   for (i = 0; i < sizeof(payload); i++)
+      payload[i] = (uint8_t)(i * 13 + 7);
+   spans[0].data = payload;
+   spans[0].size = 17;
+   spans[1].data = payload + 17;
+   spans[1].size = 111;
+   spans[2].data = payload + 128;
+   spans[2].size = 130;
+   assert(!net_rtmp_session_media(s, 20, 0, spans, 3));
+   assert(!net_rtmp_session_media(s, 9, 0, NULL, 0));
+   assert(net_rtmp_session_media(s, 9, 0x1000000, spans, 3));
+   assert(!net_rtmp_session_media(s, 8, 0, spans, 3));
+   assert(!net_rtmp_session_free(s));
+   assert(!net_rtmp_session_media_release(s));
+   assert(net_rtmp_session_get(s, &span));
+   assert(span.size == sizeof(first) && !memcmp(span.data, first, sizeof(first)));
+   memcpy(output, span.data, span.size);
+   output_size = span.size;
+   assert(net_rtmp_session_consume(s, span.size));
+   for (i = 0; i < 2; i++)
+   {
+      assert(net_rtmp_session_get(s, &span));
+      assert(span.data == spans[i].data && span.size == spans[i].size);
+      memcpy(output + output_size, span.data, span.size);
+      output_size += span.size;
+      assert(net_rtmp_session_consume(s, span.size));
+   }
+   assert(output_size == 144);
+   incoming(s, 4, 0, ping, sizeof(ping));
+   pump(s);
+   assert(output_size == 302);
+   assert(!memcmp(output, first, sizeof(first)));
+   assert(!memcmp(output + 16, payload, 128));
+   assert(!memcmp(output + 144, pong, sizeof(pong)));
+   assert(!memcmp(output + 162, continuation, sizeof(continuation)));
+   assert(!memcmp(output + 167, payload + 128, 128));
+   assert(!memcmp(output + 295, continuation, sizeof(continuation)));
+   assert(!memcmp(output + 300, payload + 256, 2));
+   assert(net_rtmp_session_media_release(s));
+   assert(!net_rtmp_session_media_release(s));
+   assert(net_rtmp_session_media(s, 8, 0, spans, 1));
+   assert(net_rtmp_session_get(s, &span));
+   net_rtmp_session_cancel(s);
+   assert(!net_rtmp_session_media_release(s));
+   assert(net_rtmp_session_discard(s));
+   assert(!net_rtmp_session_free(s));
+   assert(net_rtmp_session_media_release(s));
+   assert(net_rtmp_session_free(s));
+   output_size = 0;
+}
+
+static void chunk_resize(void)
+{
+   static const uint8_t announcement[] =
+      { 2, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 16, 0 };
+   static uint8_t payload[258];
+   net_rtmp_session_t *s = ready();
+   net_rtmp_span_t span;
+   span.data = payload;
+   span.size = sizeof(payload);
+   assert(!net_rtmp_session_chunk_size(s, 0));
+   assert(!net_rtmp_session_chunk_size(s, 0x80000000U));
+   assert(net_rtmp_session_chunk_size(s, 4096));
+   assert(!net_rtmp_session_chunk_size(s, 4096));
+   assert(!net_rtmp_session_media(s, 9, 0, &span, 1));
+   pump(s);
+   assert(output_size == sizeof(announcement));
+   assert(!memcmp(output, announcement, sizeof(announcement)));
+   output_size = 0;
+   assert(net_rtmp_session_media(s, 9, 0, &span, 1));
+   assert(!net_rtmp_session_chunk_size(s, 128));
+   while (net_rtmp_session_get(s, &span))
+   {
+      memcpy(output + output_size, span.data, span.size);
+      output_size += span.size;
+      assert(net_rtmp_session_consume(s, span.size));
+   }
+   assert(output_size == sizeof(payload) + 12);
+   assert(!memcmp(output + 12, payload, sizeof(payload)));
+   assert(net_rtmp_session_step(s));
+   assert(net_rtmp_session_media_release(s));
+   assert(net_rtmp_session_chunk_size(s, 128));
+   output_size = 0;
+   pump(s);
+   assert(output_size == 16 && output[14] == 0 && output[15] == 128);
+   assert(net_rtmp_session_free(s));
+   output_size = 0;
+}
+
+static void control_number(net_rtmp_session_t *s, unsigned type, uint32_t value)
+{
+   uint8_t bytes[5];
+   bytes[0] = (uint8_t)(value >> 24);
+   bytes[1] = (uint8_t)(value >> 16);
+   bytes[2] = (uint8_t)(value >> 8);
+   bytes[3] = (uint8_t)value;
+   bytes[4] = 0;
+   incoming(s, type, 0, bytes, type == 6 ? 5 : 4);
+}
+
+static void credit(void)
+{
+   static uint8_t payload[258];
+   net_rtmp_session_t *s = ready();
+   net_rtmp_span_t span;
+   uint64_t before, sent;
+   net_rtmp_session_status(s, NULL, &before);
+   assert(before < 65536);
+   control_number(s, 6, (uint32_t)before + 20);
+   assert(net_rtmp_session_step(s));
+   span.data = payload;
+   span.size = sizeof(payload);
+   assert(net_rtmp_session_media(s, 9, 0, &span, 1));
+   pump(s);
+   net_rtmp_session_status(s, NULL, &sent);
+   assert(sent == before + 20 && output_size == 20);
+   assert(!net_rtmp_session_get(s, &span));
+   assert(!net_rtmp_session_media_release(s));
+   control_number(s, 3, (uint32_t)sent + 1);
+   pump(s);
+   assert(output_size == 20);
+   control_number(s, 3, (uint32_t)sent);
+   pump(s);
+   assert(output_size == 288);
+   assert(net_rtmp_session_media_release(s));
+   assert(net_rtmp_session_free(s));
+   output_size = 0;
+}
+
+static void finish(void)
+{
+   static const uint8_t expected[] =
+   {
+      3, 0, 0, 0, 0, 0, 34, 20, 0, 0, 0, 0,
+      2, 0, 12, 'd', 'e', 'l', 'e', 't', 'e', 'S', 't', 'r', 'e', 'a', 'm',
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 64, 49, 0, 0, 0, 0, 0, 0
+   };
+   static const uint8_t payload[] = { 175, 1, 1 };
+   net_rtmp_span_t span, media_span;
+   net_rtmp_session_t *s = make_session("rtmp://localhost/live", false);
+   assert(!net_rtmp_session_finish(NULL) && !net_rtmp_session_finish(s));
+   assert(net_rtmp_session_free(s));
+   s = ready();
+   media_span.data = payload;
+   media_span.size = sizeof(payload);
+   assert(net_rtmp_session_media(s, 8, 0, &media_span, 1));
+   assert(!net_rtmp_session_finish(s));
+   pump(s);
+   assert(!net_rtmp_session_finish(s));
+   assert(net_rtmp_session_media_release(s));
+   output_size = 0;
+   assert(net_rtmp_session_finish(s) && net_rtmp_session_finish(s));
+   assert(net_rtmp_session_status(s, NULL, NULL) == NET_RTMP_SESSION_DRAINING);
+   assert(!net_rtmp_session_free(s));
+   assert(!net_rtmp_session_media(s, 8, 0, &media_span, 1));
+   assert(!net_rtmp_session_chunk_size(s, 4096));
+   assert(net_rtmp_session_step(s) && net_rtmp_session_get(s, &span));
+   assert(net_rtmp_session_consume(s, 0));
+   assert(net_rtmp_session_status(s, NULL, NULL) == NET_RTMP_SESSION_DRAINING);
+   pump(s);
+   assert(net_rtmp_session_status(s, NULL, NULL) == NET_RTMP_SESSION_FINISHED);
+   assert(output_size == sizeof(expected) && !memcmp(output, expected, sizeof(expected)));
+   assert(!net_rtmp_session_get(s, &span) && !net_rtmp_session_step(s));
+   assert(net_rtmp_session_finish(s) && net_rtmp_session_free(s));
+   output_size = 0;
+   s = ready();
+   assert(net_rtmp_session_finish(s));
+   assert(net_rtmp_session_step(s) && net_rtmp_session_get(s, &span));
+   net_rtmp_session_cancel(s);
+   assert(!net_rtmp_session_finish(s) && !net_rtmp_session_free(s));
+   assert(net_rtmp_session_discard(s) && net_rtmp_session_free(s));
+}
+
 int main(int argc, char **argv)
 {
    if (argc == 4 && !strcmp(argv[1], "--peer"))
@@ -236,6 +525,11 @@ int main(int argc, char **argv)
    cancellation();
    internal_retirement();
    rejection();
-   puts("PASS RTMP session cancellation, partial output and failed initialization");
+   media();
+   mux_lifetime();
+   chunk_resize();
+   credit();
+   finish();
+   puts("PASS RTMP session borrows, media/control interleave, credit and cancellation");
    return 0;
 }

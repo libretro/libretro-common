@@ -22,38 +22,57 @@
 #include <net/net_rtmp_session.h>
 #include <stdlib.h>
 
-enum session_output { SESSION_OUTPUT_NONE, SESSION_OUTPUT_CONTROL, SESSION_OUTPUT_PUBLISH };
+enum session_output
+{
+   SESSION_OUTPUT_NONE, SESSION_OUTPUT_CONTROL,
+   SESSION_OUTPUT_PUBLISH, SESSION_OUTPUT_SIZE, SESSION_OUTPUT_CLOSE
+};
 struct net_rtmp_session
 {
    net_rtmp_handshake_t *handshake;
    net_rtmp_publish_t *publish;
    net_rtmp_control_t *control;
    net_rtmp_receive_t *receive;
-   net_rtmp_chunk_t *chunk;
+   net_rtmp_chunk_t *chunk, *media;
    net_rtmp_span_t view;
-   uint64_t sent;
+   uint64_t sent, acknowledged;
+   uint32_t peer_ack;
+   size_t close_size;
+   unsigned chunk_size;
    enum net_rtmp_session_state state;
    enum session_output owner;
-   bool borrowed, handshake_view, reply;
+   uint8_t size_bytes[4];
+   uint8_t close_bytes[34];
+   bool borrowed, handshake_view, reply, media_active, media_complete;
+   bool media_wire;
 };
 
-net_rtmp_session_t *net_rtmp_session_new(const net_rtmp_publish_config_t *config,
-      const uint8_t random[1528], uint32_t time, size_t max_reply, unsigned streams)
+net_rtmp_session_t *net_rtmp_session_new_caps(const net_rtmp_publish_config_t *config,
+      const uint8_t random[1528], uint32_t time, size_t max_reply, unsigned streams,
+      const net_rtmp_codec_caps_t *caps)
 {
    net_rtmp_session_t *s = (net_rtmp_session_t*)calloc(1, sizeof(*s));
    if (!s)
       return NULL;
    s->handshake = net_rtmp_handshake_new(random, time);
-   s->publish = net_rtmp_publish_new(config);
+   s->publish = net_rtmp_publish_new_caps(config, caps);
    s->control = net_rtmp_control_new();
    s->receive = net_rtmp_receive_new(max_reply, streams);
    s->chunk = net_rtmp_chunk_new(128);
-   if (!s->handshake || !s->publish || !s->control || !s->receive || !s->chunk)
+   s->media = net_rtmp_chunk_new(128);
+   if (!s->handshake || !s->publish || !s->control || !s->receive
+         || !s->chunk || !s->media)
    {
       net_rtmp_session_free(s);
       return NULL;
    }
    return s;
+}
+
+net_rtmp_session_t *net_rtmp_session_new(const net_rtmp_publish_config_t *config,
+      const uint8_t random[1528], uint32_t time, size_t max_reply, unsigned streams)
+{
+   return net_rtmp_session_new_caps(config, random, time, max_reply, streams, NULL);
 }
 
 bool net_rtmp_session_feed(net_rtmp_session_t *s,
@@ -63,7 +82,8 @@ bool net_rtmp_session_feed(net_rtmp_session_t *s,
    if (!used)
       return false;
    *used = 0;
-   if (!s || s->state == NET_RTMP_SESSION_FAILED || (size && !data))
+   if (!s || s->state == NET_RTMP_SESSION_FAILED
+         || s->state == NET_RTMP_SESSION_FINISHED || (size && !data))
       return false;
    if (s->state == NET_RTMP_SESSION_HANDSHAKE)
       result = net_rtmp_handshake_feed(s->handshake, data, size, used, time);
@@ -82,7 +102,9 @@ bool net_rtmp_session_step(net_rtmp_session_t *s)
    net_rtmp_span_t span;
    net_rtmp_message_t m;
    int result;
-   if (!s || s->state == NET_RTMP_SESSION_FAILED)
+   bool progress = false;
+   if (!s || s->state == NET_RTMP_SESSION_FAILED
+         || s->state == NET_RTMP_SESSION_FINISHED)
       return false;
    if (s->state == NET_RTMP_SESSION_HANDSHAKE)
    {
@@ -96,11 +118,30 @@ bool net_rtmp_session_step(net_rtmp_session_t *s)
    }
    if (s->owner != SESSION_OUTPUT_NONE && !net_rtmp_chunk_get(s->chunk, &span))
    {
-      result = s->owner == SESSION_OUTPUT_CONTROL
-         ? net_rtmp_control_ack(s->control) : net_rtmp_publish_ack(s->publish);
+      if (s->owner == SESSION_OUTPUT_CLOSE)
+      {
+         s->owner = SESSION_OUTPUT_NONE;
+         s->state = NET_RTMP_SESSION_FINISHED;
+         return true;
+      }
+      if (s->owner == SESSION_OUTPUT_SIZE)
+      {
+         result = net_rtmp_chunk_size(s->chunk, s->chunk_size)
+            && net_rtmp_chunk_size(s->media, s->chunk_size);
+         s->chunk_size = 0;
+      }
+      else
+         result = s->owner == SESSION_OUTPUT_CONTROL
+            ? net_rtmp_control_ack(s->control) : net_rtmp_publish_ack(s->publish);
       s->owner = SESSION_OUTPUT_NONE;
       if (!result)
          goto invalid;
+      return true;
+   }
+   if (s->media_active && !s->media_complete
+         && !net_rtmp_chunk_get(s->media, &span))
+   {
+      s->media_complete = true;
       return true;
    }
    if (s->reply)
@@ -113,7 +154,8 @@ bool net_rtmp_session_step(net_rtmp_session_t *s)
             goto invalid;
          if (net_rtmp_publish_status(s->publish, NULL, NULL) == NET_RTMP_PUBLISH_FAILED)
             goto invalid;
-         if (net_rtmp_publish_status(s->publish, NULL, NULL) == NET_RTMP_PUBLISH_READY)
+         if (s->state != NET_RTMP_SESSION_DRAINING
+               && net_rtmp_publish_status(s->publish, NULL, NULL) == NET_RTMP_PUBLISH_READY)
             s->state = NET_RTMP_SESSION_READY;
       }
       else if (result != NET_RTMP_PUBLISH_PROGRESS)
@@ -127,9 +169,23 @@ bool net_rtmp_session_step(net_rtmp_session_t *s)
          goto invalid;
       if (result == NET_RTMP_CONTROL_HANDLED)
       {
+         if (m.type == 3)
+         {
+            net_rtmp_control_status_t status;
+            uint32_t delta;
+            if (!net_rtmp_control_status(s->control, &status))
+               goto invalid;
+            delta = status.peer_ack - s->peer_ack;
+            if (delta <= s->sent - s->acknowledged)
+            {
+               s->acknowledged += delta;
+               s->peer_ack = status.peer_ack;
+            }
+         }
          if (!net_rtmp_receive_release(s->receive))
             goto invalid;
-         return true;
+         progress = true;
+         goto dispatch;
       }
       if (result == NET_RTMP_CONTROL_OTHER)
       {
@@ -159,16 +215,35 @@ bool net_rtmp_session_step(net_rtmp_session_t *s)
          }
       }
    }
+dispatch:
    if (s->owner != SESSION_OUTPUT_NONE)
-      return false;
+      return progress;
    if (net_rtmp_control_get(s->control, &m))
       s->owner = SESSION_OUTPUT_CONTROL;
+   else if (s->chunk_size)
+   {
+      s->owner = SESSION_OUTPUT_SIZE;
+      m.chunk_id = 2;
+      m.stream_id = m.timestamp = 0;
+      m.type = 1;
+      m.payload.data = s->size_bytes;
+      m.payload.size = sizeof(s->size_bytes);
+   }
    else if (net_rtmp_publish_get(s->publish, &m))
       s->owner = SESSION_OUTPUT_PUBLISH;
+   else if (s->state == NET_RTMP_SESSION_DRAINING)
+   {
+      s->owner = SESSION_OUTPUT_CLOSE;
+      m.chunk_id = 3;
+      m.stream_id = m.timestamp = 0;
+      m.type = 20;
+      m.payload.data = s->close_bytes;
+      m.payload.size = s->close_size;
+   }
    else if (net_rtmp_publish_status(s->publish, NULL, NULL) == NET_RTMP_PUBLISH_FAILED)
       goto invalid;
    else
-      return false;
+      return progress;
    if (!net_rtmp_chunk_push(s->chunk, m.chunk_id, m.stream_id,
             m.type, m.timestamp, &m.payload, 1))
       goto invalid;
@@ -184,12 +259,34 @@ bool net_rtmp_session_get(net_rtmp_session_t *s, net_rtmp_span_t *span)
       return false;
    if (!s->borrowed)
    {
-      if (s->state == NET_RTMP_SESSION_FAILED)
+      if (s->state == NET_RTMP_SESSION_FAILED
+            || s->state == NET_RTMP_SESSION_FINISHED)
          return false;
       s->handshake_view = s->state == NET_RTMP_SESSION_HANDSHAKE;
-      if (!(s->handshake_view ? net_rtmp_handshake_get(s->handshake, &s->view)
-               : net_rtmp_chunk_get(s->chunk, &s->view)))
-         return false;
+      if (s->handshake_view)
+      {
+         if (!net_rtmp_handshake_get(s->handshake, &s->view))
+            return false;
+      }
+      else
+      {
+         net_rtmp_control_status_t status;
+         uint64_t outstanding = s->sent - s->acknowledged;
+         if (!net_rtmp_control_status(s->control, &status)
+               || (status.bandwidth && outstanding >= status.bandwidth))
+            return false;
+         if (!s->media_wire && !net_rtmp_chunk_get(s->chunk, &s->view))
+         {
+            if (!s->media_active || s->media_complete
+                  || !net_rtmp_chunk_get(s->media, &s->view))
+               return false;
+            s->media_wire = true;
+         }
+         else if (s->media_wire && !net_rtmp_chunk_get(s->media, &s->view))
+            return false;
+         if (status.bandwidth && s->view.size > status.bandwidth - outstanding)
+            s->view.size = (size_t)(status.bandwidth - outstanding);
+      }
       s->borrowed = true;
    }
    *span = s->view;
@@ -202,13 +299,77 @@ bool net_rtmp_session_consume(net_rtmp_session_t *s, size_t size)
          || (uint64_t)size > (uint64_t)-1 - s->sent)
       return false;
    if (!(s->handshake_view ? net_rtmp_handshake_consume(s->handshake, size)
-            : net_rtmp_chunk_consume(s->chunk, size)))
+            : net_rtmp_chunk_consume(s->media_wire ? s->media : s->chunk, size)))
       return false;
    s->sent += size;
    s->view.data = (const uint8_t*)s->view.data + size;
    s->view.size -= size;
    if (!s->view.size)
+   {
       s->borrowed = false;
+      if (s->media_wire && net_rtmp_chunk_boundary(s->media))
+         s->media_wire = false;
+   }
+   return true;
+}
+
+bool net_rtmp_session_chunk_size(net_rtmp_session_t *s, unsigned size)
+{
+   if (!s || s->state != NET_RTMP_SESSION_READY || s->media_active
+         || s->chunk_size || !size || size > 0x7fffffff)
+      return false;
+   s->chunk_size = size;
+   s->size_bytes[0] = (uint8_t)(size >> 24);
+   s->size_bytes[1] = (uint8_t)(size >> 16);
+   s->size_bytes[2] = (uint8_t)(size >> 8);
+   s->size_bytes[3] = (uint8_t)size;
+   return true;
+}
+
+bool net_rtmp_session_media(net_rtmp_session_t *s, unsigned type,
+      uint32_t timestamp, const net_rtmp_span_t *spans, size_t count)
+{
+   uint32_t stream;
+   unsigned id = type == 8 ? 4 : type == 9 ? 6 : 5;
+   if (!s || s->state != NET_RTMP_SESSION_READY || s->media_active || s->chunk_size
+         || (type != 8 && type != 9 && type != 18) || !count
+         || net_rtmp_publish_status(s->publish, &stream, NULL)
+            != NET_RTMP_PUBLISH_READY
+         || !net_rtmp_chunk_push(s->media, id, stream, type, timestamp, spans, count))
+      return false;
+   s->media_active = true;
+   s->media_complete = false;
+   return true;
+}
+
+bool net_rtmp_session_media_release(net_rtmp_session_t *s)
+{
+   if (!s || !s->media_active || s->borrowed
+         || (!s->media_complete && s->state != NET_RTMP_SESSION_FAILED))
+      return false;
+   s->media_active = false;
+   return true;
+}
+
+bool net_rtmp_session_finish(net_rtmp_session_t *s)
+{
+   net_rtmp_command_config_t config;
+   if (!s)
+      return false;
+   if (s->state == NET_RTMP_SESSION_DRAINING
+         || s->state == NET_RTMP_SESSION_FINISHED)
+      return true;
+   if (s->state != NET_RTMP_SESSION_READY || s->media_active || s->borrowed
+         || s->chunk_size)
+      return false;
+   config.application = config.url = config.name = NULL;
+   config.transaction = 0;
+   if (net_rtmp_publish_status(s->publish, &config.stream, NULL)
+            != NET_RTMP_PUBLISH_READY
+         || !net_rtmp_command_encode(NET_RTMP_DELETE_STREAM, &config,
+            s->close_bytes, sizeof(s->close_bytes), &s->close_size))
+      return false;
+   s->state = NET_RTMP_SESSION_DRAINING;
    return true;
 }
 
@@ -240,9 +401,10 @@ bool net_rtmp_session_free(net_rtmp_session_t *s)
 {
    if (!s)
       return true;
-   if (s->borrowed)
+   if (s->borrowed || s->media_active || s->state == NET_RTMP_SESSION_DRAINING)
       return false;
    net_rtmp_chunk_free(s->chunk);
+   net_rtmp_chunk_free(s->media);
    net_rtmp_publish_cancel(s->publish);
    if (s->reply)
       net_rtmp_publish_step(s->publish);

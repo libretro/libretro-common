@@ -31,9 +31,9 @@
 
 RETRO_BEGIN_DECLS
 
-/* Built only under HAVE_CRYPTO (Makefile.common, griffin); the small
- * consoles leave it out and anything optional on top of it - the
- * keychain, the cleanroom TLS, SMB and NFS clients - is gated on it.
+/* HAVE_CRYPTO enables the full library. CRYPTO_AES_ONLY builds just the
+ * basic block, CTR, CFB and CBC primitives for independent consumers.
+ * Keychain, TLS, SMB and NFS remain gated on the full library.
  *
  * Symmetric primitives: constant-time helpers, AES (block, CTR, GCM,
  * CMAC), ChaCha20, Poly1305 and the AEAD front over them. Hashes are
@@ -177,6 +177,40 @@ void aes_ctr_crypt(const struct aes_ctx *ctx, uint8_t *counter,
       const uint8_t *in, uint8_t *out, size_t len);
 
 /**
+ * aes_ctr128_crypt:
+ * @counter           : 16-octet counter block, incremented per block as
+ *                      one 128-bit big-endian number (SP 800-38A's
+ *                      standard incrementing function, as OpenSSL's
+ *                      CRYPTO_ctr128 and mbedtls's aes_crypt_ctr); the
+ *                      block is updated in place.
+ *
+ * aes_ctr_crypt() with the carry out of the low 32 bits taken into the
+ * rest of the block, for formats whose initial counter is a random
+ * 128-bit value rather than GCM's nonce and 32-bit counter. Runs on the
+ * same multi-block paths. @in and @out may alias. Partial trailing
+ * blocks are allowed but a continuation must start on a block boundary.
+ **/
+void aes_ctr128_crypt(const struct aes_ctx *ctx, uint8_t *counter,
+      const uint8_t *in, uint8_t *out, size_t len);
+
+/**
+ * aes_cfb128_encrypt:
+ * @iv                : 16 octets; left holding the feedback register,
+ *                      so a caller can continue the stream.
+ * @num               : octets of the register's keystream already
+ *                      used, 0 at the start of a stream; updated.
+ * @len               : any length.
+ *
+ * CFB mode with 128-bit feedback (SP 800-38A), as OpenSSL's
+ * AES_cfb128_encrypt: a stream split across calls gives the same
+ * octets as one call. @in and @out may alias.
+ **/
+void aes_cfb128_encrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      unsigned *num, const uint8_t *in, uint8_t *out, size_t len);
+void aes_cfb128_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      unsigned *num, const uint8_t *in, uint8_t *out, size_t len);
+
+/**
  * aes_cbc_encrypt:
  * @iv                : 16 octets; left holding the last ciphertext
  *                      block, so a caller can continue the chain.
@@ -197,6 +231,35 @@ void aes_cbc_encrypt(const struct aes_ctx *ctx, uint8_t *iv,
  * instructions made for it. @in and @out may alias.
  **/
 void aes_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      const uint8_t *in, uint8_t *out, size_t len);
+
+/**
+ * aes_xts_encrypt:
+ * @data_key          : the data key, made by aes_init().
+ * @tweak_key         : the tweak key, made by aes_init(); XTS takes two
+ *                      independent keys of one size (AES-128-XTS is a
+ *                      32-octet key, its halves the two).
+ * @tweak             : 16 octets, the data unit's number as IEEE 1619
+ *                      gives it (little-endian for disk sectors);
+ *                      encrypted with @tweak_key here.
+ * @len               : a multiple of 16: whole blocks, no ciphertext
+ *                      stealing.
+ *
+ * XTS-AES (IEEE 1619, SP 800-38E) over one data unit, several blocks at
+ * once where the cipher runs on instructions made for it. @in and @out
+ * may alias.
+ **/
+void aes_xts_encrypt(const struct aes_ctx *data_key,
+      const struct aes_ctx *tweak_key, const uint8_t *tweak,
+      const uint8_t *in, uint8_t *out, size_t len);
+
+/**
+ * aes_xts_decrypt:
+ *
+ * The inverse of aes_xts_encrypt(), with the same keys and tweak.
+ **/
+void aes_xts_decrypt(const struct aes_ctx *data_key,
+      const struct aes_ctx *tweak_key, const uint8_t *tweak,
       const uint8_t *in, uint8_t *out, size_t len);
 
 /**

@@ -34,6 +34,8 @@
 struct ssl_state
 {
    int fd;
+   int handshake_state; /* 0: setup, 1: active, 2: complete,
+                         * 3: close_notify sent, -1: failed */
    char domain[256];
    br_ssl_client_context sc;
    br_x509_minimal_context xc;
@@ -170,64 +172,28 @@ static bool append_cert_x509(void* x509, size_t len)
    return true;
 }
 
-/* Compacts a PEM body in place, dropping every CR and LF, and
- * NUL-terminates the compacted run so strlen() yields the exact
- * number of base64 characters.  The input is not needed by the
- * caller afterwards, so in-place rewriting is fine. */
-static char* delete_linebreaks(char* in)
+/* Every certificate in @certs_pem (NUL-terminated) decoded where it
+ * lies, over its own base64, and added as a trust anchor, which copies
+ * what it keeps. Stops when the anchor table is full. */
+static void append_certs_pem_x509(char *certs_pem)
 {
-   char* iter_in;
-   char* iter_out;
-   while (*in == '\n' || *in == '\r')
-      in++;
+   static const char begin[] = "-----BEGIN CERTIFICATE-----";
+   static const char end_[]  = "-----END CERTIFICATE-----";
+   char *p = certs_pem;
 
-   iter_in  = in;
-   iter_out = in;
-   while (*iter_in != '\0')
+   while (TAs_NUM < sizeof(TAs) / sizeof(TAs[0]))
    {
-      if (*iter_in != '\n' && *iter_in != '\r')
-         *iter_out++ = *iter_in;
-      iter_in++;
-   }
-   *iter_out = '\0';
-
-   return in;
-}
-
-/* this rearranges its input, it's easier to implement
- * that way and caller doesn't need it anymore anyways */
-static void append_certs_pem_x509(char * certs_pem)
-{
-   void * cert_bin;
-   int cert_bin_len;
-   char *cert     = certs_pem;
-   char *cert_end = certs_pem;
-
-   for (;;)
-   {
-      cert      = strstr(cert_end, "-----BEGIN CERTIFICATE-----");
-      if (!cert)
+      char  *b, *stop;
+      size_t n;
+      if (!(b = strstr(p, begin)))
          break;
-      cert     += STRLEN_CONST("-----BEGIN CERTIFICATE-----");
-      cert_end  = strstr(cert, "-----END CERTIFICATE-----");
-      if (!cert_end)
+      b += STRLEN_CONST(begin);
+      if (!(stop = strstr(b, end_)))
          break;
-
-      *cert_end = '\0';
-      cert      = delete_linebreaks(cert);
-
-      /* unbase64() requires an exact, 4-aligned length.  The compacted
-       * run is shorter than (cert_end - cert) by the number of line
-       * breaks removed, so measure it rather than reusing the span of
-       * the original wrapped body. */
-      cert_bin  = unbase64(cert, (int)strlen(cert), &cert_bin_len);
-      if (cert_bin)
-      {
-         append_cert_x509(cert_bin, cert_bin_len);
-         free(cert_bin);
-      }
-
-      cert_end++; /* skip the NUL we just added */
+      p = stop + STRLEN_CONST(end_);
+      n = unbase64_into(b, (size_t)(stop - b), (unsigned char*)b);
+      if (n != (size_t)-1 && n)
+         append_cert_x509(b, n);
    }
 }
 
@@ -235,13 +201,17 @@ static void append_certs_pem_x509(char * certs_pem)
  * statically allocatable mutex/etc */
 static void initialize(void)
 {
-   void* certs_pem;
-   if (TAs_NUM)
+   static bool tried = false;
+   void   *certs_pem = NULL;
+   if (tried)
       return;
-   /* filestream_read_file appends a NUL */
-   filestream_read_file("/etc/ssl/certs/ca-certificates.crt", &certs_pem, NULL);
-   append_certs_pem_x509((char*)certs_pem);
+   /* filestream_read_file appends a NUL; a missing bundle is not read
+    * again at every connection */
+   if (filestream_read_file("/etc/ssl/certs/ca-certificates.crt",
+            &certs_pem, NULL))
+      append_certs_pem_x509((char*)certs_pem);
    free(certs_pem);
+   tried = true;
 }
 
 /* BearSSL's br_ssl_client_init_full (below) always performs full
@@ -280,7 +250,7 @@ void* ssl_socket_init(int fd, const char *domain)
 
 static bool process_inner(struct ssl_state *state, bool blocking)
 {
-   bool dummy;
+   bool dummy = false;
    size_t buflen;
    ssize_t bytes;
    uint8_t *buf = br_ssl_engine_sendrec_buf(&state->sc.eng, &buflen);
@@ -321,7 +291,7 @@ static bool process_inner(struct ssl_state *state, bool blocking)
       bytes = socket_receive_all_nonblocking(state->fd, &dummy, buf, buflen);
       if (bytes > 0)
          br_ssl_engine_recvrec_ack(&state->sc.eng, bytes);
-      if (bytes < 0)
+      if (bytes < 0 || dummy)
          return false;
    }
 
@@ -381,44 +351,73 @@ static void ssl_bear_report_verify(struct ssl_state *state)
    ssl_socket_log_verify_fail(1, state->domain, info);
 }
 
+int ssl_socket_handshake_step(void *state_data, bool *read, bool *write)
+{
+   struct ssl_state *state = (struct ssl_state*)state_data;
+   unsigned status;
+   if (read)
+      *read = false;
+   if (write)
+      *write = false;
+   if (!state || state->handshake_state < 0)
+      return -1;
+   if (state->handshake_state >= 2)
+      return 1;
+   if (!state->handshake_state)
+   {
+      if (!socket_set_block(state->fd, false))
+         goto error;
+      state->handshake_state = 1;
+   }
+   if (!process_inner(state, false))
+      goto error;
+   status = br_ssl_engine_current_state(&state->sc.eng);
+   if (status & BR_SSL_CLOSED)
+      goto error;
+   if (status & BR_SSL_SENDAPP)
+   {
+      state->handshake_state = 2;
+      return 1;
+   }
+   if (read)
+      *read = (status & BR_SSL_RECVREC) != 0;
+   if (write)
+      *write = (status & BR_SSL_SENDREC) != 0;
+   return 0;
+error:
+   state->handshake_state = -1;
+   ssl_bear_report_verify(state);
+   return -1;
+}
+
 int ssl_socket_connect(void *state_data,
       void *data, bool timeout_enable, bool nonblock)
 {
    struct ssl_state *state = (struct ssl_state*)state_data;
-   unsigned bearstate;
-
+   int result;
+   bool read, write;
+   (void)nonblock;
+   if (!state)
+      return -1;
    if (timeout_enable)
    {
       if (!socket_connect_with_timeout(state->fd, data, 5000))
          return -1;
-      /* socket_connect_with_timeout makes the socket non-blocking. */
-      if (!socket_set_block(state->fd, true))
-         return -1;
    }
-   else
+   else if (socket_connect(state->fd, data))
+      return -1;
+   while ((result = ssl_socket_handshake_step(state, &read, &write)) == 0)
    {
-      if (socket_connect(state->fd, data))
-         return -1;
-   }
-
-   for (;;)
-   {
-      if (!process_inner(state, true))
+      if ((read || write)
+            && (!socket_wait(state->fd, &read, &write, SSL_SOCKET_IO_TIMEOUT_MS)
+               || !(read || write)))
       {
-         ssl_bear_report_verify(state);
+         state->handshake_state = -1;
          return -1;
       }
-
-      bearstate = br_ssl_engine_current_state(&state->sc.eng);
-      if (bearstate & BR_SSL_SENDAPP)
-         break; /* handshake done */
-      if (bearstate & BR_SSL_CLOSED)
-      {
-         ssl_bear_report_verify(state);
-         return -1; /* failed */
-      }
    }
-
+   if (result < 0 || !socket_set_block(state->fd, true))
+      return -1;
    return 1;
 }
 
@@ -571,15 +570,28 @@ int ssl_socket_flush_nonblocking(void *state_data)
    }
 }
 
+int ssl_socket_close_notify(void *state_data)
+{
+   struct ssl_state *state = (struct ssl_state*)state_data;
+   if (     !state || state->fd < 0 || state->handshake_state != 2
+         || !socket_set_block(state->fd, false))
+      return -1;
+   br_ssl_engine_close(&state->sc.eng);
+   process_inner(state, false);
+   /* Sent: no second one at the close */
+   state->handshake_state = 3;
+   return 0;
+}
+
 void ssl_socket_close(void *state_data)
 {
    struct ssl_state *state = (struct ssl_state*)state_data;
-
-   br_ssl_engine_close(&state->sc.eng);
-   process_inner(state, false); /* send close notification */
-   socket_close(state->fd);     /* but immediately close socket
-                                   and don't worry about recipient
-                                   getting our message */
+   if (!state || state->fd < 0)
+      return;
+   ssl_socket_close_notify(state);
+   socket_close(state->fd);
+   state->fd = -1;
+   state->handshake_state = -1;
 }
 
 void ssl_socket_free(void *state_data)

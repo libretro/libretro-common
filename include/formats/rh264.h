@@ -66,6 +66,7 @@
 #include <stddef.h>
 
 #include <retro_common_api.h>
+#include <retro_inline.h>
 
 #include <formats/video_hw_frame.h>
 
@@ -81,6 +82,11 @@ typedef struct rh264_video_color
 
 /* SPS VUI color; unspecified CICP values are 2. Failure clears out. */
 int rh264_video_get_color(const rh264_video *v, rh264_video_color_t *out);
+
+/* The frame rate the SPS's VUI timing gives, time_scale over twice
+ * num_units_in_tick, reduced by two where it divides: 0, or -1 when the
+ * stream has no timing (or no SPS yet). */
+int rh264_video_framerate(const rh264_video *v, unsigned *num, unsigned *den);
 
 /* Create a decoder. Returns NULL on allocation failure. */
 rh264_video *rh264_video_open(void);
@@ -103,6 +109,13 @@ int rh264_video_set_extradata(rh264_video *v, const uint8_t *avcc, size_t len);
  * and negative on malformed input or an unsupported (high-profile) stream. */
 /* 2 on hardware backpressure: retry with the same live data and length. */
 int rh264_video_decode(rh264_video *v, const uint8_t *data, size_t len);
+
+/* A caller's value for the picture the next rh264_video_decode opens,
+ * given back with that picture by rh264_video_tag once it is handed out:
+ * with B pictures the output is not the input's order. A field pair
+ * keeps its first field's. 0 until set. */
+void rh264_video_set_tag(rh264_video *v, uint64_t tag);
+uint64_t rh264_video_tag(const rh264_video *v);
 
 /* Hand out the next pending picture in display order without feeding more
  * data, for end of stream. Returns 0 when a picture became available through
@@ -330,6 +343,37 @@ int rh264_video_is_hw(const rh264_video *v);
 /* The picture decode or drain made ready, as a hardware frame; 0 when
  * there is one. rh264_video_plane has none to give then. */
 int rh264_video_hw_frame(const rh264_video *v, video_hw_frame_t *out);
+
+/* Whether an avcC record (ISO/IEC 14496-15) describes 8-bit 4:2:0
+ * pictures: the High-profile extension's chroma format and bit depths
+ * where the record carries them, otherwise a profile that has nothing
+ * else. 0 for a record too short to say. */
+static INLINE int rh264_avcc_is_420_8bit(const uint8_t *b, size_t size)
+{
+   size_t off = 6;
+   unsigned n, i, profile;
+   if (!b || size < 7 || b[0] != 1)
+      return 0;
+   profile = b[1];
+   /* the SPS list, then the PPS list with its count byte ahead */
+   for (i = 0; i < 2; i++)
+   {
+      if (off >= size)
+         return 0;
+      n    = i ? b[off++] : (b[5] & 0x1Fu);
+      while (n--)
+      {
+         if (off + 2 > size)
+            return 0;
+         off += 2 + (((size_t)b[off] << 8) | b[off + 1]);
+      }
+   }
+   if (off + 3 <= size && (profile == 100 || profile == 110
+            || profile == 122 || profile == 144 || profile == 244))
+      return (b[off] & 3) == 1 && !(b[off + 1] & 7) && !(b[off + 2] & 7);
+   return profile == 66 || profile == 77 || profile == 88
+      || profile == 100;
+}
 
 RETRO_END_DECLS
 

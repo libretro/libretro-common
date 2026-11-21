@@ -66,13 +66,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <formats/data_transfer.h>
+#include <streams/data_transfer_file.h>
 #include <memmap.h>
 #ifdef DT_COUNT_IO
 #include <streams/file_stream.h>
-static unsigned io_seeks, io_reads;
+static unsigned io_seeks, io_reads, io_ats;
 static uint64_t io_bytes;
 int64_t __real_filestream_seek(RFILE *stream, int64_t offset, int origin);
 int64_t __real_filestream_read(RFILE *stream, void *data, int64_t length);
+int64_t __real_filestream_read_at(RFILE *stream, void *data, int64_t length,
+      int64_t offset);
 int64_t __wrap_filestream_seek(RFILE *stream, int64_t offset, int origin)
 {
    io_seeks++;
@@ -83,6 +86,19 @@ int64_t __wrap_filestream_read(RFILE *stream, void *data, int64_t length)
    io_reads++;
    if (length > 0) io_bytes += (uint64_t)length;
    return __real_filestream_read(stream, data, length);
+}
+/* A read at an offset is a read and no seek; a -1 is counted by the
+ * seek and read that follow it */
+int64_t __wrap_filestream_read_at(RFILE *stream, void *data, int64_t length,
+      int64_t offset)
+{
+   int64_t got = __real_filestream_read_at(stream, data, length, offset);
+   if (got >= 0)
+   {
+      io_reads++; io_ats++;
+      if (length > 0) io_bytes += (uint64_t)length;
+   }
+   return got;
 }
 #endif
 #if defined(__linux__)
@@ -1031,6 +1047,76 @@ static int callback_window_check(void)
    return 0;
 }
 
+/* A consumer far into a large file - one that starts there, moves on,
+ * then steps back, which the feed takes for a lap - is fed from margin
+ * bytes behind it: the gap it has passed is never read in, whatever the
+ * frontier was. */
+typedef struct far_source { size_t length; size_t bytes; } far_source;
+static int64_t far_read_at(void *ud, uint64_t offset, uint8_t *dst,
+      size_t bytes)
+{
+   far_source *src = (far_source*)ud;
+   size_t i;
+   if (offset > src->length || bytes > src->length - (size_t)offset)
+      return -1;
+   for (i = 0; i < bytes; i++)
+      dst[i] = (uint8_t)((offset + i) * 29 + 7);
+   src->bytes += bytes;
+   return (int64_t)bytes;
+}
+static int far_matches(const uint8_t *base, size_t at, size_t n)
+{
+   size_t i;
+   for (i = 0; i < n; i++)
+      if (base[at + i] != (uint8_t)((at + i) * 29 + 7))
+         return 0;
+   return 1;
+}
+static int far_feed_check(void)
+{
+   far_source src;
+   data_transfer_t *dt;
+   const uint8_t *base;
+   size_t blen = 0, step, tell, bound = MARGIN + LOOKAHD + (2u << 20);
+   const size_t len = 256u << 20;
+   if (!data_transfer_reserve_supported())
+   {
+      printf("[skip] far feed: no reservations on this build\n");
+      return 0;
+   }
+   memset(&src, 0, sizeof(src));
+   src.length = len;
+   if (!(dt = data_transfer_open_window_reader(len, KEEP, far_read_at, &src)))
+   { fail("far feed: open"); return 1; }
+   base = data_transfer_window_base(dt, &blen);
+   for (step = 0; step < 3; step++)
+   {
+      size_t before = src.bytes;
+      tell = len - (1u << 20) + (step == 1 ? 300u * 1024 : step == 2 ? 260u * 1024 : 0);
+      if (!data_transfer_window_feed(dt, tell, LOOKAHD, MARGIN)
+            || !far_matches(base, tell, 4096))
+      {
+         printf("[FAIL] far feed: step %u, bytes at tell\n", (unsigned)step);
+         bad = 1;
+         break;
+      }
+      if (src.bytes - before > bound
+            || data_transfer_window_resident(dt) > KEEP + bound)
+      {
+         printf("[FAIL] far feed: step %u read %lu bytes, resident %lu\n",
+               (unsigned)step, (unsigned long)(src.bytes - before),
+               (unsigned long)data_transfer_window_resident(dt));
+         bad = 1;
+         break;
+      }
+   }
+   data_transfer_free(dt);
+   if (step < 3)
+      return 1;
+   ok("far feed: started, moved and stepped back far into a file, read only near the consumer");
+   return 0;
+}
+
 int main(void)
 {
    const char *path = "dtwin.bin";
@@ -1061,7 +1147,7 @@ int main(void)
    if (data_transfer_window_is_reserved(dt))
    {
       uint8_t probe[16];
-      io_seeks = io_reads = 0;
+      io_seeks = io_reads = io_ats = 0;
       if (!data_transfer_window_extend(dt, KEEP + 4096)
             || !data_transfer_window_extend(dt, KEEP + 8192)
             || memcmp(base + KEEP, ref + KEEP, 8192))
@@ -1075,7 +1161,8 @@ int main(void)
             || !data_transfer_window_extend(dt, KEEP + 12288)
             || memcmp(base + KEEP, ref + KEEP, 12288))
          fail("metadata probes and window refill retain exact bytes");
-      if (io_seeks != 2 || io_reads != 5)
+      /* reads at offsets never seek */
+      if (io_seeks != (io_ats ? 0u : 2u) || io_reads != 5)
          fail("metadata probes only seek when changing ranges");
       else ok("metadata probes only seek when changing ranges");
       printf("window I/O: %u reads, %u seeks\n", io_reads, io_seeks);
@@ -1138,6 +1225,7 @@ int main(void)
 #endif
 
    bad |= callback_window_check();
+   bad |= far_feed_check();
    bad |= sparse_skip_check();
    bad |= pin_check();
    bad |= feed_budget_check();

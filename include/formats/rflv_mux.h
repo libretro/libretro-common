@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <boolean.h>
 #include <retro_common_api.h>
+#include <formats/video_color.h>
 
 typedef struct rflv_mux rflv_mux_t;
 typedef struct rflv_config
@@ -40,6 +41,13 @@ typedef struct rflv_span
    size_t size;
 } rflv_span_t;
 
+typedef struct rflv_tag
+{
+   rflv_span_t spans[2];
+   uint32_t timestamp;
+   unsigned type;
+} rflv_tag_t;
+
 enum rflv_result
 {
    RFLV_ERROR = -1, RFLV_BUSY, RFLV_PROGRESS,
@@ -50,17 +58,52 @@ RETRO_BEGIN_DECLS
 /* Single worker owner. Copies AVCDecoderConfigurationRecord and AAC-LC ASC
  * during cold initialization. At least one track; AVC uses four-byte lengths. */
 rflv_mux_t *rflv_mux_new(const rflv_config_t *config);
-/* Track 1: one length-prefixed AVC access unit; track 2: one raw AAC unit.
+/* Enhanced RTMP HEVC. avcc/avcc_size carry an hvcC record with four-byte
+ * NAL lengths. Other fields retain their meaning; max_packet_size <= 0xfffff7.
+ * Media input stays borrowed; native Annex B uses new_hevc_annexb. */
+rflv_mux_t *rflv_mux_new_hevc(const rflv_config_t *config);
+/* Enhanced RTMP AV1. avcc carries av1C, with a sequence OBU that agrees with
+ * its header. Media is one sized-OBU temporal unit in spatial layer 0, DTS=PTS. No conversion
+ * storage or media copy; step validates one OBU. max_packet_size <= 0xfffffa. */
+rflv_mux_t *rflv_mux_new_av1(const rflv_config_t *config);
+/* Native AV1: avcc carries sized configuration OBUs, exactly one sequence.
+ * Builds av1C during cold setup. push() borrows native temporal units as-is. */
+rflv_mux_t *rflv_mux_new_av1_obu(const rflv_config_t *config);
+/* Cold HEVC/AV1 setup, once before the initial file-header release. Emits AMF0
+ * colorInfo before the video sequence. Unknown fields stay absent. Mastering
+ * must be complete and within Enhanced RTMP ranges; xy rounds to four decimals.
+ * Depth must match configuration; AV1 CICP/range must agree with its sequence.
+ * Range remains in the coded bitstream. Copies supplied
+ * source metadata, never display/tone-map defaults. No later mutation. */
+bool rflv_mux_set_color(rflv_mux_t *mux, const video_color_metadata_t *color,
+      unsigned bit_depth);
+/* Native AVC encoder adapter. avcc contains Annex B SPS/PPS (one each).
+ * Cold allocation reserves conversion storage up to max_packet_size.
+ * Other configuration fields retain their ordinary meaning. */
+rflv_mux_t *rflv_mux_new_annexb(const rflv_config_t *config);
+/* Native HEVC adapter: Annex B VPS/SPS/PPS (one each). Builds hvcC from SPS;
+ * reserves conversion storage once. Media uses push_annexb, one NAL per step. */
+rflv_mux_t *rflv_mux_new_hevc_annexb(const rflv_config_t *config);
+/* Track 1: length-prefixed AVC/HEVC or an AV1 temporal unit; track 2: raw AAC.
  * Accepted input stays borrowed until output release, error or free.
  * BUSY takes nothing. Timestamps use the configured per-track timescale;
  * their millisecond representation must fit a nonnegative signed 32-bit value. */
 int rflv_mux_push(rflv_mux_t *mux, unsigned track,
       const void *data, size_t size, uint64_t dts, uint64_t pts, bool keyframe);
-/* One AVC NAL validation step. PACKET repeats until release; BUSY needs input. */
+/* Video only, on a mux created by new_annexb/new_hevc_annexb. Native output stays
+ * borrowed until release/error/free. Each step adapts one NAL into reserved
+ * storage: format conversion requires a copy; ordinary push still borrows. */
+int rflv_mux_push_annexb(rflv_mux_t *mux, const void *data, size_t size,
+      uint64_t dts, uint64_t pts, bool keyframe);
+/* One NAL validation step. PACKET repeats until release; BUSY needs input. */
 int rflv_mux_step(rflv_mux_t *mux);
 /* Up to three borrowed spans. No payload copy, allocation, I/O or wait. */
 bool rflv_mux_get(rflv_mux_t *mux,
       const rflv_span_t **spans, size_t *count);
+/* Ready codec payload for streaming, without the file tag header/trailer.
+ * False for the initial file header. Borrows last until mux output release.
+ * A streaming consumer must return its borrow before releasing mux output. */
+bool rflv_mux_get_tag(rflv_mux_t *mux, rflv_tag_t *tag);
 bool rflv_mux_release(rflv_mux_t *mux);
 /* Requires acknowledged output. No seek or file trailer. */
 bool rflv_mux_finish(rflv_mux_t *mux);

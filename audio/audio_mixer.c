@@ -184,6 +184,7 @@ struct audio_mixer_sound
    void *prepared_transfer;
    enum audio_type_enum prepared_type;
    unsigned prepared_rate;
+   unsigned container_track; /* zero: automatic; otherwise demux index + 1 */
    bool prepared_s16;
 #endif
    bool initial_paused;
@@ -387,47 +388,11 @@ static INLINE float audio_mixer_bits_float(int i)
 #ifdef AUDIO_MIXER_HAS_STREAM
 /* ---- folding a multichannel stream to the stereo a voice mixes ------
  *
- * Vorbis and Opus both decode more than two channels now, and so do
- * WAV and FLAC - but they do not agree on what order the channels
- * arrive in, so there are two tables and the caller says which.
- *
- * Vorbis's order (spec 4.3.9), which Opus mapping family 1 adopts:
- *
- *   3  L C R          4  L R RL RR        5  L C R RL RR
- *   6  L C R RL RR LFE                    7  L C R RL RR BC LFE
- *   8  L C R RL RR SL SR LFE
- *
- * Microsoft's, which WAV carries and FLAC's spec matches:
- *
- *   3  FL FR FC       4  FL FR BL BR      5  FL FR FC BL BR
- *   6  FL FR FC LFE BL BR                 7  FL FR FC LFE BC SL SR
- *   8  FL FR FC LFE BL BR SL SR
- *
- * Folding one with the other's table is not a subtle error: on 5.1 it
- * sends front-right to both sides, front-centre to the right alone,
- * LFE into the mix and back-right nowhere.
- *
- * A stream voice mixes stereo, so anything wider is folded here - the
- * arms deliberately do no channel conversion, leaving it to the
- * mixer.  Coefficients are the usual ITU-R BS.775 ones: centre and
- * surrounds enter both sides at -3 dB, a lone back centre at -6 dB
- * into each, and LFE is dropped, which is what it is for.
- *
- * Not normalised.  Scaling by the coefficient sum would put 5.1
- * content 7.7 dB below the same material in a stereo file, which is a
- * surprising thing for a file's channel count to do to its volume;
- * the sum only reaches full scale when the channels are correlated,
- * and the mixer already clamps at its s16 and float boundaries.  The
- * trade is level for the possibility of clipping on correlated
- * material, and it is the trade most players make.
- *
-  * Q15 in int32 - unity is 32768, which does not fit the int16 the
- * coefficients would otherwise want, and wrapping it would invert a
- * channel rather than pass it.  The s16 fold stays clear of float. */
-#define AMIX_DM_UNITY 32768
-#define AMIX_DM_M3DB  23170
-#define AMIX_DM_M6DB  16384
-
+ * A voice mixes stereo, so anything wider is folded here - the arms
+ * deliberately do no channel conversion.  The fold for each arm's
+ * channel order is audio_transfer's (audio_transfer_fold_q15): Vorbis
+ * and Opus in Vorbis order, the rest in WAVE order, WMA by its speaker
+ * mask.  Q15 in int32; the s16 fold stays clear of float. */
 static int16_t audio_mixer_sat_s16_64(int64_t v)
 {
    if (v >  32767)
@@ -437,59 +402,6 @@ static int16_t audio_mixer_sat_s16_64(int64_t v)
    return (int16_t)v;
 }
 
-/* [channels][input channel][0 = left, 1 = right] */
-static const int32_t audio_mixer_downmix_vorbis_q15[9][8][2] = {
-   { {0,0} },                                              /* unused    */
-   { {0,0} },                                              /* mono      */
-   { {0,0} },                                              /* stereo    */
-   /* 3: L C R */
-   { {AMIX_DM_UNITY,0}, {AMIX_DM_M3DB,AMIX_DM_M3DB}, {0,AMIX_DM_UNITY} },
-   /* 4: L R RL RR */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB} },
-   /* 5: L C R RL RR */
-   { {AMIX_DM_UNITY,0}, {AMIX_DM_M3DB,AMIX_DM_M3DB}, {0,AMIX_DM_UNITY},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB} },
-   /* 6: L C R RL RR LFE */
-   { {AMIX_DM_UNITY,0}, {AMIX_DM_M3DB,AMIX_DM_M3DB}, {0,AMIX_DM_UNITY},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB}, {0,0} },
-   /* 7: L C R RL RR BC LFE */
-   { {AMIX_DM_UNITY,0}, {AMIX_DM_M3DB,AMIX_DM_M3DB}, {0,AMIX_DM_UNITY},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB},
-     {AMIX_DM_M6DB,AMIX_DM_M6DB}, {0,0} },
-   /* 8: L C R RL RR SL SR LFE */
-   { {AMIX_DM_UNITY,0}, {AMIX_DM_M3DB,AMIX_DM_M3DB}, {0,AMIX_DM_UNITY},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB}, {0,0} }
-};
-
-
-/* Microsoft/FLAC order. */
-static const int32_t audio_mixer_downmix_wav_q15[9][8][2] = {
-   { {0,0} },                                              /* unused    */
-   { {0,0} },                                              /* mono      */
-   { {0,0} },                                              /* stereo    */
-   /* 3: FL FR FC */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY}, {AMIX_DM_M3DB,AMIX_DM_M3DB} },
-   /* 4: FL FR BL BR */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB} },
-   /* 5: FL FR FC BL BR */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY}, {AMIX_DM_M3DB,AMIX_DM_M3DB},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB} },
-   /* 6: FL FR FC LFE BL BR */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY}, {AMIX_DM_M3DB,AMIX_DM_M3DB},
-     {0,0}, {AMIX_DM_M3DB,0}, {0,AMIX_DM_M3DB} },
-   /* 7: FL FR FC LFE BC SL SR */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY}, {AMIX_DM_M3DB,AMIX_DM_M3DB},
-     {0,0}, {AMIX_DM_M6DB,AMIX_DM_M6DB},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB} },
-   /* 8: FL FR FC LFE BL BR SL SR */
-   { {AMIX_DM_UNITY,0}, {0,AMIX_DM_UNITY}, {AMIX_DM_M3DB,AMIX_DM_M3DB},
-     {0,0}, {AMIX_DM_M3DB,0}, {0,AMIX_DM_M3DB},
-     {AMIX_DM_M3DB,0},  {0,AMIX_DM_M3DB} }
-};
-
 /* Which order an arm hands its channels over in. */
 static const int32_t (*audio_mixer_downmix_table(
       enum audio_type_enum type, unsigned ch, const audio_mixer_voice_t *voice))[2]
@@ -498,15 +410,7 @@ static const int32_t (*audio_mixer_downmix_table(
 #ifdef HAVE_RWMA
    if (type == AUDIO_TYPE_WMA) return voice->types.stream.wma_matrix;
 #endif
-   switch (type)
-   {
-      case AUDIO_TYPE_VORBIS:
-      case AUDIO_TYPE_OPUS:
-         return audio_mixer_downmix_vorbis_q15[ch];
-      default:
-         break;
-   }
-   return audio_mixer_downmix_wav_q15[ch];
+   return audio_transfer_fold_q15(type, ch);
 }
 
 /* Frames a temp buffer of 'samples' holds at 'ch' channels: what a
@@ -596,7 +500,7 @@ static float wav_sample_unit(const rwav_t *wav, const uint8_t *src,
 static void wav_fold_to_stereo(const rwav_t *wav, const uint8_t *src,
       float *dst, size_t frames)
 {
-   const int32_t (*co)[2] = audio_mixer_downmix_wav_q15[wav->numchannels];
+   const int32_t (*co)[2] = audio_transfer_fold_q15(AUDIO_TYPE_WAV, wav->numchannels);
    size_t i;
    for (i = 0; i < frames; i++)
    {
@@ -674,7 +578,7 @@ static bool wav_to_float(const rwav_t* wav, const uint8_t* src,
       got = rwav_decode_s16(&h, src, 0, wav->numsamples, tmp);
       {
          const int32_t (*co)[2] =
-               audio_mixer_downmix_wav_q15[wav->numchannels];
+               audio_transfer_fold_q15(AUDIO_TYPE_WAV, wav->numchannels);
          unsigned c;
          for (i = 0; i < got; i++)
          {
@@ -1017,7 +921,7 @@ static bool wav_to_s16(const rwav_t* wav, const uint8_t* src,
       got = rwav_decode_s16(&h, src, 0, wav->numsamples, tmp);
       {
          const int32_t (*co)[2] =
-               audio_mixer_downmix_wav_q15[wav->numchannels];
+               audio_transfer_fold_q15(AUDIO_TYPE_WAV, wav->numchannels);
          unsigned c;
          for (i = 0; i < got; i++)
          {
@@ -1046,7 +950,7 @@ static bool wav_to_s16(const rwav_t* wav, const uint8_t* src,
       size_t   i2;
       unsigned c;
       const int32_t (*co)[2] =
-            audio_mixer_downmix_wav_q15[wav->numchannels];
+            audio_transfer_fold_q15(AUDIO_TYPE_WAV, wav->numchannels);
       for (i2 = 0; i2 < wav->numsamples; i2++)
       {
          int64_t l = 0, r = 0;
@@ -1407,20 +1311,48 @@ audio_mixer_sound_t* audio_mixer_load_mp3(void *buffer, size_t size)
    return NULL;
 }
 
-audio_mixer_sound_t* audio_mixer_load_m4a(void *buffer, size_t size)
+audio_mixer_sound_t* audio_mixer_load_m4a_track_avail(void *buffer, size_t size,
+      size_t avail, int track)
 {
 #ifdef HAVE_RAAC
-   audio_mixer_sound_t* sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
+   audio_mixer_sound_t* sound;
+#endif
+#if defined(HAVE_RAC3) && defined(HAVE_RMP4)
+   if (audio_transfer_mp4_audio_track_type(buffer, size, avail, track) == AUDIO_TYPE_AC3)
+   {
+      audio_mixer_sound_t *ac3 = audio_mixer_load_ac3(buffer, size);
+      if (ac3) ac3->container_track = (unsigned)track + 1;
+      return ac3;
+   }
+#endif
+   (void)avail;
+#ifdef HAVE_RAAC
+   if (track < -1)
+      return NULL;
+   sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound));
 
    if (sound)
    {
       sound->type              = AUDIO_MIXER_TYPE_M4A;
+      sound->container_track   = (unsigned)track + 1;
       sound->types.stream.size = size;
       sound->types.stream.data = buffer;
       return sound;
    }
+#else
+   (void)buffer; (void)size; (void)track;
 #endif
    return NULL;
+}
+
+audio_mixer_sound_t* audio_mixer_load_m4a_track(void *buffer, size_t size, int track)
+{
+   return audio_mixer_load_m4a_track_avail(buffer, size, size, track);
+}
+
+audio_mixer_sound_t* audio_mixer_load_m4a(void *buffer, size_t size)
+{
+   return audio_mixer_load_m4a_track(buffer, size, -1);
 }
 
 audio_mixer_sound_t* audio_mixer_load_ac3(void *buffer, size_t size)
@@ -1487,8 +1419,8 @@ audio_mixer_sound_t* audio_mixer_load_opus(void *buffer, size_t size)
    return NULL;
 }
 
-audio_mixer_sound_t* audio_mixer_load_weba_avail(void *buffer, size_t size,
-      size_t avail)
+audio_mixer_sound_t* audio_mixer_load_weba_track(void *buffer, size_t size,
+      size_t avail, int track)
 {
 #if defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS) \
  || defined(HAVE_RAAC) || defined(HAVE_RFLAC))
@@ -1498,8 +1430,8 @@ audio_mixer_sound_t* audio_mixer_load_weba_avail(void *buffer, size_t size,
     * with the whole file's length it walked the segment straight off
     * the committed head of a windowed buffer and died inside
     * rwebm_open_memory_avail. */
-   enum audio_type_enum ty = audio_transfer_webm_audio_type(buffer,
-         (avail && avail < size) ? avail : size);
+   enum audio_type_enum ty = audio_transfer_webm_audio_track_type(buffer,
+         (avail && avail < size) ? avail : size, track);
    enum audio_mixer_type mt;
 
    /* Resolve to the existing sound type whose streaming arm accepts
@@ -1522,13 +1454,20 @@ audio_mixer_sound_t* audio_mixer_load_weba_avail(void *buffer, size_t size,
    if (!(sound = (audio_mixer_sound_t*)calloc(1, sizeof(*sound))))
       return NULL;
    sound->type           = mt;
+   sound->container_track = (unsigned)track + 1;
    sound->types.stream.size = size;
    sound->types.stream.data = buffer;
    return sound;
 #else
-   (void)avail;
+   (void)buffer; (void)size; (void)avail; (void)track;
    return NULL;
 #endif
+}
+
+audio_mixer_sound_t* audio_mixer_load_weba_avail(void *buffer, size_t size,
+      size_t avail)
+{
+   return audio_mixer_load_weba_track(buffer, size, avail, -1);
 }
 
 audio_mixer_sound_t* audio_mixer_load_weba(void *buffer, size_t size)
@@ -1602,7 +1541,9 @@ bool audio_mixer_sound_set_prepared_transfer(audio_mixer_sound_t *sound,
    if (!sound || !transfer || !mix_rate || sound->prepared_transfer)
       return false;
    type = audio_mixer_sound_audio_type(sound);
-   if (type == AUDIO_TYPE_NONE || !audio_transfer_is_valid(transfer, type))
+   if (type == AUDIO_TYPE_NONE || !audio_transfer_is_valid(transfer, type)
+         || (sound->container_track && audio_transfer_container_track(transfer, type)
+               != (int)(sound->container_track - 1)))
       return false;
    sound->prepared_transfer = transfer;
    sound->prepared_type = type;
@@ -1856,6 +1797,12 @@ static void audio_mixer_feed_publish(audio_mixer_voice_t *voice)
 #endif
 #ifdef HAVE_RAAC
       case AUDIO_MIXER_TYPE_M4A: type = AUDIO_TYPE_AAC; break;
+#endif
+#ifdef HAVE_RAC3
+      case AUDIO_MIXER_TYPE_AC3: type = AUDIO_TYPE_AC3; break;
+#endif
+#ifdef HAVE_RFLAC
+      case AUDIO_MIXER_TYPE_FLAC: type = AUDIO_TYPE_FLAC; break;
 #endif
       default: break;
    }
@@ -2231,7 +2178,8 @@ static bool audio_mixer_play_stream(
       audio_transfer_set_buffer_ptr(xfer, type,
             (void*)sound->types.stream.data, sound->types.stream.size);
 
-#if (defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS))) \
+#if (defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS) \
+      || defined(HAVE_RAAC) || defined(HAVE_RFLAC))) \
     || (defined(HAVE_RAAC) && defined(HAVE_RMP4)) || defined(HAVE_RWMA)
       /* Windowed container: bound the header parse to the resident head,
        * so opening does not walk to the end of a file whose middle is
@@ -2274,6 +2222,10 @@ static bool audio_mixer_play_stream(
          }
       }
 #endif
+
+      if (sound->container_track && !audio_transfer_set_container_track(xfer,
+               type, (int)(sound->container_track - 1)))
+         goto error;
 
       if (!audio_transfer_start(xfer, type))
          goto error;
@@ -2406,7 +2358,8 @@ static bool audio_mixer_play_stream_s16(
    {
       audio_transfer_set_buffer_ptr(xfer, type,
             (void*)sound->types.stream.data, sound->types.stream.size);
-#if (defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS))) \
+#if (defined(HAVE_RWEBM) && (defined(HAVE_ROPUS) || defined(HAVE_RVORBIS) \
+      || defined(HAVE_RAAC) || defined(HAVE_RFLAC))) \
     || (defined(HAVE_RAAC) && defined(HAVE_RMP4)) || defined(HAVE_RWMA)
       /* Windowed container: bound the header parse to the head (see the
        * f32 path). */
@@ -2438,6 +2391,13 @@ static bool audio_mixer_play_stream_s16(
          }
       }
 #endif
+
+      if (sound->container_track && !audio_transfer_set_container_track(xfer,
+               type, (int)(sound->container_track - 1)))
+      {
+         audio_transfer_free(xfer, type);
+         return false;
+      }
 
       if (!audio_transfer_start(xfer, type))
       {
@@ -2909,6 +2869,37 @@ again:
    }
 }
 
+/* The game audio a mix is summed onto without having been copied to
+ * the mix first. The first voice to mix reads it in place of the mix;
+ * what it leaves is copied across before the next voice. */
+static const int16_t *mix_base;
+static const int16_t *mix_base_start;
+static int16_t       *mix_base_dst;
+static size_t         mix_base_samples;
+
+static INLINE const int16_t *audio_mixer_base_take(const int16_t *buffer,
+      size_t samples)
+{
+   const int16_t *in;
+   if (!mix_base)
+      return buffer;
+   in        = mix_base;
+   mix_base += samples;
+   return in;
+}
+
+static void audio_mixer_base_flush(void)
+{
+   size_t done;
+   if (!mix_base)
+      return;
+   done = (size_t)(mix_base - mix_base_start);
+   if (done < mix_base_samples)
+      memcpy(mix_base_dst + done, mix_base,
+            (mix_base_samples - done) * sizeof(int16_t));
+   mix_base = NULL;
+}
+
 static void audio_mixer_mix_wav_s16(int16_t* buffer, size_t num_frames,
       audio_mixer_voice_t* voice,
       int32_t gain_q16)
@@ -2920,14 +2911,16 @@ static void audio_mixer_mix_wav_s16(int16_t* buffer, size_t num_frames,
       * 2 - voice->types.wav.position;
    const int16_t* pcm               = sound->types.wav.pcm_s16 +
       voice->types.wav.position;
+   const int16_t* in;
 
 again:
    if (pcm_available < buf_free)
    {
       voice->mixed_frames += pcm_available / 2;
+      in = audio_mixer_base_take(buffer, pcm_available);
       for (i = pcm_available; i != 0; i--)
       {
-         *buffer = audio_mixer_sat_s16((int32_t)*buffer
+         *buffer = audio_mixer_sat_s16((int32_t)*in++
                + audio_mixer_gain_s16(*pcm++, gain_q16));
          buffer++;
       }
@@ -2951,9 +2944,10 @@ again:
    }
    else
    {
+      in = audio_mixer_base_take(buffer, buf_free);
       for (i = buf_free; i != 0; i--)
       {
-         *buffer = audio_mixer_sat_s16((int32_t)*buffer
+         *buffer = audio_mixer_sat_s16((int32_t)*in++
                + audio_mixer_gain_s16(*pcm++, gain_q16));
          buffer++;
       }
@@ -3086,15 +3080,16 @@ again:
       }
       else
       {
-         memcpy(voice->types.stream.buffer, temp_buffer,
-               temp_samples * sizeof(float));
          voice->types.stream.samples = temp_samples;
       }
 
       voice->types.stream.position = 0;
    }
 
-   pcm = voice->types.stream.buffer + voice->types.stream.position;
+   /* With no resampler the samples are read where they were decoded */
+   pcm = (voice->types.stream.resampler
+         ? voice->types.stream.buffer : temp_buffer)
+      + voice->types.stream.position;
 
    if (voice->types.stream.samples < buf_free)
    {
@@ -3127,6 +3122,7 @@ static void audio_mixer_mix_stream_s16(int16_t* buffer, size_t num_frames,
    int i;
    struct resampler_data_int16 info;
    int16_t *temp_buffer  = voice->types.stream.decode_buf_s16;
+   const int16_t *in;
    unsigned buf_free     = (unsigned)(num_frames * 2);
    unsigned temp_samples = 0;
    int16_t *pcm          = NULL;
@@ -3222,22 +3218,22 @@ again:
             voice->types.stream.samples = voice->types.stream.buf_samples;
       }
       else
-      {
-         memcpy(voice->types.stream.buffer_s16, temp_buffer,
-               temp_samples * sizeof(int16_t));
          voice->types.stream.samples = temp_samples;
-      }
       voice->types.stream.position = 0;
    }
 
-   pcm = voice->types.stream.buffer_s16 + voice->types.stream.position;
+   /* With no resampler the samples are read where they were decoded */
+   pcm = (voice->types.stream.resampler_int16.data
+         ? voice->types.stream.buffer_s16 : temp_buffer)
+      + voice->types.stream.position;
 
    if (voice->types.stream.samples < buf_free)
    {
       voice->mixed_frames += voice->types.stream.samples / 2;
+      in = audio_mixer_base_take(buffer, voice->types.stream.samples);
       for (i = voice->types.stream.samples; i != 0; i--)
       {
-         *buffer = audio_mixer_sat_s16((int32_t)*buffer
+         *buffer = audio_mixer_sat_s16((int32_t)*in++
                + audio_mixer_gain_s16(*pcm++, gain_q16));
          buffer++;
       }
@@ -3247,9 +3243,10 @@ again:
       goto again;
    }
 
+   in = audio_mixer_base_take(buffer, buf_free);
    for (i = buf_free; i != 0; --i)
    {
-      *buffer = audio_mixer_sat_s16((int32_t)*buffer
+      *buffer = audio_mixer_sat_s16((int32_t)*in++
             + audio_mixer_gain_s16(*pcm++, gain_q16));
       buffer++;
    }
@@ -3368,6 +3365,17 @@ void audio_mixer_mix(float* buffer, size_t num_frames,
    }
 }
 
+void audio_mixer_mix_s16_over(int16_t *dst, const int16_t *base,
+      size_t num_frames, int32_t gain_override, bool override)
+{
+   mix_base         = base;
+   mix_base_start   = base;
+   mix_base_dst     = dst;
+   mix_base_samples = num_frames * 2;
+   audio_mixer_mix_s16(dst, num_frames, gain_override, override);
+   audio_mixer_base_flush();
+}
+
 void audio_mixer_mix_s16(int16_t* buffer, size_t num_frames,
       int32_t gain_override, bool override)
 {
@@ -3459,6 +3467,7 @@ void audio_mixer_mix_s16(int16_t* buffer, size_t num_frames,
             break;
       }
 
+      audio_mixer_base_flush();
       audio_mixer_feed_publish(voice);
       audio_mixer_voice_disown(voice);
    }

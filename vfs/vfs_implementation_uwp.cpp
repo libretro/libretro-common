@@ -245,6 +245,53 @@ int64_t retro_vfs_file_write_impl(libretro_vfs_implementation_file* stream, cons
     return write(stream->fd, s, (size_t)len);
 }
 
+
+/* No gathered write here: one write per piece, as the C backend does
+ * where the platform has no writev() */
+int64_t retro_vfs_file_writev_impl(libretro_vfs_implementation_file *stream,
+      const struct retro_vfs_span *spans, size_t count)
+{
+   int64_t total = 0;
+   size_t  i;
+   if (!stream || (count && !spans))
+      return -1;
+   for (i = 0; i < count; i++)
+   {
+      int64_t one;
+      if (!spans[i].len)
+         continue;
+      if ((one = retro_vfs_file_write_impl(stream, spans[i].data,
+                  spans[i].len)) < 0)
+         return total ? total : -1;
+      total += one;
+      if ((uint64_t)one < spans[i].len)
+         break;
+   }
+   return total;
+}
+
+/* No positional I/O here: one handle, one position. The caller seeks and
+ * reads, as the C backend's callers do where it answers -1. */
+int64_t retro_vfs_file_read_at_impl(libretro_vfs_implementation_file *stream,
+      void *s, uint64_t len, int64_t offset)
+{
+   (void)stream;
+   (void)s;
+   (void)len;
+   (void)offset;
+   return -1;
+}
+
+int64_t retro_vfs_file_write_at_impl(libretro_vfs_implementation_file *stream,
+      const void *s, uint64_t len, int64_t offset)
+{
+   (void)stream;
+   (void)s;
+   (void)len;
+   (void)offset;
+   return -1;
+}
+
 int retro_vfs_file_flush_impl(libretro_vfs_implementation_file* stream)
 {
     if (stream && fflush(stream->fp) == 0)
@@ -288,6 +335,15 @@ libretro_vfs_implementation_file* retro_vfs_file_open_impl(
 
     if (!stream)
         return NULL;
+
+    /* A stable open promises what this backend can't keep (a handle no
+     * one else can write through, a regular file vouched for by its
+     * handle), so it is refused rather than quietly opened */
+    if (hints & RETRO_VFS_FILE_ACCESS_HINT_IMPL_STABLE)
+    {
+        free(stream);
+        return NULL;
+    }
 
     stream->fd        = 0;
     stream->hints     = hints;
@@ -531,6 +587,50 @@ int retro_vfs_restrict_permissions_impl(const char* path)
     return 0;
 }
 
+/* MoveFileFromAppW cannot replace an existing file, so a destination in
+ * the way is moved aside, the source moved into place, and the moved-aside
+ * copy deleted only then - or put back if the source could not be moved.
+ * A leftover aside from an interrupted run is removed only when it is in
+ * the way, and never if it is the source being restored. */
+static bool uwp_move_file_replacing(const std::wstring &old_path,
+      const std::wstring &new_path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA target_info;
+    std::wstring aside;
+
+    /* Names differing only in case are one file here: moving it aside
+     * would take the source along. */
+    if (     _wcsicmp(old_path.c_str(), new_path.c_str()) != 0
+          && GetFileAttributesExFromAppW(new_path.c_str(),
+                GetFileExInfoStandard, &target_info)
+          && target_info.dwFileAttributes != INVALID_FILE_ATTRIBUTES
+          && target_info.dwFileAttributes != 0
+          && !(target_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+    {
+        aside = new_path + L".old";
+        if (_wcsicmp(aside.c_str(), old_path.c_str()) == 0)
+            aside += L"2";
+        /* All three return nonzero on success. */
+        if (     !MoveFileFromAppW(new_path.c_str(), aside.c_str())
+              && (     !DeleteFileFromAppW(aside.c_str())
+                    || !MoveFileFromAppW(new_path.c_str(), aside.c_str())))
+            return false;
+    }
+
+    if (!MoveFileFromAppW(old_path.c_str(), new_path.c_str()))
+    {
+        if (!aside.empty())
+            MoveFileFromAppW(aside.c_str(), new_path.c_str());
+        return false;
+    }
+
+    if (!aside.empty())
+        DeleteFileFromAppW(aside.c_str());
+    /* Set ACL */
+    uwp_set_acl(new_path.c_str(), L"S-1-15-2-1");
+    return true;
+}
+
 /* The first run parameter is used to avoid error checking
  * when doing recursion.
  * Unlike the initial implementation, this can move folders
@@ -548,7 +648,7 @@ static int uwp_move_path(
 
     if (firstrun)
     {
-        WIN32_FILE_ATTRIBUTE_DATA lpFileInfo, targetfileinfo;
+        WIN32_FILE_ATTRIBUTE_DATA lpFileInfo;
         bool parent_dir_exists = false;
 
         /* Make sure that parent path exists */
@@ -587,31 +687,8 @@ static int uwp_move_path(
                 }
                 else
                 {
-                    /* The file that we want to move exists so we can copy it now
-                     * check if target file already exists. */
-                   if (GetFileAttributesExFromAppW(
-                            new_path.wstring().c_str(),
-                            GetFileExInfoStandard,
-                            &targetfileinfo))
-                    {
-                        if (
-                                 targetfileinfo.dwFileAttributes != INVALID_FILE_ATTRIBUTES
-                              && targetfileinfo.dwFileAttributes != 0
-                              && (!(targetfileinfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)))
-                        {
-                            /* DeleteFileFromAppW returns nonzero on
-                             * success; MoveFileFromAppW cannot replace
-                             * an existing destination. */
-                            if (!DeleteFileFromAppW(new_path.wstring().c_str()))
-                                return -1;
-                        }
-                    }
-
-                    if (!MoveFileFromAppW(old_path.wstring().c_str(),
-                             new_path.wstring().c_str()))
+                    if (!uwp_move_file_replacing(old_path.wstring(), new_path.wstring()))
                         return -1;
-                    /* Set ACL */
-                    uwp_set_acl(new_path.wstring().c_str(), L"S-1-15-2-1");
                 }
             }
             else
@@ -654,34 +731,8 @@ static int uwp_move_path(
                 }
                 else
                 {
-                   WIN32_FILE_ATTRIBUTE_DATA targetfileinfo;
-                   /* The file that we want to move exists so we can copy
-                    * it now.
-                    * Check if target file already exists. */
-                   if (GetFileAttributesExFromAppW(temp_new.wstring().c_str(),
-                            GetFileExInfoStandard, &targetfileinfo))
-                   {
-                      if (
-                               (targetfileinfo.dwFileAttributes !=
-                                INVALID_FILE_ATTRIBUTES)
-                            && (targetfileinfo.dwFileAttributes != 0)
-                            && (!(targetfileinfo.dwFileAttributes
-                                  & FILE_ATTRIBUTE_DIRECTORY)))
-                      {
-                         /* Nonzero is success. */
-                         if (!DeleteFileFromAppW(temp_new.wstring().c_str()))
-                            fail = true;
-                      }
-                   }
-
-                   if (!MoveFileFromAppW(temp_old.wstring().c_str(),
-                            temp_new.wstring().c_str()))
+                   if (!uwp_move_file_replacing(temp_old.wstring(), temp_new.wstring()))
                       fail = true;
-                   /* Set ACL - this step sucks or at least used to
-                    * before I made a whole function
-                    * Don't know if we actually "need" to set the ACL
-                    * though */
-                   uwp_set_acl(temp_new.wstring().c_str(), L"S-1-15-2-1");
                 }
              }
           } while (FindNextFile(searchResults, &findDataResult));
@@ -713,6 +764,23 @@ const char *retro_vfs_file_get_path_impl(libretro_vfs_implementation_file *strea
    if (!stream)
       abort();
    return stream->orig_path;
+}
+
+/* Neither is answerable from inside the app container. */
+int retro_vfs_file_get_real_path_impl(libretro_vfs_implementation_file *stream,
+      char *s, size_t len)
+{
+   (void)stream;
+   (void)s;
+   (void)len;
+   return -1;
+}
+
+int retro_vfs_resolve_path_impl(char *s, size_t len)
+{
+   (void)s;
+   (void)len;
+   return -1;
 }
 
 int64_t retro_vfs_file_get_sparse_granularity_impl(
@@ -763,6 +831,84 @@ const uint8_t *retro_vfs_file_get_mapped_ptr_impl(
     * is installed, and this file replaces vfs_implementation.c
     * wholesale on UWP, so leaving it out is a link error rather than
     * a fallback. */
+   (void)stream;
+   if (len)
+      *len = 0;
+   return NULL;
+}
+
+bool retro_vfs_file_identity_impl(libretro_vfs_implementation_file *stream,
+      struct retro_vfs_file_identity *id)
+{
+   /* Only a stable or descriptor-path stream has one, and this backend
+    * opens neither. Defined because it replaces vfs_implementation.c. */
+   (void)stream;
+   if (id)
+      memset(id, 0, sizeof(*id));
+   return false;
+}
+
+libretro_vfs_implementation_file *retro_vfs_file_open_stable_impl(
+      const char *path, struct retro_vfs_file_identity *id)
+{
+   /* No stable open on this backend: see retro_vfs_file_open_impl() */
+   (void)path;
+   if (id)
+      memset(id, 0, sizeof(*id));
+   return NULL;
+}
+
+int retro_vfs_stat_identity_impl(const char *path,
+      struct retro_vfs_file_identity *id)
+{
+   /* Not on this backend: it can't be told */
+   (void)path;
+   if (id)
+      memset(id, 0, sizeof(*id));
+   return -1;
+}
+
+bool retro_vfs_file_volume_impl(libretro_vfs_implementation_file *stream,
+      unsigned want, struct retro_vfs_volume *vol)
+{
+   /* Not on this backend */
+   (void)stream;
+   (void)want;
+   if (vol)
+      memset(vol, 0, sizeof(*vol));
+   return false;
+}
+
+int retro_vfs_stat_volume_impl(const char *path, unsigned want,
+      struct retro_vfs_volume *vol)
+{
+   (void)path;
+   (void)want;
+   if (vol)
+      memset(vol, 0, sizeof(*vol));
+   return -1;
+}
+
+size_t retro_vfs_file_verity_measure_impl(
+      libretro_vfs_implementation_file *stream, uint8_t *digest, size_t cap)
+{
+   /* No fs-verity here */
+   (void)stream;
+   (void)digest;
+   (void)cap;
+   return 0;
+}
+
+int retro_vfs_file_verity_enable_impl(
+      libretro_vfs_implementation_file *stream)
+{
+   return stream ? 0 : -1;
+}
+
+const uint8_t *retro_vfs_file_map_impl(libretro_vfs_implementation_file *stream,
+      int64_t *len)
+{
+   /* No mapping on this backend, as retro_vfs_file_get_mapped_ptr_impl */
    (void)stream;
    if (len)
       *len = 0;
@@ -1043,7 +1189,7 @@ struct retro_vfs_copy_handle *retro_vfs_copy_begin_impl(
     if (!h->in)
         goto fail;
     h->out = retro_vfs_file_open_impl(dst, RETRO_VFS_FILE_ACCESS_WRITE,
-            RETRO_VFS_FILE_ACCESS_HINT_NONE);
+            RETRO_VFS_FILE_ACCESS_HINT_SEQUENTIAL_BULK);
     if (!h->out)
         goto fail;
     return h;

@@ -55,7 +55,15 @@
  *     at least once, since a run with no overlap has tested nothing.
  *     This is the shape gfx/video_driver.c publishes its cached frame
  *     with, and the reason the relaxed forms exist.
- *  9. The test prints which backend was selected and whether
+ *  9. The 128-bit word, where there is one (RETRO_ATOMIC_HAS_128):
+ *     its operations on one thread, then four threads counting with
+ *     compare-and-swap loops and one storing and exchanging against
+ *     four readers.  The word holds a pair whose halves are each
+ *     other's complement, so a load made of two values' halves, a lost
+ *     update or a failed compare-and-swap that reports a torn value is
+ *     seen.  Each half alone is read beside the whole, by the same
+ *     readers: the low half never goes back, the high one never forward.
+ * 10. The test prints which backend was selected and whether
  *     RETRO_ATOMIC_LOCK_FREE is defined, so a CI diff makes accidental
  *     backend regressions obvious.
  *
@@ -106,6 +114,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 /* Model headers that remove this Windows macro before or after inclusion. */
 #ifdef _WIN32
@@ -328,6 +337,126 @@ static int check_relaxed_store_load(void)
  * accessors exist.  A reader that samples an even stamp, reads the
  * fields, and sees the same stamp afterwards must have a tuple from
  * one writer pass -- here, three fields that always sum to zero. */
+/* The acq_rel fence: a load before it may not drift below it and a
+ * store after it may not rise above it.  Given external linkage so it is
+ * not folded into its caller, and check-barriers.sh can find it: on
+ * aarch64 it is one full "dmb ish", where an acquire fence and then a
+ * release fence would be two barriers. */
+int acq_rel_fence_shape(retro_atomic_int_t *in, retro_atomic_int_t *out);
+int acq_rel_fence_shape(retro_atomic_int_t *in, retro_atomic_int_t *out)
+{
+   int seen = retro_atomic_load_relaxed_int(in);
+   retro_atomic_thread_fence_acq_rel();
+   retro_atomic_store_relaxed_int(out, seen + 1);
+   return seen;
+}
+
+/* The seq_cst fence, for check-x86-fence.sh: on x86 a locked or, never
+ * an mfence, whichever of GCC and Clang builds it. */
+void seq_cst_fence_shape(retro_atomic_int_t *a, retro_atomic_int_t *b);
+void seq_cst_fence_shape(retro_atomic_int_t *a, retro_atomic_int_t *b)
+{
+   retro_atomic_store_relaxed_int(a, 1);
+   retro_atomic_thread_fence_seq_cst();
+   retro_atomic_store_relaxed_int(b, retro_atomic_load_relaxed_int(a));
+}
+
+#ifdef RETRO_ATOMIC_HAS_128
+/* The 128-bit release store, for check-barriers.sh: on aarch64 one
+ * exclusive-pair loop, with no compare of a value read first. */
+void store_128_shape(retro_atomic_128_t *w, retro_u128_t v);
+void store_128_shape(retro_atomic_128_t *w, retro_u128_t v)
+{
+   retro_atomic_store_release_128(w, v);
+}
+#endif
+
+#ifdef RETRO_ATOMIC_HAS_8_16
+/* The byte and halfword accesses, for check-barriers.sh: on aarch64 an
+ * ldarb, an stlrb, an ldarh and an stlrh, each one access of its width. */
+unsigned load_acquire_8_shape(retro_atomic_8_t *p);
+unsigned load_acquire_8_shape(retro_atomic_8_t *p)
+{
+   return retro_atomic_load_acquire_8(p);
+}
+void store_release_8_shape(retro_atomic_8_t *p, unsigned v);
+void store_release_8_shape(retro_atomic_8_t *p, unsigned v)
+{
+   retro_atomic_store_release_8(p, v);
+}
+unsigned load_acquire_16_shape(retro_atomic_16_t *p);
+unsigned load_acquire_16_shape(retro_atomic_16_t *p)
+{
+   return retro_atomic_load_acquire_16(p);
+}
+void store_release_16_shape(retro_atomic_16_t *p, unsigned v);
+void store_release_16_shape(retro_atomic_16_t *p, unsigned v)
+{
+   retro_atomic_store_release_16(p, v);
+}
+
+/* Each operation once, and a store to one byte or halfword leaves the
+ * ones next to it as they were */
+static int check_8_16_single_thread(void)
+{
+   retro_atomic_8_t  b[4];
+   retro_atomic_16_t h[2];
+   int i;
+
+   for (i = 0; i < 4; i++)
+      retro_atomic_8_init(&b[i], 0x10 + i);
+   retro_atomic_16_init(&h[0], 0x1234);
+   retro_atomic_16_init(&h[1], 0x5678);
+
+   retro_atomic_store_release_8(&b[1], 0xff);
+   retro_atomic_store_relaxed_8(&b[2], 0x80);
+   if (retro_atomic_load_acquire_8(&b[0]) != 0x10
+         || retro_atomic_load_acquire_8(&b[1]) != 0xff
+         || retro_atomic_load_relaxed_8(&b[2]) != 0x80
+         || retro_atomic_load_acquire_8(&b[3]) != 0x13
+         || retro_atomic_exchange_8(&b[3], 0x01) != 0x13
+         || retro_atomic_load_acquire_8(&b[3]) != 0x01
+         || retro_atomic_load_acquire_8(&b[2]) != 0x80)
+   {
+      fprintf(stderr, "FAIL 8-bit: load, store or exchange, or a neighbour changed\n");
+      return 1;
+   }
+
+   retro_atomic_store_release_16(&h[0], 0xfffe);
+   retro_atomic_store_relaxed_16(&h[1], 0x0001);
+   if (retro_atomic_load_acquire_16(&h[0]) != 0xfffe
+         || retro_atomic_load_relaxed_16(&h[1]) != 0x0001
+         || retro_atomic_exchange_16(&h[1], 0xabcd) != 0x0001
+         || retro_atomic_load_acquire_16(&h[1]) != 0xabcd
+         || retro_atomic_load_acquire_16(&h[0]) != 0xfffe)
+   {
+      fprintf(stderr, "FAIL 16-bit: load, store or exchange, or a neighbour changed\n");
+      return 1;
+   }
+
+   printf("[pass] 8- and 16-bit: load, store, exchange, neighbours untouched\n");
+   return 0;
+}
+#endif
+
+static int check_acq_rel_fence(void)
+{
+   retro_atomic_int_t in, out;
+
+   retro_atomic_int_init(&in, 41);
+   retro_atomic_int_init(&out, 0);
+
+   if (acq_rel_fence_shape(&in, &out) != 41
+         || retro_atomic_load_acquire_int(&out) != 42)
+   {
+      fprintf(stderr, "FAIL acq_rel fence: a load or store across it\n");
+      return 1;
+   }
+
+   printf("[pass] acq_rel fence\n");
+   return 0;
+}
+
 static int check_seqlock_shape(void)
 {
    retro_atomic_size_t seq;
@@ -843,6 +972,391 @@ static int check_publication_values(void)
    return 0;
 }
 
+#if defined(RETRO_ATOMIC_HAS_8_16) && defined(HAVE_THREADS)
+/* Four threads each own one byte of a shared word and store and exchange
+ * it over and over: none of their stores may land on a neighbour's byte,
+ * as one done by reading and writing back the whole word would */
+#define BYTES_ROUNDS 200000
+static retro_atomic_8_t bytes_word[4];
+static void bytes_worker(void *arg)
+{
+   int me = (int)(intptr_t)arg;
+   int i;
+   for (i = 0; i < BYTES_ROUNDS; i++)
+   {
+      unsigned v = (unsigned)((i * 4 + me) & 0xff);
+      retro_atomic_store_release_8(&bytes_word[me], v);
+      if (retro_atomic_load_acquire_8(&bytes_word[me]) != v
+            || retro_atomic_exchange_8(&bytes_word[me], v ^ 0xff) != v)
+      {
+         retro_atomic_store_release_8(&bytes_word[me], 0x5a);
+         return;
+      }
+   }
+   retro_atomic_store_release_8(&bytes_word[me], 0xa0 + me);
+}
+
+static int check_8_stress(void)
+{
+   sthread_t *t[4];
+   int i, bad = 0;
+   for (i = 0; i < 4; i++)
+      retro_atomic_8_init(&bytes_word[i], 0);
+   for (i = 0; i < 4; i++)
+      if (!(t[i] = sthread_create(bytes_worker, (void*)(intptr_t)i)))
+      {
+         fprintf(stderr, "FAIL 8-bit stress: sthread_create returned NULL\n");
+         return 1;
+      }
+   for (i = 0; i < 4; i++)
+      sthread_join(t[i]);
+   for (i = 0; i < 4; i++)
+      if (retro_atomic_load_acquire_8(&bytes_word[i]) != (unsigned)(0xa0 + i))
+         bad++;
+   if (bad)
+   {
+      fprintf(stderr, "FAIL 8-bit stress: %d of 4 threads' bytes lost or overwritten\n", bad);
+      return 1;
+   }
+   printf("[pass] 8-bit stress: 4 threads, a byte each in one word, %d rounds, none lost\n", BYTES_ROUNDS);
+   return 0;
+}
+#endif
+
+/* ---- The 128-bit word ---------------------------------------------------
+ *
+ * Where RETRO_ATOMIC_HAS_128 is set: load, store, exchange and both
+ * compare-and-swaps on one thread, then a stress.  The word always
+ * holds a pair whose high half is the complement of its low half.
+ * Four threads count the low half up with compare-and-swap loops, one
+ * stores and exchanges pairs of its own, and four read: a load that
+ * came back as halves of two pairs does not have that shape, a lost
+ * update leaves the count short, and what a failed compare-and-swap
+ * reports is checked for the shape as well. */
+
+#ifdef RETRO_ATOMIC_HAS_128
+
+static retro_u128_t pair_of(uint64_t lo)
+{
+   retro_u128_t v;
+   v.lo = lo;
+   v.hi = ~lo;
+   return v;
+}
+
+static int check_128_single_thread(void)
+{
+   retro_atomic_128_t w;
+   retro_u128_t v, seen;
+   int fails = 0;
+
+   if (sizeof(retro_atomic_128_t) != 16
+         || ((size_t)&w & 15) != 0)
+   {
+      fprintf(stderr, "FAIL 128: the word is not 16 bytes aligned to 16\n");
+      fails++;
+   }
+
+   v.lo = 0x0123456789abcdefULL;
+   v.hi = 0xfedcba9876543210ULL;
+   retro_atomic_128_init(&w, v);
+   seen = retro_atomic_load_acquire_128(&w);
+   if (seen.lo != v.lo || seen.hi != v.hi)
+   {
+      fprintf(stderr, "FAIL 128: init then load\n");
+      fails++;
+   }
+
+   /* lo is the word at the lower address */
+   if (((const uint64_t*)&w)[0] != v.lo || ((const uint64_t*)&w)[1] != v.hi)
+   {
+      fprintf(stderr, "FAIL 128: halves in the wrong order\n");
+      fails++;
+   }
+
+   retro_atomic_store_release_128(&w, pair_of(7));
+   seen = retro_atomic_load_acquire_128(&w);
+   if (seen.lo != 7 || seen.hi != ~(uint64_t)7)
+   {
+      fprintf(stderr, "FAIL 128: store then load\n");
+      fails++;
+   }
+
+   seen = retro_atomic_exchange_128(&w, pair_of(8));
+   if (seen.lo != 7 || seen.hi != ~(uint64_t)7
+         || retro_atomic_load_acquire_128(&w).lo != 8)
+   {
+      fprintf(stderr, "FAIL 128: exchange\n");
+      fails++;
+   }
+
+   /* A compare-and-swap that differs in one half only must fail */
+   v = pair_of(8);
+   v.hi ^= 1;
+   if (retro_atomic_cas_128(&w, v, pair_of(9))
+         || retro_atomic_load_acquire_128(&w).lo != 8)
+   {
+      fprintf(stderr, "FAIL 128: cas took a value whose high half differs\n");
+      fails++;
+   }
+   v = pair_of(8);
+   v.lo ^= 1;
+   if (retro_atomic_cas_128(&w, v, pair_of(9))
+         || retro_atomic_load_acquire_128(&w).lo != 8)
+   {
+      fprintf(stderr, "FAIL 128: cas took a value whose low half differs\n");
+      fails++;
+   }
+
+   if (!retro_atomic_cas_128(&w, pair_of(8), pair_of(9))
+         || retro_atomic_load_acquire_128(&w).lo != 9
+         || retro_atomic_load_acquire_128(&w).hi != ~(uint64_t)9)
+   {
+      fprintf(stderr, "FAIL 128: cas with the expected value\n");
+      fails++;
+   }
+
+   /* The failed one says what was there, and leaves it there */
+   seen = pair_of(1);
+   if (retro_atomic_cas_seen_128(&w, &seen, pair_of(2))
+         || seen.lo != 9 || seen.hi != ~(uint64_t)9
+         || retro_atomic_load_acquire_128(&w).lo != 9)
+   {
+      fprintf(stderr, "FAIL 128: cas_seen did not report what was there\n");
+      fails++;
+   }
+   if (!retro_atomic_cas_seen_128(&w, &seen, pair_of(2))
+         || seen.lo != 9
+         || retro_atomic_load_acquire_128(&w).lo != 2)
+   {
+      fprintf(stderr, "FAIL 128: cas_seen with the value it reported\n");
+      fails++;
+   }
+   if (retro_atomic_load_acquire_128_lo(&w) != 2
+         || retro_atomic_load_acquire_128_hi(&w) != ~(uint64_t)2)
+   {
+      fprintf(stderr, "FAIL 128: a half alone is not that half\n");
+      fails++;
+   }
+
+   if (!fails)
+      printf("[pass] 128-bit word: load, store, exchange, cas\n");
+   return fails;
+}
+
+#ifdef HAVE_THREADS
+
+#define W128_COUNTERS 4
+#define W128_READERS  4
+#define W128_COUNTS   200000
+
+typedef struct
+{
+   retro_atomic_128_t word;
+   retro_atomic_int_t counters_done;
+   retro_atomic_int_t torn;
+   retro_atomic_int_t retries;
+} w128_state_t;
+
+static void w128_counter(void *userdata)
+{
+   w128_state_t *st = (w128_state_t*)userdata;
+   int i;
+
+   for (i = 0; i < W128_COUNTS; i++)
+   {
+      retro_u128_t seen = retro_atomic_load_acquire_128(&st->word);
+
+      for (;;)
+      {
+         if (seen.hi != ~seen.lo)
+            retro_atomic_inc_int(&st->torn);
+         if (retro_atomic_cas_seen_128(&st->word, &seen,
+                  pair_of(seen.lo + 1)))
+            break;
+         retro_atomic_inc_int(&st->retries);
+      }
+   }
+
+   retro_atomic_inc_int(&st->counters_done);
+}
+
+static void w128_reader(void *userdata)
+{
+   w128_state_t *st = (w128_state_t*)userdata;
+   uint64_t last   = 0;
+   uint64_t last_lo = 0;
+   uint64_t last_hi = ~(uint64_t)0;
+
+   while (retro_atomic_load_acquire_int(&st->counters_done) < W128_COUNTERS)
+   {
+      retro_u128_t seen = retro_atomic_load_acquire_128(&st->word);
+      uint64_t lo, hi;
+
+      /* Whole, and never older than the one before */
+      if (seen.hi != ~seen.lo || seen.lo < last)
+         retro_atomic_inc_int(&st->torn);
+      last = seen.lo;
+
+      /* The halves alone: each the right one, and never older */
+      lo = retro_atomic_load_acquire_128_lo(&st->word);
+      hi = retro_atomic_load_acquire_128_hi(&st->word);
+      if (lo < last_lo || hi > last_hi || lo < last)
+         retro_atomic_inc_int(&st->torn);
+      last_lo = lo;
+      last_hi = hi;
+   }
+}
+
+/* Four threads exchanging values of their own in: each value put in
+ * comes out of exactly one exchange, or is the one left at the end.
+ * The sums say so; an exchange that is a load and a store apart loses
+ * values and hands others out twice. */
+typedef struct
+{
+   retro_atomic_128_t *word;
+   uint64_t            first;   /* this thread's values: first .. first + W128_COUNTS - 1 */
+   uint64_t            put;     /* their sum                  */
+   uint64_t            got;     /* the sum of what came back  */
+   int                 torn;
+} w128_swapper_t;
+
+static void w128_swapper(void *userdata)
+{
+   w128_swapper_t *sw = (w128_swapper_t*)userdata;
+   uint64_t n;
+
+   for (n = sw->first; n < sw->first + W128_COUNTS; n++)
+   {
+      retro_u128_t was = retro_atomic_exchange_128(sw->word, pair_of(n));
+
+      if (was.hi != ~was.lo)
+         sw->torn++;
+      sw->put += n;
+      sw->got += was.lo;
+   }
+}
+
+static int check_128_stress(void)
+{
+   w128_state_t   *st;
+   void           *block;
+   sthread_t      *counters[W128_COUNTERS];
+   sthread_t      *readers[W128_READERS];
+   retro_u128_t    end;
+   int             i;
+   int             fails = 0;
+
+   /* malloc gives 16-byte alignment on the hosts that have the word,
+    * but the word asks for it itself: place it by hand */
+   block = malloc(sizeof(*st) + 16);
+   st    = (w128_state_t*)(((size_t)block + 15) & ~(size_t)15);
+   retro_atomic_128_init(&st->word, pair_of(0));
+   retro_atomic_int_init(&st->counters_done, 0);
+   retro_atomic_int_init(&st->torn, 0);
+   retro_atomic_int_init(&st->retries, 0);
+
+   for (i = 0; i < W128_READERS; i++)
+      readers[i]  = sthread_create(w128_reader, st);
+   for (i = 0; i < W128_COUNTERS; i++)
+      counters[i] = sthread_create(w128_counter, st);
+   for (i = 0; i < W128_COUNTERS; i++)
+      sthread_join(counters[i]);
+   for (i = 0; i < W128_READERS; i++)
+      sthread_join(readers[i]);
+
+   end = retro_atomic_load_acquire_128(&st->word);
+
+   if (retro_atomic_load_acquire_int(&st->torn))
+   {
+      fprintf(stderr, "FAIL 128 stress: %d values were halves of two, "
+            "or went backwards\n", retro_atomic_load_acquire_int(&st->torn));
+      fails++;
+   }
+   if (end.lo != (uint64_t)W128_COUNTERS * W128_COUNTS || end.hi != ~end.lo)
+   {
+      fprintf(stderr, "FAIL 128 stress: counted to %lu, not %lu\n",
+            (unsigned long)end.lo,
+            (unsigned long)W128_COUNTERS * W128_COUNTS);
+      fails++;
+   }
+
+   /* Stores and exchanges against loads: pairs of the writer's own */
+   retro_atomic_int_init(&st->counters_done, 0);
+   retro_atomic_store_release_128(&st->word, pair_of(0));
+   for (i = 0; i < W128_READERS; i++)
+      readers[i] = sthread_create(w128_reader, st);
+   {
+      uint64_t n;
+      for (n = 1; n <= W128_COUNTS; n++)
+      {
+         if (n & 1)
+            retro_atomic_store_release_128(&st->word, pair_of(n));
+         else
+         {
+            retro_u128_t was = retro_atomic_exchange_128(&st->word,
+                  pair_of(n));
+            if (was.lo != n - 1 || was.hi != ~was.lo)
+               retro_atomic_inc_int(&st->torn);
+         }
+      }
+   }
+   retro_atomic_store_release_int(&st->counters_done, W128_COUNTERS);
+   for (i = 0; i < W128_READERS; i++)
+      sthread_join(readers[i]);
+
+   if (retro_atomic_load_acquire_int(&st->torn))
+   {
+      fprintf(stderr, "FAIL 128 stress: %d torn or stale values under "
+            "stores and exchanges\n",
+            retro_atomic_load_acquire_int(&st->torn));
+      fails++;
+   }
+
+   /* Exchanges against exchanges */
+   {
+      w128_swapper_t sw[W128_COUNTERS];
+      uint64_t put = 0, got = 0;
+      int torn     = 0;
+
+      retro_atomic_store_release_128(&st->word, pair_of(0));
+      for (i = 0; i < W128_COUNTERS; i++)
+      {
+         sw[i].word  = &st->word;
+         sw[i].first = 1 + (uint64_t)i * W128_COUNTS;
+         sw[i].put   = 0;
+         sw[i].got   = 0;
+         sw[i].torn  = 0;
+         counters[i] = sthread_create(w128_swapper, &sw[i]);
+      }
+      for (i = 0; i < W128_COUNTERS; i++)
+      {
+         sthread_join(counters[i]);
+         put  += sw[i].put;
+         got  += sw[i].got;
+         torn += sw[i].torn;
+      }
+
+      end = retro_atomic_load_acquire_128(&st->word);
+      if (torn || got + end.lo != put)
+      {
+         fprintf(stderr, "FAIL 128 stress: exchanges lost or repeated "
+               "values (%d torn)\n", torn);
+         fails++;
+      }
+   }
+
+   if (!fails)
+      printf("[pass] 128-bit word stress: %d counted by %d threads "
+            "(%d retries), %d readers, none torn\n",
+            W128_COUNTERS * W128_COUNTS, W128_COUNTERS,
+            retro_atomic_load_acquire_int(&st->retries), W128_READERS);
+   free(block);
+   return fails;
+}
+#endif /* HAVE_THREADS */
+#endif /* RETRO_ATOMIC_HAS_128 */
+
 int main(void)
 {
    int fails = 0;
@@ -859,13 +1373,29 @@ int main(void)
    fails += check_store_load();
    fails += check_relaxed_store_load();
    fails += check_seqlock_shape();
+   fails += check_acq_rel_fence();
+#ifdef RETRO_ATOMIC_HAS_8_16
+   fails += check_8_16_single_thread();
+#endif
    fails += check_fetch_add_returns_previous();
    fails += check_fetch_sub_returns_previous();
    fails += check_inc_dec_wrappers();
 
+#ifdef RETRO_ATOMIC_HAS_128
+   fails += check_128_single_thread();
+#else
+   printf("[skip] 128-bit word (RETRO_ATOMIC_HAS_128 not defined)\n");
+#endif
+
 #ifdef HAVE_THREADS
    fails += check_spsc_stress();
    fails += check_seqlock_stress();
+#ifdef RETRO_ATOMIC_HAS_128
+   fails += check_128_stress();
+#endif
+#if defined(RETRO_ATOMIC_HAS_8_16)
+   fails += check_8_stress();
+#endif
 #else
    printf("[skip] SPSC + seqlock stress tests "
          "(HAVE_THREADS not defined)\n");

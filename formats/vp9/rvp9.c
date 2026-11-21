@@ -1263,6 +1263,9 @@ static void rvp9_get_tile_n_bits(int mi_cols, int *min_log2, int *max_log2)
    *max_log2 = mx;
 }
 
+/* Largest coded dimension of any VP9 level (6.x). */
+#define RVP9_MAX_DIM 16832
+
 static int rvp9_read_frame_size(rvp9_rb *rb, int *w, int *h)
 {
    *w = rvp9_rb_lit(rb, 16) + 1;
@@ -1421,6 +1424,9 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
       }
    }
 
+   if (hd->w > RVP9_MAX_DIM || hd->h > RVP9_MAX_DIM)
+      return -1;
+
    if (!hd->error_resilient)
    {
       hd->refresh_frame_context     = rvp9_rb_bit(&rb);
@@ -1528,6 +1534,14 @@ static int rvp9_parse_uncompressed(const uint8_t *data, size_t len,
    return rb.error ? -1 : 0;
 }
 
+/* The compressed header has to be present, lie inside the frame, and
+ * leave at least one byte of tile data behind it. */
+static int rvp9_first_partition_fits(const rvp9_hdr *hd, size_t len)
+{
+   return hd->first_partition_size && hd->uncomp_size < len
+      && (size_t)hd->first_partition_size < len - hd->uncomp_size;
+}
+
 int rvp9_parse_frame_header(const uint8_t *data, size_t len,
       const rvp9_hdr *previous, const int *ref_dims, rvp9_hdr *out)
 {
@@ -1537,9 +1551,7 @@ int rvp9_parse_frame_header(const uint8_t *data, size_t len,
    else memset(out, 0, sizeof(*out));
    ret = rvp9_parse_uncompressed(data, len, out, ref_dims);
    if (ret) return ret;
-   if (out->w <= 0 || out->h <= 0 || !out->first_partition_size
-         || out->uncomp_size >= len
-         || (size_t)out->first_partition_size >= len - out->uncomp_size)
+   if (!rvp9_first_partition_fits(out, len))
       return -1;
    return 0;
 }
@@ -1746,7 +1758,7 @@ static int rvp9_parse_compressed_intra(const uint8_t *data, size_t sz,
    static const int band_ctx[RVP9_COEF_BANDS] = { 3, 6, 6, 6, 6, 6 };
    static const int biggest_tx[5] = { 0, 1, 2, 3, 3 };
 
-   rvp9_br_init(&r, data, sz);
+   if (rvp9_br_init(&r, data, sz)) return -1;
 
    if (hd->lossless)
       tx_mode = 0;

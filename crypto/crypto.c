@@ -57,15 +57,74 @@
 #define AES_ARM_NEEDS_TARGET 1
 #define AES_ARM_DISPATCH     1
 #endif
+#elif defined(__arm__) && defined(__ARMEL__) && !defined(_MSC_VER) \
+   && (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(AES_NO_ARM)
+/* 32-bit code on an ARMv8 CPU with the Cryptographic Extension: the
+ * same instructions in AArch32 (Android's armeabi-v7a among others).
+ * GCC's arm_neon.h declares them under a target pragma of its own;
+ * Clang's declares the AES ones only for an ARMv8 baseline and the
+ * 64-bit multiply only for AArch64, so its path spells them out. */
+#if defined(__ARM_FEATURE_CRYPTO) && !defined(__clang__)
+#define AES_HAVE_ARM_PATH 1
+#elif defined(__clang__) && __clang_major__ >= 16
+#define AES_HAVE_ARM_PATH    1
+#define AES_ARM_NEEDS_TARGET 1
+#define AES_ARM_DISPATCH     1
+#define AES_ARM_A32_CLANG    1
+#elif !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 9
+#define AES_HAVE_ARM_PATH    1
+#define AES_ARM_NEEDS_TARGET 1
+#define AES_ARM_DISPATCH     1
+#endif
 #endif
 
 #if defined(AES_HAVE_ARM_PATH)
 #include <arm_neon.h>
 #include <features/features_cpu.h>
-#if defined(AES_ARM_NEEDS_TARGET)
-#define AES_TARGET_ARM __attribute__((target("+crypto")))
-#else
+#if !defined(AES_ARM_NEEDS_TARGET)
 #define AES_TARGET_ARM
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define AES_TARGET_ARM __attribute__((target("+crypto")))
+#elif defined(AES_ARM_A32_CLANG)
+#define AES_TARGET_ARM __attribute__((target("armv8-a,aes")))
+#else
+#define AES_TARGET_ARM __attribute__((target("fpu=crypto-neon-fp-armv8")))
+#endif
+
+#if defined(AES_ARM_A32_CLANG)
+/* As clang's arm_neon.h defines them for little-endian ARMv8; 48 is
+ * the builtin's type code for uint8x16_t */
+#define vaeseq_u8(b, k) ((uint8x16_t)__builtin_neon_vaeseq_u8( \
+      (int8x16_t)(b), (int8x16_t)(k), 48))
+#define vaesdq_u8(b, k) ((uint8x16_t)__builtin_neon_vaesdq_u8( \
+      (int8x16_t)(b), (int8x16_t)(k), 48))
+#define vaesmcq_u8(b)   ((uint8x16_t)__builtin_neon_vaesmcq_u8( \
+      (int8x16_t)(b), 48))
+#define vaesimcq_u8(b)  ((uint8x16_t)__builtin_neon_vaesimcq_u8( \
+      (int8x16_t)(b), 48))
+
+/* VMULL.P64, which clang has no AArch32 builtin for */
+AES_TARGET_ARM
+static INLINE uint8x16_t aes_arm_a32_pmull(uint64x1_t a, uint64x1_t b)
+{
+   uint8x16_t r;
+   __asm__("vmull.p64 %q0, %P1, %P2" : "=w"(r) : "w"(a), "w"(b));
+   return r;
+}
+#define AES_ARM_LANE(v, i) ((i) \
+      ? vget_high_u64(vreinterpretq_u64_u8(v)) \
+      : vget_low_u64(vreinterpretq_u64_u8(v)))
+#define AES_ARM_PMULL(a, i, b, j) \
+   aes_arm_a32_pmull(AES_ARM_LANE(a, i), AES_ARM_LANE(b, j))
+#define AES_ARM_PMULL_HI(a, b) AES_ARM_PMULL(a, 1, b, 1)
+#else
+/* The 128-bit carry-less product of 64-bit lane i of a and lane j of
+ * b; _HI of both high lanes */
+#define AES_ARM_PMULL(a, i, b, j) vreinterpretq_u8_p128(vmull_p64( \
+      (poly64_t)vgetq_lane_p64(vreinterpretq_p64_u8(a), i), \
+      (poly64_t)vgetq_lane_p64(vreinterpretq_p64_u8(b), j)))
+#define AES_ARM_PMULL_HI(a, b) vreinterpretq_u8_p128(vmull_high_p64( \
+      vreinterpretq_p64_u8(a), vreinterpretq_p64_u8(b)))
 #endif
 #endif
 
@@ -574,11 +633,124 @@ static void aes_x86_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
    _mm_storeu_si128((__m128i*)iv, prev);
 }
 
+/* XTS (IEEE 1619): the tweak is multiplied by alpha from one block to
+ * the next. As a little-endian 128-bit number it is a shift left by
+ * one, the bit out of the low half carried into the high one and the
+ * one out of the top folded back in as 0x87. */
+#ifndef CRYPTO_AES_ONLY
+AES_TARGET_X86
+static __m128i aes_x86_xts_next(__m128i t)
+{
+   /* lane 0: the top bit, lane 1: the low half's top bit; times 0x87
+    * and 1, which the carries being 0 or 1 make a multiply */
+   const __m128i poly  = _mm_set_epi32(0, 1, 0, 0x87);
+   const __m128i carry = _mm_shuffle_epi32(_mm_srli_epi64(t, 63), 0x4e);
+   return _mm_xor_si128(_mm_slli_epi64(t, 1), _mm_mul_epu32(carry, poly));
+}
+
+/* XTS over whole blocks, eight in flight, from the encrypted tweak
+ * @tweak; the round keys made once per call (through InvMixColumns to
+ * decrypt). Each block's input is held in a register before its output
+ * is stored, so @in and @out may alias. The tweak comes as bytes: a
+ * vector argument would be loaded by the caller, which is built
+ * without SSE on i686. */
+AES_TARGET_X86
+static void aes_x86_xts(const struct aes_ctx *ctx, const uint8_t *tweak,
+      const uint8_t *in, uint8_t *out, size_t len, int decrypt)
+{
+   __m128i  k[15];
+   __m128i  t  = _mm_loadu_si128((const __m128i*)tweak);
+   unsigned r, nr = ctx->rounds;
+
+   if (decrypt)
+   {
+      k[0]  = aes_x86_bswap32(_mm_loadu_si128((const __m128i*)(ctx->rk + 4 * nr)));
+      k[nr] = aes_x86_bswap32(_mm_loadu_si128((const __m128i*)ctx->rk));
+      for (r = 1; r < nr; r++)
+         k[r] = _mm_aesimc_si128(aes_x86_bswap32(
+                  _mm_loadu_si128((const __m128i*)(ctx->rk + 4 * (nr - r)))));
+   }
+   else
+      for (r = 0; r <= nr; r++)
+         k[r] = aes_x86_bswap32(_mm_loadu_si128((const __m128i*)(ctx->rk + 4 * r)));
+
+#define AES_X86_XTS_ROUNDS(op, oplast) \
+   for (r = 1; r < nr; r++) \
+   { \
+      const __m128i kr = k[r]; \
+      b0 = op(b0, kr); b1 = op(b1, kr); b2 = op(b2, kr); b3 = op(b3, kr); \
+      b4 = op(b4, kr); b5 = op(b5, kr); b6 = op(b6, kr); b7 = op(b7, kr); \
+   } \
+   b0 = oplast(b0, k[nr]); b1 = oplast(b1, k[nr]); \
+   b2 = oplast(b2, k[nr]); b3 = oplast(b3, k[nr]); \
+   b4 = oplast(b4, k[nr]); b5 = oplast(b5, k[nr]); \
+   b6 = oplast(b6, k[nr]); b7 = oplast(b7, k[nr]);
+   while (len >= 128)
+   {
+      const __m128i t0 = t;
+      const __m128i t1 = aes_x86_xts_next(t0);
+      const __m128i t2 = aes_x86_xts_next(t1);
+      const __m128i t3 = aes_x86_xts_next(t2);
+      const __m128i t4 = aes_x86_xts_next(t3);
+      const __m128i t5 = aes_x86_xts_next(t4);
+      const __m128i t6 = aes_x86_xts_next(t5);
+      const __m128i t7 = aes_x86_xts_next(t6);
+      __m128i b0 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in)),       t0), k[0]);
+      __m128i b1 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in +  16)), t1), k[0]);
+      __m128i b2 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in +  32)), t2), k[0]);
+      __m128i b3 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in +  48)), t3), k[0]);
+      __m128i b4 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in +  64)), t4), k[0]);
+      __m128i b5 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in +  80)), t5), k[0]);
+      __m128i b6 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in +  96)), t6), k[0]);
+      __m128i b7 = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)(in + 112)), t7), k[0]);
+      if (decrypt)
+      {
+         AES_X86_XTS_ROUNDS(_mm_aesdec_si128, _mm_aesdeclast_si128)
+      }
+      else
+      {
+         AES_X86_XTS_ROUNDS(_mm_aesenc_si128, _mm_aesenclast_si128)
+      }
+      _mm_storeu_si128((__m128i*)(out),       _mm_xor_si128(b0, t0));
+      _mm_storeu_si128((__m128i*)(out +  16), _mm_xor_si128(b1, t1));
+      _mm_storeu_si128((__m128i*)(out +  32), _mm_xor_si128(b2, t2));
+      _mm_storeu_si128((__m128i*)(out +  48), _mm_xor_si128(b3, t3));
+      _mm_storeu_si128((__m128i*)(out +  64), _mm_xor_si128(b4, t4));
+      _mm_storeu_si128((__m128i*)(out +  80), _mm_xor_si128(b5, t5));
+      _mm_storeu_si128((__m128i*)(out +  96), _mm_xor_si128(b6, t6));
+      _mm_storeu_si128((__m128i*)(out + 112), _mm_xor_si128(b7, t7));
+      t    = aes_x86_xts_next(t7);
+      in  += 128;
+      out += 128;
+      len -= 128;
+   }
+#undef AES_X86_XTS_ROUNDS
+   for (; len >= 16; in += 16, out += 16, len -= 16)
+   {
+      __m128i b = _mm_xor_si128(_mm_xor_si128(_mm_loadu_si128((const __m128i*)in), t), k[0]);
+      if (decrypt)
+      {
+         for (r = 1; r < nr; r++)
+            b = _mm_aesdec_si128(b, k[r]);
+         b = _mm_aesdeclast_si128(b, k[nr]);
+      }
+      else
+      {
+         for (r = 1; r < nr; r++)
+            b = _mm_aesenc_si128(b, k[r]);
+         b = _mm_aesenclast_si128(b, k[nr]);
+      }
+      _mm_storeu_si128((__m128i*)out, _mm_xor_si128(b, t));
+      t = aes_x86_xts_next(t);
+   }
+}
+
 /* CTR with eight blocks in flight so the AES unit's latency is hidden,
  * the round keys loaded and byte-swapped once per call rather than once
  * per round. The counter block is kept byte-reversed, where its 32-bit
  * big-endian counter is the low lane: one add steps it (mod 2^32, as
  * GCM's inc32) and one shuffle turns it back into a block. */
+#endif /* !CRYPTO_AES_ONLY */
 AES_TARGET_X86
 static void aes_x86_ctr(const struct aes_ctx *ctx, uint8_t *counter,
       const uint8_t *in, uint8_t *out, size_t len)
@@ -660,6 +832,7 @@ static void aes_x86_ctr(const struct aes_ctx *ctx, uint8_t *counter,
 }
 
 /* The unreduced 256-bit product of a and b, as *lo / *hi. */
+#ifndef CRYPTO_AES_ONLY
 AES_TARGET_X86
 static void aes_x86_clmul(__m128i a, __m128i b, __m128i *lo, __m128i *hi)
 {
@@ -789,16 +962,27 @@ static void aes_x86_ghash(const struct aes_gcm_ctx *ctx,
       *y_lo = crypto_load64_be(o + 8);
    }
 }
+#endif /* !CRYPTO_AES_ONLY */
 #endif
 
 #if defined(AES_HAVE_ARM_PATH)
+#if defined(AES_ARM_DISPATCH)
+/* -1 not checked yet, else whether the CPU has the instructions.
+ * Threads that check at once all store the same answer, which orders
+ * nothing else: relaxed. */
+static retro_atomic_int_t aes_arm_ok = -1;
+#endif
+
 static int aes_arm_available(void)
 {
 #if defined(AES_ARM_DISPATCH)
-   static int ok = -1;
-   if (ok < 0)
-      ok = (cpu_features_get() & RETRO_SIMD_AES) ? 1 : 0;
-   return ok;
+   int v = retro_atomic_load_relaxed_int(&aes_arm_ok);
+   if (v < 0)
+   {
+      v = (cpu_features_get() & RETRO_SIMD_AES) ? 1 : 0;
+      retro_atomic_store_relaxed_int(&aes_arm_ok, v);
+   }
+   return v;
 #else
    return 1;
 #endif
@@ -967,11 +1151,80 @@ static void aes_arm_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
    vst1q_u8(iv, prev);
 }
 
+/* XTS's tweak times alpha, as the x86 form above: each half shifted
+ * left, the carries exchanged and the top one folded in as 0x87. */
+#ifndef CRYPTO_AES_ONLY
+AES_TARGET_ARM
+static uint8x16_t aes_arm_xts_next(uint8x16_t t)
+{
+   static const uint64_t poly_v[2] = { 0x87, 1 };
+   const uint64x2_t v     = vreinterpretq_u64_u8(t);
+   const uint64x2_t top   = vshrq_n_u64(v, 63);
+   const uint64x2_t carry = vextq_u64(top, top, 1);
+   const uint64x2_t mask  = vsubq_u64(vdupq_n_u64(0), carry);
+   return vreinterpretq_u8_u64(veorq_u64(vshlq_n_u64(v, 1),
+            vandq_u64(mask, vld1q_u64(poly_v))));
+}
+
+/* XTS over whole blocks, eight in flight, the round keys loaded once.
+ * Decrypting is the CBC decryption's AESD chain, encrypting the CTR's
+ * AESE chain; the tweak goes in before the first round key and out
+ * after the last. */
+AES_TARGET_ARM
+static void aes_arm_xts(const struct aes_ctx *ctx, uint8x16_t t,
+      const uint8_t *in, uint8_t *out, size_t len, int decrypt)
+{
+   uint8x16_t k[15];
+   unsigned   r, nr = ctx->rounds;
+
+   for (r = 0; r <= nr; r++)
+      k[r] = aes_arm_rk(ctx, r);
+   if (decrypt)
+      for (r = 1; r < nr; r++)
+         k[r] = vaesimcq_u8(k[r]);
+
+   while (len >= 16)
+   {
+      uint8x16_t tw[8], b[8];
+      unsigned   i, n = len >= 128 ? 8 : 1;
+      for (i = 0; i < n; i++)
+      {
+         tw[i] = t;
+         b[i]  = veorq_u8(vld1q_u8(in + 16 * i), t);
+         t     = aes_arm_xts_next(t);
+      }
+      if (decrypt)
+      {
+         for (i = 0; i < n; i++)
+            b[i] = vaesdq_u8(b[i], k[nr]);
+         for (r = nr - 1; r > 0; r--)
+            for (i = 0; i < n; i++)
+               b[i] = vaesdq_u8(vaesimcq_u8(b[i]), k[r]);
+         for (i = 0; i < n; i++)
+            b[i] = veorq_u8(b[i], k[0]);
+      }
+      else
+      {
+         for (r = 0; r + 1 < nr; r++)
+            for (i = 0; i < n; i++)
+               b[i] = vaesmcq_u8(vaeseq_u8(b[i], k[r]));
+         for (i = 0; i < n; i++)
+            b[i] = veorq_u8(vaeseq_u8(b[i], k[nr - 1]), k[nr]);
+      }
+      for (i = 0; i < n; i++)
+         vst1q_u8(out + 16 * i, veorq_u8(b[i], tw[i]));
+      in  += 16 * n;
+      out += 16 * n;
+      len -= 16 * n;
+   }
+}
+
 /* CTR with eight blocks in flight, the round keys loaded once per
  * call. The counter block is kept byte-reversed within each 32-bit
  * lane, where its big-endian counter is lane 3 as a native word: one
  * add steps it (mod 2^32, as GCM's inc32) and one vrev32 turns it back
  * into a block - the other lanes reverse twice to themselves. */
+#endif /* !CRYPTO_AES_ONLY */
 AES_TARGET_ARM
 static void aes_arm_ctr(const struct aes_ctx *ctx, uint8_t *counter,
       const uint8_t *in, uint8_t *out, size_t len)
@@ -1051,16 +1304,15 @@ static void aes_arm_ctr(const struct aes_ctx *ctx, uint8_t *counter,
  * as the x86 path, with the SSE lane shifts spelled as vext and the
  * word shifts as vshl / vshr. */
 /* The unreduced 256-bit product of a and b, as *lo / *hi. */
+#ifndef CRYPTO_AES_ONLY
 AES_TARGET_ARM
 static void aes_arm_clmul(uint8x16_t a, uint8x16_t b, uint8x16_t *lo, uint8x16_t *hi)
 {
    const uint8x16_t z = vdupq_n_u8(0);
-   poly64x2_t pa = vreinterpretq_p64_u8(a);
-   poly64x2_t pb = vreinterpretq_p64_u8(b);
-   uint8x16_t t3 = vreinterpretq_u8_p128(vmull_p64((poly64_t)vgetq_lane_p64(pa, 0), (poly64_t)vgetq_lane_p64(pb, 0)));
-   uint8x16_t t4 = vreinterpretq_u8_p128(vmull_p64((poly64_t)vgetq_lane_p64(pa, 0), (poly64_t)vgetq_lane_p64(pb, 1)));
-   uint8x16_t t5 = vreinterpretq_u8_p128(vmull_p64((poly64_t)vgetq_lane_p64(pa, 1), (poly64_t)vgetq_lane_p64(pb, 0)));
-   uint8x16_t t6 = vreinterpretq_u8_p128(vmull_high_p64(pa, pb));
+   uint8x16_t t3 = AES_ARM_PMULL(a, 0, b, 0);
+   uint8x16_t t4 = AES_ARM_PMULL(a, 0, b, 1);
+   uint8x16_t t5 = AES_ARM_PMULL(a, 1, b, 0);
+   uint8x16_t t6 = AES_ARM_PMULL_HI(a, b);
    t4  = veorq_u8(t4, t5);
    *lo = veorq_u8(t3, vextq_u8(z, t4, 8));    /* slli_si128 8 */
    *hi = veorq_u8(t6, vextq_u8(t4, z, 8));    /* srli_si128 8 */
@@ -1150,18 +1402,13 @@ static void aes_arm_ghash(const struct aes_gcm_ctx *ctx,
          {
             uint8x16_t d = vld1q_u8(data + 16 * j);
             uint8x16_t dk;
-            poly64x2_t pd, pp, pdk, ppk;
             d = vrev64q_u8(vextq_u8(d, d, 8));
             if (!j)
                d = veorq_u8(d, y);
             dk  = veorq_u8(d, vextq_u8(d, d, 8));
-            pd  = vreinterpretq_p64_u8(d);
-            pp  = vreinterpretq_p64_u8(hp[7 - j]);
-            pdk = vreinterpretq_p64_u8(dk);
-            ppk = vreinterpretq_p64_u8(hk[7 - j]);
-            lo  = veorq_u8(lo,  vreinterpretq_u8_p128(vmull_p64((poly64_t)vgetq_lane_p64(pd, 0), (poly64_t)vgetq_lane_p64(pp, 0))));
-            hi  = veorq_u8(hi,  vreinterpretq_u8_p128(vmull_high_p64(pd, pp)));
-            mid = veorq_u8(mid, vreinterpretq_u8_p128(vmull_p64((poly64_t)vgetq_lane_p64(pdk, 0), (poly64_t)vgetq_lane_p64(ppk, 0))));
+            lo  = veorq_u8(lo,  AES_ARM_PMULL(d, 0, hp[7 - j], 0));
+            hi  = veorq_u8(hi,  AES_ARM_PMULL_HI(d, hp[7 - j]));
+            mid = veorq_u8(mid, AES_ARM_PMULL(dk, 0, hk[7 - j], 0));
          }
          mid = veorq_u8(mid, veorq_u8(lo, hi));
          lo  = veorq_u8(lo, vextq_u8(z, mid, 8));    /* slli_si128 8 */
@@ -1194,6 +1441,7 @@ static void aes_arm_ghash(const struct aes_gcm_ctx *ctx,
    *y_hi = crypto_load64_be(o);
    *y_lo = crypto_load64_be(o + 8);
 }
+#endif /* !CRYPTO_AES_ONLY */
 #endif
 
 int crypto_aes_hw(void)
@@ -1441,6 +1689,76 @@ void aes_ctr_crypt(const struct aes_ctx *ctx, uint8_t *counter,
    crypto_memzero(ks, sizeof(ks));
 }
 
+void aes_ctr128_crypt(const struct aes_ctx *ctx, uint8_t *counter,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   while (len)
+   {
+      /* Blocks before the low 32 bits wrap: aes_ctr_crypt() takes them
+       * as they are, the carry goes into octets 0..11 by hand. */
+      uint64_t left  = (uint64_t)0x100000000ULL
+         - crypto_load32_be(counter + 12);
+      size_t   n     = len;
+      int      wraps = 0;
+      int      i;
+
+      if ((uint64_t)len >= left * 16)
+      {
+         n     = (size_t)(left * 16);
+         wraps = 1;
+      }
+      else if ((uint64_t)len > (left - 1) * 16)
+         wraps = 1; /* a partial last block takes the last counter */
+
+      aes_ctr_crypt(ctx, counter, in, out, n);
+
+      if (wraps)
+         for (i = 11; i >= 0; i--)
+            if (++counter[i])
+               break;
+
+      in  += n;
+      out += n;
+      len -= n;
+   }
+}
+
+/* The register holds ciphertext: encrypting it gives the next
+ * keystream block, and each ciphertext octet goes back into it. */
+void aes_cfb128_encrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      unsigned *num, const uint8_t *in, uint8_t *out, size_t len)
+{
+   unsigned n = *num & 15;
+   while (len)
+   {
+      if (!n)
+         aes_encrypt_block(ctx, iv, iv);
+      iv[n] ^= *in++;
+      *out++ = iv[n];
+      n      = (n + 1) & 15;
+      len--;
+   }
+   *num = n;
+}
+
+void aes_cfb128_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
+      unsigned *num, const uint8_t *in, uint8_t *out, size_t len)
+{
+   unsigned n = *num & 15;
+   while (len)
+   {
+      uint8_t c;
+      if (!n)
+         aes_encrypt_block(ctx, iv, iv);
+      c      = *in++;
+      *out++ = (uint8_t)(iv[n] ^ c);
+      iv[n]  = c;
+      n      = (n + 1) & 15;
+      len--;
+   }
+   *num = n;
+}
+
 void aes_cbc_encrypt(const struct aes_ctx *ctx, uint8_t *iv,
       const uint8_t *in, uint8_t *out, size_t len)
 {
@@ -1513,6 +1831,72 @@ void aes_cbc_decrypt(const struct aes_ctx *ctx, uint8_t *iv,
       memcpy(prev, c, 16);
    }
    memcpy(iv, prev, 16);
+}
+
+#ifndef CRYPTO_AES_ONLY
+
+/* The tweak times alpha in GF(2^128), as a little-endian number: a
+ * shift left, the bit out of the top folded back in as 0x87. */
+static void aes_xts_next(uint8_t *t)
+{
+   unsigned i;
+   uint8_t  carry = 0;
+   for (i = 0; i < 16; i++)
+   {
+      uint8_t next = t[i] >> 7;
+      t[i]  = (uint8_t)((t[i] << 1) | carry);
+      carry = next;
+   }
+   t[0] ^= (uint8_t)(0x87 & (0 - carry));
+}
+
+static void aes_xts(const struct aes_ctx *data_key,
+      const struct aes_ctx *tweak_key, const uint8_t *tweak,
+      const uint8_t *in, uint8_t *out, size_t len, int decrypt)
+{
+   uint8_t  t[16], b[16], o[16];
+   unsigned i;
+
+   aes_encrypt_block(tweak_key, tweak, t);
+#if defined(AES_HAVE_X86_PATH)
+   if (aes_x86_available())
+   {
+      aes_x86_xts(data_key, t, in, out, len, decrypt);
+      return;
+   }
+#elif defined(AES_HAVE_ARM_PATH)
+   if (aes_arm_available())
+   {
+      aes_arm_xts(data_key, vld1q_u8(t), in, out, len, decrypt);
+      return;
+   }
+#endif
+   for (; len >= 16; in += 16, out += 16, len -= 16)
+   {
+      for (i = 0; i < 16; i++)
+         b[i] = in[i] ^ t[i];
+      if (decrypt)
+         aes_decrypt_block_c(data_key, b, o);
+      else
+         aes_encrypt_block_c(data_key, b, o);
+      for (i = 0; i < 16; i++)
+         out[i] = o[i] ^ t[i];
+      aes_xts_next(t);
+   }
+}
+
+void aes_xts_encrypt(const struct aes_ctx *data_key,
+      const struct aes_ctx *tweak_key, const uint8_t *tweak,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   aes_xts(data_key, tweak_key, tweak, in, out, len, 0);
+}
+
+void aes_xts_decrypt(const struct aes_ctx *data_key,
+      const struct aes_ctx *tweak_key, const uint8_t *tweak,
+      const uint8_t *in, uint8_t *out, size_t len)
+{
+   aes_xts(data_key, tweak_key, tweak, in, out, len, 1);
 }
 
 /* Double in GF(2^128) with the CMAC polynomial. */
@@ -2934,3 +3318,4 @@ int aead_decrypt(enum aead_alg alg,
    return -1;
 }
 
+#endif /* !CRYPTO_AES_ONLY */

@@ -464,6 +464,32 @@ static void test_pp(void)
    CHECK(!pp_dump("#version 450\n#define NOPE\n#ifdef NOPE\nint a;\n##else\nint b;\n#endif\n",
       dump, sizeof(dump), err, sizeof(err)));
 
+   /* An inactive branch is skipped to its next directive without being
+    * lexed: what is in it still reads as lexing reads it. A '#' in a
+    * block comment, in a string, after a splice or not first on its line
+    * is no directive; a directive may be indented or follow a comment;
+    * lines are counted through all of it (__LINE__ after it is right). */
+   ok = pp_dump(
+      "#version 450\n"
+      "#ifdef NOPE\n"
+      "int a; /* # not a directive\n"
+      "#else in a comment */ int b;\n"
+      "\"a string with # and /* in it\" x;\n"
+      "y = 1; // #endif in a comment\n"
+      "  # define INNER 1\n"
+      "z \\\n"
+      "#endif after a splice\n"
+      "w # endif not first\n"
+      "/* c */ #elif 0\n"
+      "  /* d */  #endif\n"
+      "#ifdef INNER\nint inner;\n#endif\n"
+      "int c = __LINE__;\n",
+      dump, sizeof(dump), err, sizeof(err));
+   CHECK(ok);
+   pp_flat(dump, flat, sizeof(flat));
+   CHECK(!strcmp(flat, "int c = 16 ;"));
+   CHECK(strstr(dump, "16 int\n") != NULL);
+
    /* Predefined macros and #extension / #pragma pass-through. */
    ok = pp_dump(
       "#version 450\n#extension GL_GOOGLE_cpp_style_line_directive : require\n"
@@ -2340,6 +2366,56 @@ static void test_exhaustion(void)
    free(src);
 }
 
+static void test_sample_colour(void)
+{
+   static const char *const samplers[] = { "Source" };
+   static const char src[] =
+      "#version 450\n"
+      "layout(binding=0) uniform sampler2D Source;\n"
+      "layout(binding=1) uniform sampler2D LUT;\n"
+      "layout(location=0) in vec2 uv;\n"
+      "layout(location=0) out vec4 colour;\n"
+      "vec4 sample_it(sampler2D s, vec2 p) { return texture(s,p); }\n"
+      "void main() { colour=sample_it(Source,uv)+sample_it(LUT,uv)"
+      "+textureProj(Source,vec3(uv,1.0))"
+      "+textureProj(Source,vec4(uv,0.0,1.0))"
+      "+textureLod(Source,uv,0.0)"
+      "+texelFetch(Source,ivec2(0),0)"
+      "+textureGather(Source,uv,2)"
+      "+textureGatherOffset(Source,uv,ivec2(1),1)"
+      "+vec4(textureSize(Source,0),textureQueryLevels(Source),1); }\n";
+   struct rslc_opts o;
+   struct rslc_result r;
+   struct rslc_remap rm;
+   char err[256];
+   unsigned dst;
+   memset(&rm, 0, sizeof(rm));
+   rm.samplers = samplers;
+   rm.sampler_count = 1;
+   rm.rect_name = "ColourRow0";
+   rm.clamp_name = "ColourRow1";
+   rm.texels_name = "ColourRow2";
+   rm.colour = true;
+   for (dst = RSLC_DST_SPIRV; dst <= RSLC_DST_MSL; dst++)
+   {
+      opts_default(&o, err, sizeof(err));
+      o.dst = (enum rslc_dst)dst;
+      o.version = dst == RSLC_DST_MSL ? 20000
+         : dst == RSLC_DST_HLSL ? 50 : dst == RSLC_DST_GLSL_ES ? 320 : 450;
+      o.remap = &rm;
+      err[0] = 0;
+      if (!rslc_compile(src, sizeof(src)-1, RSLC_STAGE_FRAGMENT, &o, &r))
+      {
+         fprintf(stderr, "colour target %u: %s\n", dst, err);
+         CHECK(0);
+         continue;
+      }
+      CHECK(r.remap == RSLC_REMAP_REWRITTEN);
+      rslc_result_free(&r, &o);
+      CHECK(alloc_live == 0);
+   }
+}
+
 int main(int argc, char **argv)
 {
    if (argc == 3 && !strcmp(argv[1], "--pp"))
@@ -2382,6 +2458,7 @@ int main(int argc, char **argv)
    test_cafe();
    test_ingest();
    test_sampler_active();
+   test_sample_colour();
    test_exhaustion();
 
    if (fails)

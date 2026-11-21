@@ -42,6 +42,9 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>   /* geteuid: root ignores mode bits */
+#else
+#include <windows.h>  /* CreateFileA: whether the system holds to it */
+#include <direct.h>
 #endif
 
 #define DIR_NAME   "v5_meta_dir"
@@ -102,6 +105,21 @@ static bool files_equal(const char *a, const char *b)
    return same;
 }
 
+#ifdef _WIN32
+/* Whether the system itself refuses @path to a writer: Windows does
+ * for a read-only file, Wine run as root does not, as root ignores the
+ * mode bits Wine keeps the attribute in */
+static bool system_refuses_write(const char *path)
+{
+   HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (h == INVALID_HANDLE_VALUE)
+      return true;
+   CloseHandle(h);
+   return false;
+}
+#endif
+
 static void test_readonly(const char *dir)
 {
    char p[512];
@@ -119,6 +137,10 @@ static void test_readonly(const char *dir)
 #if !defined(_WIN32)
    if (geteuid() == 0)
       SKIP("open-for-write-denied check (running as root, mode bits are not enforced)");
+   else
+#else
+   if (!system_refuses_write(p))
+      SKIP("open-for-write-denied check (the system lets this process write a read-only file: Wine as root)");
    else
 #endif
    {
@@ -426,6 +448,39 @@ static void test_rmdir(const char *dir)
    CHECK(!path_rmdir(sub), "rmdir of a missing path fails");
 }
 
+#if defined(_WIN32)
+static void test_windows_stat_paths(const char *dir)
+{
+   char file[128], suffixed[132], root[4];
+   size_t length;
+   int64_t size = 0;
+   int flags, drive = _getdrive();
+   snprintf(file, sizeof(file), "%s/stat_\303\251.bin", dir);
+   CHECK(write_pattern(file, 17, 4), "UTF-8 metadata file created");
+   CHECK(GetFileAttributesW(L"v5_meta_dir/stat_\351.bin") != INVALID_FILE_ATTRIBUTES,
+         "native UTF-16 sees the same file");
+   flags = retro_vfs_stat_64_impl(file, &size);
+   CHECK((flags & RETRO_VFS_STAT_IS_VALID) && size == 17, "Unicode file stat size");
+   snprintf(suffixed, sizeof(suffixed), "%s\\//", file);
+   length = strlen(file);
+   flags = retro_vfs_stat_64_impl(suffixed, &size);
+   CHECK((flags & RETRO_VFS_STAT_IS_VALID) && size == 17, "mixed suffix on Unicode file");
+   CHECK(!memcmp(suffixed, file, length) && !strcmp(suffixed + length, "\\//"),
+         "stat leaves the caller's UTF-8 path intact");
+   snprintf(suffixed, sizeof(suffixed), "%s\\//", dir);
+   CHECK(retro_vfs_stat_64_impl(suffixed, NULL) & RETRO_VFS_STAT_IS_DIRECTORY,
+         "mixed directory suffix");
+   CHECK(drive >= 1 && drive <= 26, "current drive available");
+   root[0] = (char)('A' + drive - 1);
+   root[1] = ':';
+   root[2] = '\\';
+   root[3] = 0;
+   CHECK(retro_vfs_stat_64_impl(root, NULL) & RETRO_VFS_STAT_IS_DIRECTORY,
+         "drive root remains a root");
+   CHECK(filestream_delete(file) == 0, "Unicode metadata file removed");
+}
+#endif
+
 int main(void)
 {
    const char *dir = DIR_NAME;
@@ -436,6 +491,9 @@ int main(void)
       printf("cannot create %s\n", dir);
       return 1;
    }
+#if defined(_WIN32)
+   test_windows_stat_paths(dir);
+#endif
    test_readonly(dir);
    test_mtime(dir);
    test_copy(dir);

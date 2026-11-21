@@ -513,6 +513,54 @@ static INLINE uint8_t rflac_crc8_byte(uint8_t crc, uint8_t data)
    return rflac__crc8_table[crc ^ data];
 }
 
+int rflac_packet_frames(const uint8_t *packet, size_t size)
+{
+   unsigned code, rate, count = 1, i, frames;
+   size_t at;
+   uint8_t first, crc = 0;
+   if (!packet || size < 6 || packet[0] != 0xff
+         || (packet[1] & 0xfe) != 0xf8 || (packet[3] & 1)
+         || (packet[3] >> 4) > 10 || ((packet[3] >> 1) & 7) == 3)
+      return -1;
+   code = packet[2] >> 4;
+   rate = packet[2] & 15;
+   if (!code || rate == 15) return -1;
+   first = packet[4];
+   if (first & 0x80)
+   {
+      if ((first & 0xe0) == 0xc0) count = 2;
+      else if ((first & 0xf0) == 0xe0) count = 3;
+      else if ((first & 0xf8) == 0xf0) count = 4;
+      else if ((first & 0xfc) == 0xf8) count = 5;
+      else if ((first & 0xfe) == 0xfc) count = 6;
+      else if (first == 0xfe) count = 7;
+      else return -1;
+   }
+   at = 4 + count;
+   if (at >= size) return -1;
+   for (i = 1; i < count; i++)
+      if ((packet[4 + i] & 0xc0) != 0x80) return -1;
+   if (code == 1) frames = 192;
+   else if (code <= 5) frames = 576U << (code - 2);
+   else if (code == 6)
+   {
+      if (size - at < 2) return -1;
+      frames = (unsigned)packet[at++] + 1;
+   }
+   else if (code == 7)
+   {
+      if (size - at < 3) return -1;
+      frames = ((unsigned)packet[at] << 8) + packet[at + 1] + 1;
+      at += 2;
+      if (frames > RFLAC_MAX_BLOCK_SIZE) return -1;
+   }
+   else frames = 256U << (code - 8);
+   at += rate == 12 ? 1 : rate >= 13 ? 2 : 0;
+   if (at >= size) return -1;
+   for (i = 0; i < at; i++) crc = rflac_crc8_byte(crc, packet[i]);
+   return crc == packet[at] ? (int)frames : -1;
+}
+
 static INLINE uint8_t rflac_crc8(uint8_t crc, uint32_t data, uint32_t count)
 {
    uint32_t wholeBytes;
@@ -2154,6 +2202,13 @@ static uint32_t rflac__decode_samples_with_residual__rice__scalar(rflac_bs* bs,
 }
 
 #if defined(RFLAC_SUPPORT_SSE2)
+/* rflac__s16_round for four lanes, but for the clamp, which the saturating
+ * pack after it does */
+static INLINE __m128i rflac__mm_round_s16_epi32(__m128i x)
+{
+   return _mm_srai_epi32(_mm_add_epi32(_mm_srai_epi32(x, 15), _mm_set1_epi32(1)), 1);
+}
+
 static INLINE __m128i rflac__mm_packs_interleaved_epi32(__m128i a, __m128i b)
 {
    __m128i r;
@@ -3320,6 +3375,12 @@ static uint32_t rflac__decode_subframe_wide(rflac_bs* bs, rflac_frame* frame,
    if (!rflac__read_subframe_header(bs, pSubframe))
       return 0;
 
+   /* Predictor warm-up samples must fit in the frame's sample block. */
+   if ((pSubframe->subframeType == RFLAC_SUBFRAME_FIXED ||
+        pSubframe->subframeType == RFLAC_SUBFRAME_LPC) &&
+       pSubframe->lpcOrder > frame->header.blockSizeInPCMFrames)
+      return 0;
+
    if (pSubframe->wastedBitsPerSample >= subframeBitsPerSample)
       return 0;
    subframeBitsPerSample -= pSubframe->wastedBitsPerSample;
@@ -3347,6 +3408,12 @@ static uint32_t rflac__decode_subframe(rflac_bs* bs, rflac_frame* frame,
    uint32_t subframeBitsPerSample;
    rflac_subframe* pSubframe = frame->subframes + subframeIndex;
    if (!rflac__read_subframe_header(bs, pSubframe))
+      return 0;
+
+   /* Predictor warm-up samples must fit in the frame's sample block. */
+   if ((pSubframe->subframeType == RFLAC_SUBFRAME_FIXED ||
+        pSubframe->subframeType == RFLAC_SUBFRAME_LPC) &&
+       pSubframe->lpcOrder > frame->header.blockSizeInPCMFrames)
       return 0;
 
    /* Side channels require an extra bit per sample. Took a while to figure that
@@ -4387,6 +4454,17 @@ static rflac* rflac_open_with_metadata_private(rflac_read_proc onRead,
    return pFlac;
 }
 
+/* A sample left-justified in 32 bits, to 16: rounded to the nearest step
+ * (halves up) and clamped, where a shift alone rounded down - every sample
+ * of a 24-bit stream half a step low on average. Shifting by 15 first keeps
+ * the rounding add from overflowing; only +32768 can come out, at the very
+ * top, and is clamped. A stream of 16 bits or fewer is unchanged by it. */
+static INLINE int16_t rflac__s16_round(uint32_t x)
+{
+   int32_t r = (((int32_t)x >> 15) + 1) >> 1;
+   return (int16_t)(r > 32767 ? 32767 : r);
+}
+
 static INLINE void rflac_read_pcm_frames_s16__decode_left_side__scalar(
       rflac* pFlac, uint64_t frameCount, uint32_t unusedBitsPerSample,
       const int32_t* pInputSamples0, const int32_t* pInputSamples1,
@@ -4416,24 +4494,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_left_side__scalar(
       uint32_t right2 = left2 - side2;
       uint32_t right3 = left3 - side3;
 
-      left0  >>= 16;
-      left1  >>= 16;
-      left2  >>= 16;
-      left3  >>= 16;
-
-      right0 >>= 16;
-      right1 >>= 16;
-      right2 >>= 16;
-      right3 >>= 16;
-
-      pOutputSamples[i*8+0] = (int16_t)left0;
-      pOutputSamples[i*8+1] = (int16_t)right0;
-      pOutputSamples[i*8+2] = (int16_t)left1;
-      pOutputSamples[i*8+3] = (int16_t)right1;
-      pOutputSamples[i*8+4] = (int16_t)left2;
-      pOutputSamples[i*8+5] = (int16_t)right2;
-      pOutputSamples[i*8+6] = (int16_t)left3;
-      pOutputSamples[i*8+7] = (int16_t)right3;
+      pOutputSamples[i*8+0] = rflac__s16_round(left0);
+      pOutputSamples[i*8+1] = rflac__s16_round(right0);
+      pOutputSamples[i*8+2] = rflac__s16_round(left1);
+      pOutputSamples[i*8+3] = rflac__s16_round(right1);
+      pOutputSamples[i*8+4] = rflac__s16_round(left2);
+      pOutputSamples[i*8+5] = rflac__s16_round(right2);
+      pOutputSamples[i*8+6] = rflac__s16_round(left3);
+      pOutputSamples[i*8+7] = rflac__s16_round(right3);
    }
 
    for (i = (frameCount4 << 2); i < frameCount; ++i)
@@ -4442,11 +4510,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_left_side__scalar(
       uint32_t side  = pInputSamples1U32[i] << shift1;
       uint32_t right = left - side;
 
-      left  >>= 16;
-      right >>= 16;
-
-      pOutputSamples[i*2+0] = (int16_t)left;
-      pOutputSamples[i*2+1] = (int16_t)right;
+      pOutputSamples[i*2+0] = rflac__s16_round(left);
+      pOutputSamples[i*2+1] = rflac__s16_round(right);
    }
 }
 
@@ -4468,8 +4533,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_left_side__sse2(
       __m128i side  = _mm_slli_epi32(_mm_loadu_si128((const __m128i*)pInputSamples1 + i), shift1);
       __m128i right = _mm_sub_epi32(left, side);
 
-      left  = _mm_srai_epi32(left,  16);
-      right = _mm_srai_epi32(right, 16);
+      left  = rflac__mm_round_s16_epi32(left);
+      right = rflac__mm_round_s16_epi32(right);
 
       _mm_storeu_si128((__m128i*)(pOutputSamples + i*8), rflac__mm_packs_interleaved_epi32(left, right));
    }
@@ -4479,11 +4544,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_left_side__sse2(
       uint32_t side  = pInputSamples1U32[i] << shift1;
       uint32_t right = left - side;
 
-      left  >>= 16;
-      right >>= 16;
-
-      pOutputSamples[i*2+0] = (int16_t)left;
-      pOutputSamples[i*2+1] = (int16_t)right;
+      pOutputSamples[i*2+0] = rflac__s16_round(left);
+      pOutputSamples[i*2+1] = rflac__s16_round(right);
    }
 }
 #endif
@@ -4509,14 +4571,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_left_side__neon(
       uint32x4_t side  = vshlq_u32(vld1q_u32(pInputSamples1U32 + i*4), shift1_4);
       uint32x4_t right = vsubq_u32(left, side);
 
-      left  = vshrq_n_u32(left,  16);
-      right = vshrq_n_u32(right, 16);
+      left  = vreinterpretq_u32_s32(vrshrq_n_s32(vreinterpretq_s32_u32(left), 16));
+      right = vreinterpretq_u32_s32(vrshrq_n_s32(vreinterpretq_s32_u32(right), 16));
 
       {
          /* interleaving store; replaces vzip + contiguous store */
          uint16x4x2_t v;
-         v.val[0] = vmovn_u32(left);
-         v.val[1] = vmovn_u32(right);
+         v.val[0] = vreinterpret_u16_s16(vqmovn_s32(vreinterpretq_s32_u32(left)));
+         v.val[1] = vreinterpret_u16_s16(vqmovn_s32(vreinterpretq_s32_u32(right)));
          vst2_u16((uint16_t*)pOutputSamples + i*8, v);
       }
    }
@@ -4527,11 +4589,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_left_side__neon(
       uint32_t side  = pInputSamples1U32[i] << shift1;
       uint32_t right = left - side;
 
-      left  >>= 16;
-      right >>= 16;
-
-      pOutputSamples[i*2+0] = (int16_t)left;
-      pOutputSamples[i*2+1] = (int16_t)right;
+      pOutputSamples[i*2+0] = rflac__s16_round(left);
+      pOutputSamples[i*2+1] = rflac__s16_round(right);
    }
 }
 #endif
@@ -4585,24 +4644,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_right_side__scalar(
       uint32_t left2 = right2 + side2;
       uint32_t left3 = right3 + side3;
 
-      left0  >>= 16;
-      left1  >>= 16;
-      left2  >>= 16;
-      left3  >>= 16;
-
-      right0 >>= 16;
-      right1 >>= 16;
-      right2 >>= 16;
-      right3 >>= 16;
-
-      pOutputSamples[i*8+0] = (int16_t)left0;
-      pOutputSamples[i*8+1] = (int16_t)right0;
-      pOutputSamples[i*8+2] = (int16_t)left1;
-      pOutputSamples[i*8+3] = (int16_t)right1;
-      pOutputSamples[i*8+4] = (int16_t)left2;
-      pOutputSamples[i*8+5] = (int16_t)right2;
-      pOutputSamples[i*8+6] = (int16_t)left3;
-      pOutputSamples[i*8+7] = (int16_t)right3;
+      pOutputSamples[i*8+0] = rflac__s16_round(left0);
+      pOutputSamples[i*8+1] = rflac__s16_round(right0);
+      pOutputSamples[i*8+2] = rflac__s16_round(left1);
+      pOutputSamples[i*8+3] = rflac__s16_round(right1);
+      pOutputSamples[i*8+4] = rflac__s16_round(left2);
+      pOutputSamples[i*8+5] = rflac__s16_round(right2);
+      pOutputSamples[i*8+6] = rflac__s16_round(left3);
+      pOutputSamples[i*8+7] = rflac__s16_round(right3);
    }
 
    for (i = (frameCount4 << 2); i < frameCount; ++i)
@@ -4611,11 +4660,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_right_side__scalar(
       uint32_t right = pInputSamples1U32[i] << shift1;
       uint32_t left  = right + side;
 
-      left  >>= 16;
-      right >>= 16;
-
-      pOutputSamples[i*2+0] = (int16_t)left;
-      pOutputSamples[i*2+1] = (int16_t)right;
+      pOutputSamples[i*2+0] = rflac__s16_round(left);
+      pOutputSamples[i*2+1] = rflac__s16_round(right);
    }
 }
 
@@ -4638,8 +4684,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_right_side__sse2(
       __m128i right = _mm_slli_epi32(_mm_loadu_si128((const __m128i*)pInputSamples1 + i), shift1);
       __m128i left  = _mm_add_epi32(right, side);
 
-      left  = _mm_srai_epi32(left,  16);
-      right = _mm_srai_epi32(right, 16);
+      left  = rflac__mm_round_s16_epi32(left);
+      right = rflac__mm_round_s16_epi32(right);
 
       _mm_storeu_si128((__m128i*)(pOutputSamples + i*8), rflac__mm_packs_interleaved_epi32(left, right));
    }
@@ -4649,11 +4695,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_right_side__sse2(
       uint32_t right = pInputSamples1U32[i] << shift1;
       uint32_t left  = right + side;
 
-      left  >>= 16;
-      right >>= 16;
-
-      pOutputSamples[i*2+0] = (int16_t)left;
-      pOutputSamples[i*2+1] = (int16_t)right;
+      pOutputSamples[i*2+0] = rflac__s16_round(left);
+      pOutputSamples[i*2+1] = rflac__s16_round(right);
    }
 }
 #endif
@@ -4679,14 +4722,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_right_side__neon(
       uint32x4_t right = vshlq_u32(vld1q_u32(pInputSamples1U32 + i*4), shift1_4);
       uint32x4_t left  = vaddq_u32(right, side);
 
-      left  = vshrq_n_u32(left,  16);
-      right = vshrq_n_u32(right, 16);
+      left  = vreinterpretq_u32_s32(vrshrq_n_s32(vreinterpretq_s32_u32(left), 16));
+      right = vreinterpretq_u32_s32(vrshrq_n_s32(vreinterpretq_s32_u32(right), 16));
 
       {
          /* interleaving store; replaces vzip + contiguous store */
          uint16x4x2_t v;
-         v.val[0] = vmovn_u32(left);
-         v.val[1] = vmovn_u32(right);
+         v.val[0] = vreinterpret_u16_s16(vqmovn_s32(vreinterpretq_s32_u32(left)));
+         v.val[1] = vreinterpret_u16_s16(vqmovn_s32(vreinterpretq_s32_u32(right)));
          vst2_u16((uint16_t*)pOutputSamples + i*8, v);
       }
    }
@@ -4696,11 +4739,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_right_side__neon(
       uint32_t right = pInputSamples1U32[i] << shift1;
       uint32_t left  = right + side;
 
-      left  >>= 16;
-      right >>= 16;
-
-      pOutputSamples[i*2+0] = (int16_t)left;
-      pOutputSamples[i*2+1] = (int16_t)right;
+      pOutputSamples[i*2+0] = rflac__s16_round(left);
+      pOutputSamples[i*2+1] = rflac__s16_round(right);
    }
 }
 #endif
@@ -4775,24 +4815,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__scalar(
          temp2R = (mid2 - side2) << shift;
          temp3R = (mid3 - side3) << shift;
 
-         temp0L >>= 16;
-         temp1L >>= 16;
-         temp2L >>= 16;
-         temp3L >>= 16;
-
-         temp0R >>= 16;
-         temp1R >>= 16;
-         temp2R >>= 16;
-         temp3R >>= 16;
-
-         pOutputSamples[i*8+0] = (int16_t)temp0L;
-         pOutputSamples[i*8+1] = (int16_t)temp0R;
-         pOutputSamples[i*8+2] = (int16_t)temp1L;
-         pOutputSamples[i*8+3] = (int16_t)temp1R;
-         pOutputSamples[i*8+4] = (int16_t)temp2L;
-         pOutputSamples[i*8+5] = (int16_t)temp2R;
-         pOutputSamples[i*8+6] = (int16_t)temp3L;
-         pOutputSamples[i*8+7] = (int16_t)temp3R;
+         pOutputSamples[i*8+0] = rflac__s16_round(temp0L);
+         pOutputSamples[i*8+1] = rflac__s16_round(temp0R);
+         pOutputSamples[i*8+2] = rflac__s16_round(temp1L);
+         pOutputSamples[i*8+3] = rflac__s16_round(temp1R);
+         pOutputSamples[i*8+4] = rflac__s16_round(temp2L);
+         pOutputSamples[i*8+5] = rflac__s16_round(temp2R);
+         pOutputSamples[i*8+6] = rflac__s16_round(temp3L);
+         pOutputSamples[i*8+7] = rflac__s16_round(temp3R);
       }
    }
    else
@@ -4833,24 +4863,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__scalar(
          temp2R = ((int32_t)(mid2 - side2) >> 1);
          temp3R = ((int32_t)(mid3 - side3) >> 1);
 
-         temp0L >>= 16;
-         temp1L >>= 16;
-         temp2L >>= 16;
-         temp3L >>= 16;
-
-         temp0R >>= 16;
-         temp1R >>= 16;
-         temp2R >>= 16;
-         temp3R >>= 16;
-
-         pOutputSamples[i*8+0] = (int16_t)temp0L;
-         pOutputSamples[i*8+1] = (int16_t)temp0R;
-         pOutputSamples[i*8+2] = (int16_t)temp1L;
-         pOutputSamples[i*8+3] = (int16_t)temp1R;
-         pOutputSamples[i*8+4] = (int16_t)temp2L;
-         pOutputSamples[i*8+5] = (int16_t)temp2R;
-         pOutputSamples[i*8+6] = (int16_t)temp3L;
-         pOutputSamples[i*8+7] = (int16_t)temp3R;
+         pOutputSamples[i*8+0] = rflac__s16_round(temp0L);
+         pOutputSamples[i*8+1] = rflac__s16_round(temp0R);
+         pOutputSamples[i*8+2] = rflac__s16_round(temp1L);
+         pOutputSamples[i*8+3] = rflac__s16_round(temp1R);
+         pOutputSamples[i*8+4] = rflac__s16_round(temp2L);
+         pOutputSamples[i*8+5] = rflac__s16_round(temp2R);
+         pOutputSamples[i*8+6] = rflac__s16_round(temp3L);
+         pOutputSamples[i*8+7] = rflac__s16_round(temp3R);
       }
    }
 
@@ -4861,8 +4881,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__scalar(
 
       mid = (mid << 1) | (side & 0x01);
 
-      pOutputSamples[i*2+0] = (int16_t)(((uint32_t)((int32_t)(mid + side) >> 1) << unusedBitsPerSample) >> 16);
-      pOutputSamples[i*2+1] = (int16_t)(((uint32_t)((int32_t)(mid - side) >> 1) << unusedBitsPerSample) >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(((uint32_t)((int32_t)(mid + side) >> 1) << unusedBitsPerSample)));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(((uint32_t)((int32_t)(mid - side) >> 1) << unusedBitsPerSample)));
    }
 }
 
@@ -4892,8 +4912,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__sse2(
          left  = _mm_srai_epi32(_mm_add_epi32(mid, side), 1);
          right = _mm_srai_epi32(_mm_sub_epi32(mid, side), 1);
 
-         left  = _mm_srai_epi32(left,  16);
-         right = _mm_srai_epi32(right, 16);
+         left  = rflac__mm_round_s16_epi32(left);
+         right = rflac__mm_round_s16_epi32(right);
 
          _mm_storeu_si128((__m128i*)(pOutputSamples + i*8), rflac__mm_packs_interleaved_epi32(left, right));
       }
@@ -4904,8 +4924,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__sse2(
 
          mid = (mid << 1) | (side & 0x01);
 
-         pOutputSamples[i*2+0] = (int16_t)(((int32_t)(mid + side) >> 1) >> 16);
-         pOutputSamples[i*2+1] = (int16_t)(((int32_t)(mid - side) >> 1) >> 16);
+         pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(((int32_t)(mid + side) >> 1)));
+         pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(((int32_t)(mid - side) >> 1)));
       }
    }
    else
@@ -4923,8 +4943,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__sse2(
          left  = _mm_slli_epi32(_mm_add_epi32(mid, side), shift);
          right = _mm_slli_epi32(_mm_sub_epi32(mid, side), shift);
 
-         left  = _mm_srai_epi32(left,  16);
-         right = _mm_srai_epi32(right, 16);
+         left  = rflac__mm_round_s16_epi32(left);
+         right = rflac__mm_round_s16_epi32(right);
 
          _mm_storeu_si128((__m128i*)(pOutputSamples + i*8), rflac__mm_packs_interleaved_epi32(left, right));
       }
@@ -4936,8 +4956,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__sse2(
 
          mid = (mid << 1) | (side & 0x01);
 
-         pOutputSamples[i*2+0] = (int16_t)(((mid + side) << shift) >> 16);
-         pOutputSamples[i*2+1] = (int16_t)(((mid - side) << shift) >> 16);
+         pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(((mid + side) << shift)));
+         pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(((mid - side) << shift)));
       }
    }
 }
@@ -4972,14 +4992,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__neon(
          left  = vshrq_n_s32(vreinterpretq_s32_u32(vaddq_u32(mid, side)), 1);
          right = vshrq_n_s32(vreinterpretq_s32_u32(vsubq_u32(mid, side)), 1);
 
-         left  = vshrq_n_s32(left,  16);
-         right = vshrq_n_s32(right, 16);
+         left  = vrshrq_n_s32(left, 16);
+         right = vrshrq_n_s32(right, 16);
 
          {
             /* interleaving store; replaces vzip + contiguous store */
             int16x4x2_t v;
-            v.val[0] = vmovn_s32(left);
-            v.val[1] = vmovn_s32(right);
+            v.val[0] = vqmovn_s32(left);
+            v.val[1] = vqmovn_s32(right);
             vst2_s16(pOutputSamples + i*8, v);
          }
       }
@@ -4991,8 +5011,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__neon(
 
          mid = (mid << 1) | (side & 0x01);
 
-         pOutputSamples[i*2+0] = (int16_t)(((int32_t)(mid + side) >> 1) >> 16);
-         pOutputSamples[i*2+1] = (int16_t)(((int32_t)(mid - side) >> 1) >> 16);
+         pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(((int32_t)(mid + side) >> 1)));
+         pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(((int32_t)(mid - side) >> 1)));
       }
    }
    else
@@ -5015,14 +5035,14 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__neon(
          left  = vreinterpretq_s32_u32(vshlq_u32(vaddq_u32(mid, side), shift4));
          right = vreinterpretq_s32_u32(vshlq_u32(vsubq_u32(mid, side), shift4));
 
-         left  = vshrq_n_s32(left,  16);
-         right = vshrq_n_s32(right, 16);
+         left  = vrshrq_n_s32(left, 16);
+         right = vrshrq_n_s32(right, 16);
 
          {
             /* interleaving store; replaces vzip + contiguous store */
             int16x4x2_t v;
-            v.val[0] = vmovn_s32(left);
-            v.val[1] = vmovn_s32(right);
+            v.val[0] = vqmovn_s32(left);
+            v.val[1] = vqmovn_s32(right);
             vst2_s16(pOutputSamples + i*8, v);
          }
       }
@@ -5034,8 +5054,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_mid_side__neon(
 
          mid = (mid << 1) | (side & 0x01);
 
-         pOutputSamples[i*2+0] = (int16_t)(((mid + side) << shift) >> 16);
-         pOutputSamples[i*2+1] = (int16_t)(((mid - side) << shift) >> 16);
+         pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(((mid + side) << shift)));
+         pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(((mid - side) << shift)));
       }
    }
 }
@@ -5084,29 +5104,19 @@ static INLINE void rflac_read_pcm_frames_s16__decode_independent_stereo__scalar(
       uint32_t tempR2 = pInputSamples1U32[i*4+2] << shift1;
       uint32_t tempR3 = pInputSamples1U32[i*4+3] << shift1;
 
-      tempL0 >>= 16;
-      tempL1 >>= 16;
-      tempL2 >>= 16;
-      tempL3 >>= 16;
-
-      tempR0 >>= 16;
-      tempR1 >>= 16;
-      tempR2 >>= 16;
-      tempR3 >>= 16;
-
-      pOutputSamples[i*8+0] = (int16_t)tempL0;
-      pOutputSamples[i*8+1] = (int16_t)tempR0;
-      pOutputSamples[i*8+2] = (int16_t)tempL1;
-      pOutputSamples[i*8+3] = (int16_t)tempR1;
-      pOutputSamples[i*8+4] = (int16_t)tempL2;
-      pOutputSamples[i*8+5] = (int16_t)tempR2;
-      pOutputSamples[i*8+6] = (int16_t)tempL3;
-      pOutputSamples[i*8+7] = (int16_t)tempR3;
+      pOutputSamples[i*8+0] = rflac__s16_round(tempL0);
+      pOutputSamples[i*8+1] = rflac__s16_round(tempR0);
+      pOutputSamples[i*8+2] = rflac__s16_round(tempL1);
+      pOutputSamples[i*8+3] = rflac__s16_round(tempR1);
+      pOutputSamples[i*8+4] = rflac__s16_round(tempL2);
+      pOutputSamples[i*8+5] = rflac__s16_round(tempR2);
+      pOutputSamples[i*8+6] = rflac__s16_round(tempL3);
+      pOutputSamples[i*8+7] = rflac__s16_round(tempR3);
    }
 
    for (i = (frameCount4 << 2); i < frameCount; ++i) {
-      pOutputSamples[i*2+0] = (int16_t)((pInputSamples0U32[i] << shift0) >> 16);
-      pOutputSamples[i*2+1] = (int16_t)((pInputSamples1U32[i] << shift1) >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)((pInputSamples0U32[i] << shift0)));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)((pInputSamples1U32[i] << shift1)));
    }
 }
 
@@ -5127,8 +5137,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_independent_stereo__sse2(
       __m128i left  = _mm_slli_epi32(_mm_loadu_si128((const __m128i*)pInputSamples0 + i), shift0);
       __m128i right = _mm_slli_epi32(_mm_loadu_si128((const __m128i*)pInputSamples1 + i), shift1);
 
-      left  = _mm_srai_epi32(left,  16);
-      right = _mm_srai_epi32(right, 16);
+      left  = rflac__mm_round_s16_epi32(left);
+      right = rflac__mm_round_s16_epi32(right);
 
       /* At this point we have results. We can now pack and interleave these
        * into a single __m128i object and then store the in the output buffer. */
@@ -5136,8 +5146,8 @@ static INLINE void rflac_read_pcm_frames_s16__decode_independent_stereo__sse2(
    }
 
    for (i = (frameCount4 << 2); i < frameCount; ++i) {
-      pOutputSamples[i*2+0] = (int16_t)((pInputSamples0U32[i] << shift0) >> 16);
-      pOutputSamples[i*2+1] = (int16_t)((pInputSamples1U32[i] << shift1) >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)((pInputSamples0U32[i] << shift0)));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)((pInputSamples1U32[i] << shift1)));
    }
 }
 #endif
@@ -5164,22 +5174,22 @@ static INLINE void rflac_read_pcm_frames_s16__decode_independent_stereo__neon(
       left  = vreinterpretq_s32_u32(vshlq_u32(vld1q_u32(pInputSamples0U32 + i*4), shift0_4));
       right = vreinterpretq_s32_u32(vshlq_u32(vld1q_u32(pInputSamples1U32 + i*4), shift1_4));
 
-      left  = vshrq_n_s32(left,  16);
-      right = vshrq_n_s32(right, 16);
+      left  = vrshrq_n_s32(left, 16);
+      right = vrshrq_n_s32(right, 16);
 
       {
          /* interleaving store; replaces vzip + contiguous store */
          int16x4x2_t v;
-         v.val[0] = vmovn_s32(left);
-         v.val[1] = vmovn_s32(right);
+         v.val[0] = vqmovn_s32(left);
+         v.val[1] = vqmovn_s32(right);
          vst2_s16(pOutputSamples + i*8, v);
       }
    }
 
    for (i = (frameCount4 << 2); i < frameCount; ++i)
    {
-      pOutputSamples[i*2+0] = (int16_t)((pInputSamples0U32[i] << shift0) >> 16);
-      pOutputSamples[i*2+1] = (int16_t)((pInputSamples1U32[i] << shift1) >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)((pInputSamples0U32[i] << shift0)));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)((pInputSamples1U32[i] << shift1)));
    }
 }
 #endif
@@ -5219,12 +5229,12 @@ static void rflac_read_pcm_frames_s16__decode_left_side__wide(rflac* pFlac,
 
    for (i = 0; i < frameCount; ++i)
    {
-      int64_t left  = (int64_t)pInLeft[i] << shiftL;
-      int64_t side  = pInSide[i] << shiftS;
+      int64_t left  = (int64_t)((uint64_t)(int64_t)pInLeft[i] << shiftL);
+      int64_t side  = (int64_t)((uint64_t)pInSide[i] << shiftS);
       int64_t right = left - side;
 
-      pOutputSamples[i*2+0] = (int16_t)(left  >> 16);
-      pOutputSamples[i*2+1] = (int16_t)(right >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(left));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(right));
    }
 }
 
@@ -5238,12 +5248,12 @@ static void rflac_read_pcm_frames_s16__decode_right_side__wide(rflac* pFlac,
 
    for (i = 0; i < frameCount; ++i)
    {
-      int64_t side  = pInSide[i] << shiftS;
-      int64_t right = (int64_t)pInRight[i] << shiftR;
+      int64_t side  = (int64_t)((uint64_t)pInSide[i] << shiftS);
+      int64_t right = (int64_t)((uint64_t)(int64_t)pInRight[i] << shiftR);
       int64_t left  = right + side;
 
-      pOutputSamples[i*2+0] = (int16_t)(left  >> 16);
-      pOutputSamples[i*2+1] = (int16_t)(right >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(left));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(right));
    }
 }
 
@@ -5257,17 +5267,17 @@ static void rflac_read_pcm_frames_s16__decode_mid_side__wide(rflac* pFlac,
 
    for (i = 0; i < frameCount; ++i)
    {
-      int64_t mid  = (int64_t)pInMid[i] << shiftM;
-      int64_t side = pInSide[i] << shiftS;
+      int64_t mid  = (int64_t)((uint64_t)(int64_t)pInMid[i] << shiftM);
+      int64_t side = (int64_t)((uint64_t)pInSide[i] << shiftS);
       int64_t left;
       int64_t right;
 
-      mid   = (mid << 1) | (side & 0x01);
+      mid   = (int64_t)((uint64_t)mid << 1) | (side & 0x01);
       left  = (mid + side) >> 1;
       right = (mid - side) >> 1;
 
-      pOutputSamples[i*2+0] = (int16_t)(left  >> 16);
-      pOutputSamples[i*2+1] = (int16_t)(right >> 16);
+      pOutputSamples[i*2+0] = rflac__s16_round((uint32_t)(left));
+      pOutputSamples[i*2+1] = rflac__s16_round((uint32_t)(right));
    }
 }
 
@@ -5282,8 +5292,8 @@ static void rflac_read_pcm_frames_f32__decode_left_side__wide(rflac* pFlac,
 
    for (i = 0; i < frameCount; ++i)
    {
-      int64_t left  = (int64_t)pInLeft[i] << shiftL;
-      int64_t side  = pInSide[i] << shiftS;
+      int64_t left  = (int64_t)((uint64_t)(int64_t)pInLeft[i] << shiftL);
+      int64_t side  = (int64_t)((uint64_t)pInSide[i] << shiftS);
       int64_t right = left - side;
 
       pOutputSamples[i*2+0] = (int32_t)left  * factor;
@@ -5302,8 +5312,8 @@ static void rflac_read_pcm_frames_f32__decode_right_side__wide(rflac* pFlac,
 
    for (i = 0; i < frameCount; ++i)
    {
-      int64_t side  = pInSide[i] << shiftS;
-      int64_t right = (int64_t)pInRight[i] << shiftR;
+      int64_t side  = (int64_t)((uint64_t)pInSide[i] << shiftS);
+      int64_t right = (int64_t)((uint64_t)(int64_t)pInRight[i] << shiftR);
       int64_t left  = right + side;
 
       pOutputSamples[i*2+0] = (int32_t)left  * factor;
@@ -5322,12 +5332,12 @@ static void rflac_read_pcm_frames_f32__decode_mid_side__wide(rflac* pFlac,
 
    for (i = 0; i < frameCount; ++i)
    {
-      int64_t mid  = (int64_t)pInMid[i] << shiftM;
-      int64_t side = pInSide[i] << shiftS;
+      int64_t mid  = (int64_t)((uint64_t)(int64_t)pInMid[i] << shiftM);
+      int64_t side = (int64_t)((uint64_t)pInSide[i] << shiftS);
       int64_t left;
       int64_t right;
 
-      mid   = (mid << 1) | (side & 0x01);
+      mid   = (int64_t)((uint64_t)mid << 1) | (side & 0x01);
       left  = (mid + side) >> 1;
       right = (mid - side) >> 1;
 
@@ -5413,7 +5423,7 @@ static uint64_t rflac_read_pcm_frames_s16(rflac* pFlac, uint64_t framesToRead,
                unsigned int j;
                for (j = 0; j < channelCount; ++j) {
                   int32_t sampleS32 = (int32_t)((uint32_t)(pFlac->currentFLACFrame.subframes[j].pSamplesS32[iFirstPCMFrame + i]) << (unusedBitsPerSample + pFlac->currentFLACFrame.subframes[j].wastedBitsPerSample));
-                  pBufferOut[(i*channelCount)+j] = (int16_t)(sampleS32 >> 16);
+                  pBufferOut[(i*channelCount)+j] = rflac__s16_round((uint32_t)(sampleS32));
                }
             }
          }
@@ -6421,11 +6431,13 @@ struct rflac_ctx
    float             *out_f32;
    size_t             out_frames;
    size_t             out_done;
+   int                discard;      /* consume PCM without interleaving */
    int                ended;
    size_t             span_taken;    /* of the current span, last call   */
    int                eof_in;        /* caller has no more input to give */
    int                need_header;   /* set until a header is parsed */
    int                raw;           /* made by rflac_new_raw()          */
+   int                swap_out;      /* s16 out in the other byte order  */
 };
 
 static size_t rflac__on_read_push(void *pUserData, void *bufferOut,
@@ -6698,6 +6710,40 @@ static size_t rflac__max_frame_bytes(const rflac_t *f)
         * ((f->fmt.bits_per_sample + 7) / 8) + 64;
 }
 
+/* Byte-swaps @n samples in place: run on what the frame just wrote,
+ * while it is still in L1, rather than as a pass of the caller's. */
+static void rflac__swap_s16(int16_t *p, size_t n)
+{
+   size_t i = 0;
+#if defined(RFLAC_SUPPORT_SSE2)
+   if (rflac__gIsSSE2Supported)
+   {
+      for (; i + 16 <= n; i += 16)
+      {
+         __m128i a = _mm_loadu_si128((const __m128i*)(p + i));
+         __m128i b = _mm_loadu_si128((const __m128i*)(p + i + 8));
+         a = _mm_or_si128(_mm_slli_epi16(a, 8), _mm_srli_epi16(a, 8));
+         b = _mm_or_si128(_mm_slli_epi16(b, 8), _mm_srli_epi16(b, 8));
+         _mm_storeu_si128((__m128i*)(p + i),     a);
+         _mm_storeu_si128((__m128i*)(p + i + 8), b);
+      }
+   }
+#elif defined(RFLAC_SUPPORT_NEON)
+   if (rflac__gIsNEONSupported)
+   {
+      for (; i + 16 <= n; i += 16)
+      {
+         uint8x16_t a = vld1q_u8((const uint8_t*)(p + i));
+         uint8x16_t b = vld1q_u8((const uint8_t*)(p + i + 8));
+         vst1q_u8((uint8_t*)(p + i),     vrev16q_u8(a));
+         vst1q_u8((uint8_t*)(p + i + 8), vrev16q_u8(b));
+      }
+   }
+#endif
+   for (; i < n; i++)
+      p[i] = (int16_t)rflac__swap_endian_uint16((uint16_t)p[i]);
+}
+
 int rflac_process(rflac_t *f, size_t *read, size_t *wrote)
 {
    size_t   start_pos;
@@ -6754,7 +6800,7 @@ int rflac_process(rflac_t *f, size_t *read, size_t *wrote)
 
    if (!f->dec)
       return RFLAC_PROCESS_ERROR;
-   if (!f->out_s16 && !f->out_f32)
+   if (!f->discard && !f->out_s16 && !f->out_f32)
       return RFLAC_PROCESS_NEXT;
    if (f->out_done >= f->out_frames)
       return RFLAC_PROCESS_NEXT;
@@ -6799,9 +6845,15 @@ int rflac_process(rflac_t *f, size_t *read, size_t *wrote)
 
    f->src.underrun = 0;
 
-   if (f->out_s16)
-      produced = (size_t)rflac_read_pcm_frames_s16(f->dec, want,
-            f->out_s16 + f->out_done * f->fmt.channels);
+   if (f->discard)
+      produced = (size_t)rflac_read_pcm_frames_s16(f->dec, want, NULL);
+   else if (f->out_s16)
+   {
+      int16_t *out = f->out_s16 + f->out_done * f->fmt.channels;
+      produced = (size_t)rflac_read_pcm_frames_s16(f->dec, want, out);
+      if (f->swap_out)
+         rflac__swap_s16(out, produced * f->fmt.channels);
+   }
    else
       produced = (size_t)rflac_read_pcm_frames_f32(f->dec, want,
             f->out_f32 + f->out_done * f->fmt.channels);
@@ -6876,11 +6928,18 @@ int rflac_process(rflac_t *f, size_t *read, size_t *wrote)
 
 int rflac_seek(rflac_t *f, uint64_t frame, uint64_t *byte_offset)
 {
+   uint64_t point_frame;
+   return rflac_seek_point(f, frame, byte_offset, &point_frame);
+}
+
+int rflac_seek_point(rflac_t *f, uint64_t frame, uint64_t *byte_offset,
+      uint64_t *point_frame)
+{
    uint32_t i;
    uint32_t best = 0;
    int      found = 0;
 
-   if (!f || !f->dec || !byte_offset)
+   if (!f || !f->dec || !byte_offset || !point_frame)
       return RFLAC_PROCESS_ERROR;
    if (!f->dec->pSeekpoints || !f->dec->seekpointCount)
       return RFLAC_PROCESS_ERROR;
@@ -6905,6 +6964,7 @@ int rflac_seek(rflac_t *f, uint64_t frame, uint64_t *byte_offset)
 
    *byte_offset = f->dec->firstFLACFramePosInBytes
                 + f->dec->pSeekpoints[best].flacFrameOffset;
+   *point_frame = f->dec->pSeekpoints[best].firstPCMFrame;
 
    return RFLAC_PROCESS_NEXT;
 }
@@ -7066,6 +7126,17 @@ void rflac_set_out_s16(rflac_t *f, int16_t *out, size_t out_frames)
    f->out_f32    = NULL;
    f->out_frames = out_frames;
    f->out_done   = 0;
+   f->discard    = 0;
+   f->swap_out   = 0;
+}
+
+void rflac_set_out_s16_order(rflac_t *f, int16_t *out, size_t out_frames,
+      int big_endian)
+{
+   if (!f)
+      return;
+   rflac_set_out_s16(f, out, out_frames);
+   f->swap_out   = (big_endian != 0) != (RETRO_IS_BIG_ENDIAN != 0);
 }
 
 void rflac_set_out_f32(rflac_t *f, float *out, size_t out_frames)
@@ -7076,6 +7147,20 @@ void rflac_set_out_f32(rflac_t *f, float *out, size_t out_frames)
    f->out_s16    = NULL;
    f->out_frames = out_frames;
    f->out_done   = 0;
+   f->discard    = 0;
+   f->swap_out   = 0;
+}
+
+void rflac_set_out_discard(rflac_t *f, size_t frames)
+{
+   if (!f)
+      return;
+   f->out_s16    = NULL;
+   f->out_f32    = NULL;
+   f->out_frames = frames;
+   f->out_done   = 0;
+   f->discard    = 1;
+   f->swap_out   = 0;
 }
 
 const rflac_format_t *rflac_format(const rflac_t *f)

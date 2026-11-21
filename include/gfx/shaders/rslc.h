@@ -48,10 +48,25 @@
  * stage's gl_ClipDistance / gl_CullDistance (sized by the highest
  * constant element written; HLSL and MSL refuse them yet), in / out
  * interface blocks, RSLC_STAGE_GEOMETRY (SPIR-V and GLSL only), and
- * storage buffers with the atomic builtins (SPIR-V and GLSL only).
+ * storage buffers with the atomic builtins (SPIR-V and GLSL only),
+ * and what a generated stage says: #version 420 to 440 for the same
+ * dialect, gl_WorkGroupSize, and a uniform block that says std430
+ * (placed as glslang places it under GL_EXT_scalar_block_layout) or
+ * ends in an array of unstated length
+ * (GL_EXT_uniform_buffer_unsized_array; SPIR-V only), a block member
+ * that says its layout(offset) (SPIR-V only),
+ * gl_FragStencilRefARB (SPIR-V only), and one multisampled image read
+ * and written a sample at a time: sampler2DMS and image2DMS with their
+ * i and u forms (SPIR-V only), the two-channel and 16-bit image
+ * formats, and a write-only image that leaves its format out (SPIR-V
+ * only), and specialization constants: layout(constant_id) on a global
+ * const bool, int, uint or float, and local_size_x_id to _z_id (SPIR-V
+ * only; never folded to their defaults).
  * Without it
  * none of that is accepted, nothing is compiled in for it, and every
- * destination is word for word what it was.  MSL has no form of the
+ * destination is word for word what it was. RSLC_NO_DXBC omits the
+ * Direct3D bytecode backend from an extended build; other destinations
+ * are unchanged. MSL has no form of the
  * extended samplers or of a third block yet and refuses them. */
 
 #include <stdint.h>
@@ -92,7 +107,8 @@ enum rslc_base
    RSLC_BASE_BOOL,
    RSLC_BASE_INT,
    RSLC_BASE_UINT,
-   RSLC_BASE_FLOAT
+   RSLC_BASE_FLOAT,
+   RSLC_BASE_DOUBLE   /* RSLC_EXTENDED: a 64-bit scalar, never a constant; SPIR-V only */
 };
 
 #define RSLC_MAX_SAMPLERS 16
@@ -268,6 +284,10 @@ struct rslc_remap
    enum rslc_remap_where where;
    enum rslc_remap_wrap  wrap;
    bool        linear;
+   /* Rewrite sampled colours rather than coordinates. The three vec4s
+    * hold matrix rows: rect.w enables it, clamp.w is the signed power.
+    * Sampler coordinates, filtering, levels and size queries are unchanged. */
+   bool        colour;
 };
 
 /* How the printed destinations name the interface.  A driver binds
@@ -317,6 +337,18 @@ struct rslc_names
  * version: GLSL #version, HLSL shader model or MSL version per dst.
  * es / fixup_clipspace / flip_vert_y: the flags slang_process passes
  *   into the printers today; honoured at print time, never in the IR. */
+/* RSLC_EXTENDED, GLSL: how an input attachment, the colour attachment's
+ * value on entry, is read */
+enum rslc_fb_fetch
+{
+   RSLC_FB_FETCH_NONE = 0,   /* refused */
+   RSLC_FB_FETCH_EXT,        /* GL_EXT_shader_framebuffer_fetch: the colour
+                                output at the attachment's index is inout
+                                and read where the input is */
+   RSLC_FB_FETCH_ARM         /* GL_ARM_shader_framebuffer_fetch:
+                                gl_LastFragColorARM */
+};
+
 struct rslc_opts
 {
    void *(*alloc)(void *ud, size_t len);
@@ -334,6 +366,10 @@ struct rslc_opts
    bool es;
    bool fixup_clipspace;
    bool flip_vert_y;
+   unsigned fb_fetch;   /* enum rslc_fb_fetch */
+   /* RSLC_EXTENDED, GLSL: early fragment tests as conservative depth's
+    * depth_unchanged, for a context without image load / store */
+   bool early_z_depth_unchanged;
 };
 
 #define RSLC_ARENA_CHUNK        (64u * 1024u)

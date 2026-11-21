@@ -1,0 +1,18 @@
+C runtime streams, 67108864 bytes
+sequential 1 B                           15.8 ns/call      63.2 MB/s
+sequential 16 B                          17.0 ns/call     940.8 MB/s
+sequential 256 B                         41.6 ns/call    6146.7 MB/s
+sequential 4096 B                       437.4 ns/call    9364.2 MB/s
+sequential 65536 B                     6163.5 ns/call   10633.0 MB/s
+sequential 1048576 B                  79857.8 ns/call   13130.5 MB/s
+random 4 KiB, seek+read                7559.7 ns/call     541.8 MB/s
+random 4 KiB, read_at                  2688.9 ns/call    1523.3 MB/s
+random 4 KiB, read_at x4 threads       2113.3 ns/call    1938.2 MB/s
+open + read 4 KiB + close             22068.4 ns/call     185.6 MB/s
+write sequential 16 B                    18.0 ns/call     888.1 MB/s
+write sequential 256 B                   51.5 ns/call    4974.3 MB/s
+write sequential 4096 B                 763.0 ns/call    5368.0 MB/s
+write sequential 65536 B              11344.5 ns/call    5776.9 MB/s
+write sequential 1048576 B           157956.2 ns/call    6638.4 MB/s
+write random 64 B, seek+write          2279.4 ns/call      28.1 MB/s
+create + write 4 KiB + close          94980.6 ns/call      43.1 MB/s

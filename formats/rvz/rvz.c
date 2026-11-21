@@ -135,6 +135,9 @@ struct rvz
    uint8_t           *zbuf;     /* a compressed group, as read */
    uint16_t          *probs;    /* the LZMA model, for LZMA and LZMA2 */
    rbzip2_t          *bz;       /* the bzip2 decoder, for bzip2 */
+#ifdef HAVE_RZSTD
+   rzstd_decoder_t   *zstd;     /* the zstd decoder's scratch, for zstd */
+#endif
    uint8_t           *zeros;    /* a group's worth of zeroed data */
    uint8_t           *block;    /* the hash block reassembled */
    uint8_t           *hashes;   /* its 64 sectors' hash areas */
@@ -170,12 +173,14 @@ struct rvz
    uint64_t           rd_off;
    size_t             rd_len;
    size_t             rd_done;
+   int                rd_part;  /* a decrypted read's partition, or -1 */
    bool               rd_armed;
    uint32_t           n_regions;
    uint32_t           n_parts;
    uint32_t           n_groups;
    uint32_t           chunk;
    uint32_t           compression;
+   int32_t            level;    /* as the file records it */
    uint32_t           n_slots;
    uint32_t           block_part;  /* the hash block held: partition, */
    uint32_t           block_index; /* and block, or UINT32_MAX */
@@ -235,6 +240,51 @@ static bool rvz_grow(uint8_t **buf, size_t *cap, size_t need)
    return true;
 }
 
+/* Room, from the time the image is opened, for the largest group the
+ * tables tell of: as stored, and as its data. Reading then takes no
+ * memory but for what the tables could not tell, exception lists
+ * above all, and for a group a damaged table makes out larger than a
+ * group's data can be twice over; those grow what holds them as they
+ * come. */
+static bool rvz_reserve(rvz_t *z)
+{
+   size_t   most   = 2 * z->data_max + 0x10000;
+   size_t   stored = 0;
+   size_t   data   = z->data_max;
+   bool     packed = false;
+   uint32_t i;
+
+   for (i = 0; i < z->n_groups; i++)
+   {
+      const struct rvz_group *grp = &z->groups[i];
+      if (grp->size > stored)
+         stored = grp->size;
+      if (grp->packed)
+      {
+         packed = true;
+         if (grp->packed > data)
+            data = grp->packed;
+      }
+   }
+   if (stored > most)
+      stored = most;
+   if (data > most)
+      data = most;
+   if (stored > data)
+      data = stored;
+
+   if (     !rvz_grow(&z->zbuf, &z->zbuf_cap, stored)
+         || !rvz_grow(&z->raw.raw, &z->raw.raw_cap, data)
+         || (packed && !rvz_grow(&z->raw.out, &z->raw.out_cap, z->data_max)))
+      return false;
+   for (i = 0; z->slots && i < z->n_slots; i++)
+      if (     !rvz_grow(&z->slots[i].raw, &z->slots[i].raw_cap, data)
+            || (packed && !rvz_grow(&z->slots[i].out, &z->slots[i].out_cap,
+                     z->data_max)))
+         return false;
+   return true;
+}
+
 /* An LZMA stream carries no end: a group is decoded as far as its
  * @n_lists exception lists say, then @tail octets more. */
 static int rvz_lzma(rvz_t *z, uint8_t *dst, size_t cap,
@@ -290,8 +340,8 @@ static int rvz_decompress(rvz_t *z, uint8_t *dst, size_t cap,
    {
 #ifdef HAVE_RZSTD
       case RVZ_COMP_ZSTD:
-         return rzstd_decode(dst, cap, src, src_len, len) == RZSTD_PROCESS_END
-            ? RVZ_OK : RVZ_ERROR_DATA;
+         return rzstd_decode_reuse(z->zstd, dst, cap, src, src_len, len)
+               == RZSTD_PROCESS_END ? RVZ_OK : RVZ_ERROR_DATA;
 #endif
       case RVZ_COMP_BZIP2:
          switch (rbzip2_decode(z->bz, dst, cap, src, src_len, len))
@@ -863,11 +913,64 @@ static const struct rvz_region *rvz_region_at(const rvz_t *z, uint64_t off,
    return NULL;
 }
 
+/* The partition whose data starts at disc offset @pdo, or -1 */
+static int rvz_part_at(const rvz_t *z, uint64_t pdo)
+{
+   uint32_t i;
+   for (i = 0; i < z->n_parts; i++)
+      if ((uint64_t)z->parts[i].base * RVZ_SECTOR == pdo)
+         return (int)i;
+   return -1;
+}
+
+/* Runs an armed decrypted read on: each sector's data as its group
+ * holds it, with no hashes worked out and nothing encrypted */
+static int rvz_read_decrypted_run(rvz_t *z)
+{
+   const struct rvz_part *pt = &z->parts[z->rd_part];
+   unsigned n_lists = z->chunk >= RVZ_BLOCK ? z->chunk / RVZ_BLOCK : 1;
+   int      e;
+
+   while (z->rd_done < z->rd_len)
+   {
+      uint64_t pos  = z->rd_off + z->rd_done;
+      size_t   in_s = (size_t)(pos % RVZ_SECTOR_DATA);
+      size_t   take = z->rd_len - z->rd_done, avail;
+      uint32_t s, g, g_first, g_count, in_g, k;
+      struct rvz_slot *slot = NULL;
+
+      if (pos / RVZ_SECTOR_DATA >= pt->sectors)
+         return RVZ_ERROR_DATA;
+      s = (uint32_t)(pos / RVZ_SECTOR_DATA);
+      if (!rvz_part_locate(z, pt, s, &g, &g_first, &g_count, &in_g))
+         return RVZ_ERROR_DATA;
+      /* a slot holding the group already, else the first */
+      for (k = 0; k < z->n_slots && !slot; k++)
+         if (z->slots[k].group == g)
+            slot = &z->slots[k];
+      if (!slot)
+         slot = &z->slots[0];
+      if ((e = rvz_group_load(z, slot, g, (size_t)g_count * RVZ_SECTOR_DATA,
+               n_lists, (uint64_t)g_first * RVZ_SECTOR_DATA, NULL)) != RVZ_OK)
+         return e;
+      avail = (size_t)(g_count - in_g) * RVZ_SECTOR_DATA - in_s;
+      if (take > avail)
+         take = avail;
+      memcpy(z->rd_dst + z->rd_done,
+            slot->data + (size_t)in_g * RVZ_SECTOR_DATA + in_s, take);
+      z->rd_done += take;
+   }
+   return RVZ_OK;
+}
+
 /* Runs the armed read on from where it stands */
 static int rvz_read_run(rvz_t *z)
 {
    uint8_t *out = z->rd_dst;
    int      e;
+
+   if (z->rd_part >= 0)
+      return rvz_read_decrypted_run(z);
 
    while (z->rd_done < z->rd_len)
    {
@@ -976,6 +1079,45 @@ int rvz_read_begin(rvz_t *z, uint64_t off, void *dst, size_t len)
    z->rd_off   = off;
    z->rd_len   = len;
    z->rd_done  = 0;
+   z->rd_part  = -1;
+   z->rd_armed = true;
+   return RVZ_OK;
+}
+
+bool rvz_decrypted_supported(const rvz_t *z, uint64_t partition_data,
+      uint64_t off, uint64_t len)
+{
+   const struct rvz_part *pt;
+   unsigned k;
+   int      pi;
+   if (!z || z->stage != RVZ_STAGE_OPEN
+         || (pi = rvz_part_at(z, partition_data)) < 0)
+      return false;
+   pt = &z->parts[pi];
+   for (k = 0; k < 2; k++)
+      if (pt->count[k] && off + len <= (uint64_t)(pt->first[k] - pt->base
+               + pt->count[k]) * RVZ_SECTOR_DATA)
+         return true;
+   return false;
+}
+
+int rvz_read_decrypted_begin(rvz_t *z, uint64_t partition_data,
+      uint64_t off, void *dst, size_t len)
+{
+   int pi;
+   if (!z || (!dst && len))
+      return RVZ_ERROR_PARAM;
+   if (z->stage != RVZ_STAGE_OPEN)
+      return RVZ_ERROR_STATE;
+   if ((pi = rvz_part_at(z, partition_data)) < 0)
+      return RVZ_ERROR_PARAM;
+   z->fetching = 0;
+   z->failed   = false;
+   z->rd_dst   = (uint8_t*)dst;
+   z->rd_off   = off;
+   z->rd_len   = len;
+   z->rd_done  = 0;
+   z->rd_part  = pi;
    z->rd_armed = true;
    return RVZ_OK;
 }
@@ -1055,6 +1197,9 @@ void rvz_free(rvz_t *z)
    free(z->h0);
    free(z->probs);
    rbzip2_free(z->bz);
+#ifdef HAVE_RZSTD
+   rzstd_decoder_free(z->zstd);
+#endif
    free(z->disc);
    free(z->tab);
    free(z);
@@ -1063,6 +1208,18 @@ void rvz_free(rvz_t *z)
 int rvz_disc_type(const rvz_t *z)
 {
    return z ? z->disc_type : 0;
+}
+
+int rvz_compression(const rvz_t *z, int *level)
+{
+   if (level)
+      *level = z && z->stage == RVZ_STAGE_OPEN ? (int)z->level : 0;
+   return z && z->stage == RVZ_STAGE_OPEN ? (int)z->compression : -1;
+}
+
+uint32_t rvz_chunk_size(const rvz_t *z)
+{
+   return z && z->stage == RVZ_STAGE_OPEN ? z->chunk : 0;
 }
 
 uint64_t rvz_disc_size(const rvz_t *z)
@@ -1227,7 +1384,7 @@ static int rvz_open_regions(rvz_t *z)
       for (i = 0; i < z->n_slots; i++)
          z->slots[i].group = UINT32_MAX;
    }
-   return RVZ_OK;
+   return rvz_reserve(z) ? RVZ_OK : RVZ_ERROR_MEM;
 }
 
 /* Reads the heads and the tables, a stage at a time */
@@ -1272,6 +1429,7 @@ static int rvz_open_run(rvz_t *z)
             d              = z->disc;
             z->disc_type   = (int)rvz_be32(d + 0x00);
             z->compression = rvz_be32(d + 0x04);
+            z->level       = (int32_t)rvz_be32(d + 0x08);
             z->chunk       = rvz_be32(d + 0x0c);
             memcpy(z->dhead, d + 0x10, RVZ_DHEAD);
             z->n_parts     = rvz_be32(d + 0x90);
@@ -1320,6 +1478,11 @@ static int rvz_open_run(rvz_t *z)
             }
             if (z->compression == RVZ_COMP_BZIP2 && !(z->bz = rbzip2_new()))
                return RVZ_ERROR_MEM;
+#ifdef HAVE_RZSTD
+            if (z->compression == RVZ_COMP_ZSTD && !z->zstd
+                  && !(z->zstd = rzstd_decoder_new()))
+               return RVZ_ERROR_MEM;
+#endif
             z->encrypted = z->dhead[0x61] == 0;
             z->data_max  = z->chunk;
             z->stage     = RVZ_STAGE_PARTS;

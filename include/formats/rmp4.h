@@ -63,7 +63,8 @@ enum rmp4_codec
    RMP4_CODEC_OPUS,
    RMP4_CODEC_AAC,
    RMP4_CODEC_H265,
-   RMP4_CODEC_AV1
+   RMP4_CODEC_AV1,
+   RMP4_CODEC_AC3
 };
 
 typedef struct
@@ -102,6 +103,13 @@ typedef struct
    /* Duration of the supported nonempty unity-rate edit, excluding the
     * leading delay. -1 when no such edit declares a play length. */
    int64_t                presentation_duration_ns;
+   /* An mp4v or mp4a entry's esds objectTypeIndication: what the
+    * fourcc does not say (mp4v carries MPEG-4 Visual 0x20, MPEG-2
+    * video 0x60..0x65, MPEG-1 video 0x6A or JPEG 0x6C; mp4a MPEG-4
+    * Audio 0x40, MPEG-2 AAC 0x66..0x68 or MP3 0x69/0x6B). 0 for other
+    * entries, or without an esds. An mp4v's DecoderSpecificInfo (the
+    * MPEG-4 VOS/VOL headers) is its codec_private. */
+   unsigned               object_type;
 } rmp4_track;
 
 typedef struct
@@ -125,6 +133,9 @@ typedef struct rmp4 rmp4_t;
 rmp4_t *rmp4_open_memory(const uint8_t *data, size_t size);
 
 void rmp4_close(rmp4_t *mp4);
+
+/* False while later fragment sample tables have not been indexed. */
+int rmp4_index_complete(const rmp4_t *mp4);
 
 /* Track enumeration. */
 int               rmp4_num_tracks(const rmp4_t *mp4);
@@ -158,14 +169,14 @@ int64_t rmp4_duration_ns(const rmp4_t *mp4);
 int rmp4_read_packet(rmp4_t *mp4, rmp4_packet *pkt);
 
 /* Next packet byte range from sample tables; reads no media bytes. */
-void rmp4_read_span(const rmp4_t *mp4, size_t *lo, size_t *hi);
+void rmp4_read_span(rmp4_t *mp4, size_t *lo, size_t *hi);
 
 /* Open against a partially-read buffer: only the first 'avail' bytes
  * are valid (the rest may be uninitialised) and are never read.  Box
  * bodies are hopped arithmetically, so a trailing moov (a file muxed
  * without faststart) is found as soon as its own bytes arrive; a
- * fragmented movie needs the whole file (its sample tables live in
- * moof boxes interleaved to the end).  On failure, *need_more (when
+ * fragmented movie indexes resident headers and requests later headers
+ * through rmp4_read_span as its samples are consumed.  On failure, *need_more (when
  * non-NULL) is set when the failure was running out of available
  * bytes rather than malformed data - retry with a larger avail.
  * rmp4_open_memory is this with avail == size. */
